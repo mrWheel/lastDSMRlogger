@@ -1,0 +1,21 @@
+menu "lastDSMRlogger P1 Interface"
+
+    choice LASTDSMRLOGGER_P1_RX_POLARITY
+        prompt "P1 RX signal polarity"
+        default LASTDSMRLOGGER_P1_RX_DIRECT
+        help
+            Select how the chosen P1 interface presents the meter signal to
+            the ESP32-S3. The smart meter P1 port is an idle-high interface.
+            Use the setting documented for the interface board you wire to
+            J5; the selection is fixed at build time.
+
+        config LASTDSMRLOGGER_P1_RX_DIRECT
+            bool "Direct (non-inverted) signal from the P1 interface"
+
+        config LASTDSMRLOGGER_P1_RX_INVERTED
+            bool "Inverted signal (interface inverts before the ESP32-S3)"
+    endchoice
+
+    comment "The P1 request signal is externally enabled in this release."
+
+endmenu

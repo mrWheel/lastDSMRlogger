@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lastDSMRlogger</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>lastDSMRlogger</h1>
+    <nav>
+      <button id="tabSettings" class="tab active" type="button">Settings</button>
+      <button id="tabTelegrams" class="tab" type="button">Telegrams</button>
+    </nav>
+  </header>
+
+  <div id="statusStrip" class="status">Connecting to the logger...</div>
+
+  <main>
+    <section id="viewSettings">
+      <h2>Settings</h2>
+      <div id="settingsMessage" class="message"></div>
+      <form id="settingsForm">
+        <label for="selGpio">P1 RX GPIO</label>
+        <select id="selGpio"></select>
+
+        <label for="selCountry">Country</label>
+        <select id="selCountry"></select>
+
+        <label for="selProfile">Protocol version</label>
+        <select id="selProfile"></select>
+
+        <fieldset>
+          <legend>M-Bus channels</legend>
+          <div class="mbusRow">
+            <label for="selMbus1">Channel 1</label>
+            <select id="selMbus1"></select>
+          </div>
+          <div class="mbusRow">
+            <label for="selMbus2">Channel 2</label>
+            <select id="selMbus2"></select>
+          </div>
+          <div class="mbusRow">
+            <label for="selMbus3">Channel 3</label>
+            <select id="selMbus3"></select>
+          </div>
+          <div class="mbusRow">
+            <label for="selMbus4">Channel 4</label>
+            <select id="selMbus4"></select>
+          </div>
+        </fieldset>
+
+        <button id="saveSettings" type="submit">Save</button>
+      </form>
+    </section>
+
+    <section id="viewTelegrams" hidden>
+      <h2>Telegrams</h2>
+      <div id="telegramState" class="message"></div>
+      <select id="telegramList" size="6" aria-label="Recent telegrams"></select>
+      <div id="agedOutNotice" class="message warning" hidden>
+        The selected telegram has aged out of the history.
+        <button id="backToLatest" type="button">Show latest</button>
+      </div>
+
+      <div id="telegramDetail" hidden>
+        <h3>Decoded summary</h3>
+        <div id="recordMeta" class="meta"></div>
+        <div id="recordNotes" class="message"></div>
+        <table id="summaryTable">
+          <thead>
+            <tr><th>OBIS</th><th>Value</th><th>Unit</th><th>Timestamp</th><th>M-Bus</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+
+        <h3>Raw telegram</h3>
+        <pre id="rawView"></pre>
+      </div>
+    </section>
+  </main>
+
+  <footer id="footerInfo"></footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

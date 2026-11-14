@@ -1,0 +1,80 @@
+lastDSMRlogger — Project Specification
+
+Buildnumber: 1
+Last update-date: 2026-11-14
+
+Every Markdown document in the project shall include `Buildnumber` and `Last update-date` metadata near the beginning. Keep both values current whenever a Markdown document is created or edited.
+
+1. Product and first release
+
+lastDSMRlogger shall read P1 telegrams from a smart meter, validate and decode them through parserDSMR, and make recent telegrams visible in a single-page web application served by the logger. The SPA shall have two views, Settings and Telegrams. The first release shall retain a short, bounded history in RAM and persist configuration across restarts. Long-term logging, SD-card storage, graphs, tariffs, MQTT, cloud services, and legacy API compatibility are outside this release.
+
+The project shall target the ESP32-S3 on the TFT LCD Display EC11 Piggyback Board v3 using native ESP-IDF 6.0.2. The application and integration code shall use C with plain structs, enums, functions, Allman braces, lowerCamelCase identifiers for functions and variables, and English comments. The web interface shall use local HTML, CSS, and JavaScript assets. The hardware target shall reserve the display, encoder, buttons, SD, and I²C pins. Use mrWheel's `esp32_s3_piggyback` component from [esp32-s3-Piggyback](https://github.com/mrWheel/esp32-s3-Piggyback) for board integration. Read the API documentation in that component's `README.md` and use its documented API; do not implement direct board/peripheral driving. The two required screens are browser views. An on-device TFT interface is outside this release except for showing debug lines what the device is doing like
+- show browser active screen names
+- receive telegram on P1
+- start WiFi portal with IP adres
+- when connecting to WiFi show SSID and IP-address
+- other debug information
+
+2. References and dependency
+
+|Reference                                                                                                                      |Role                                                                                                                                                                                                                                 |
+|-------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|[parserDSMR](https://github.com/mrWheel/parserDSMR)                                                                            |P1 framing, CRC, protocol profiles, OBIS decoding, M-Bus interpretation, and the ESP-IDF receive adapter. Last version/commit.                    |
+|[DSMRlogger32 firmware](https://github.com/mrWheel/DSMRlogger32/tree/main/DSMRlogger32)                                        |Functional reference for displaying raw telegrams and configuring device types per M-Bus channel. See `data/DSMRindex.js`, `src/restAPI.cpp`, `src/settingsStuff.cpp`, and `src/handleSlimmeMeter.cpp`. Reference revision `b9e401a`.|
+|[TFT LCD Display EC11 Piggyback Board](https://willem.aandewiel.nl/index.php/2026/05/19/tft-lcd-display-ec11-piggy-back-board/)|Hardware target and authoritative board pinout.                                                                                                                                                                                      |
+|[esp32_s3_piggyback](https://github.com/mrWheel/esp32-s3-Piggyback)                                                            |Board integration component. Follow the API documented in its `README.md`; do not drive the board directly.                                                                                                                         |
+|[esp-idf-wifi-provisioner](https://github.com/MichMich/esp-idf-wifi-provisioner)                                               |Wi-Fi connection using saved credentials and captive-portal provisioning fallback.                                                                                                                                                  |
+|[ESP-IDF UART driver](https://docs.espressif.com/projects/esp-idf/en/release-v6.0/esp32s3/api-reference/peripherals/uart.html) |UART routing and receive handling if an application-side adapter is required.                                                                                                                                                        |
+
+The project shall pin parserDSMR to a Git revision. For the inspected baseline, the ESP-IDF build shall add the checkout’s components/parserDSMR directory to EXTRA_COMPONENT_DIRS and require the parserDSMR component. The checkout shall preserve the relative symlinks from that component directory to the root src/, include/ and adapter/ directories. When the raw-frame API is available in the dependency, the production build shall pin the revision containing it. The pinned dependency shall retain its MIT license.
+
+The public integration headers are dsmr_parser.h and dsmr_uart_esp32.h. The parser test fixtures are in test/fixtures/. The baseline README describes the Belgian fixtures as pending verification against Fluvius publications and the profile field tables as covering core fields. Acceptance for the logger shall use independently verified Belgian fixtures and shall restrict the decoded summary to fields the dependency exposes.
+
+3. P1 input and board configuration
+
+The P1 data signal shall pass through a P1 interface that provides the appropriate signal conditioning and a 3.3 V-compatible signal at the ESP32-S3 input. The setup documentation shall identify the interface, wiring, signal polarity, and how the meter’s P1 request signal is enabled. The first release shall use an externally enabled request signal. RX polarity shall be set by the documented interface configuration at build time.
+
+The production receiver shall use a hardware UART separate from the console. Its RX GPIO shall be selected from the board’s J5 connector. The initial selectable set shall be GPIO10, 38, 39, 40, 41, 42, 47, and 48, subject to the resources actually enabled by the board configuration. GPIO43 and GPIO44 shall remain reserved for UART0. The application shall validate the selected pin against the same board allowlist whether the selection arrives through the SPA or the API. On first boot, or if saved settings cannot be loaded, reception shall await a valid configuration.
+
+4. Settings view
+
+|Setting         |Required behavior                                                                                                                                                                         |
+|----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|P1 RX GPIO      |Select an eligible J5 input and show its GPIO number.                                                                                                                                     |
+|Country         |Select the country code from the available parser profiles.                                                                                                                               |
+|Protocol version|Select a supported profile for the chosen country. Persist the stable profile ID. Display the human-readable protocol version and keep it separate from the version reported by the meter.|
+|M-Bus channels  |Show channels 1–4. Each channel shall default to **Auto** and shall offer **Disabled** and explicit device types supported for the selected profile.                                      |
+
+The settings service shall obtain built-in IDs through dsmrProfileListIds() and country and timing metadata through dsmrProfileLookup(). The baseline includes nl.dsmr.4.0, nl.dsmr.4.2, nl.dsmr.4 (4.0/4.2 selection), nl.dsmr.5.0, be.emucs.1.x, and be.emucs.2.1. The SPA shall use the choices returned by the settings service. UART settings, telegram framing, version checks and CRC policy shall follow the selected profile and the parser’s defaults.
+
+In Auto mode, the application shall use the device type reported in the channel’s 0-n:24.1.0 field. Explicit expected types shall be submitted through dsmrParserConfig.mbusDevices and mbusDeviceCount. The parser emits DSMR_DIAG_MBUS_TYPE_MISMATCH after an accepted telegram if the published type contradicts the configured one. The logger shall also detect a missing published type from the decoded fields. Disabled is a logger display setting. An explicit selection shall act as an expected type. A mismatch or missing type shall be visible in decoded diagnostics. The application shall preserve source data and shall only present a channel as the configured device type when the reported type matches. Disabled channels shall be omitted from the decoded summary while their lines remain visible in the raw telegram. A channel without a reading shall be shown as unavailable when applicable. A measured zero shall remain distinguishable from an unavailable reading. Submeter measurement timestamps and units shall be displayed as supplied by the parser. M-Bus data shall come from the P1 telegram.
+
+Save shall validate and apply the complete configuration as one operation. The settings service shall store the complete versioned configuration in ESP-IDF NVS. Any receiver restart shall discard a partial frame and initialize the new parser profile before consuming further bytes. If activation or persistence fails, the service shall restore the previous configuration and report the failure in the SPA. A successful save shall show the active configuration and current receive state. Previously captured records shall retain the country, profile and decoded data associated with their capture.
+
+5. Telegrams view
+
+The view shall update automatically, show the latest accepted telegram by default, and allow the user to select a recent telegram for inspection. New arrivals shall leave the user’s selected telegram in view while it is available. The interface shall report when a previously selected telegram has aged out and allow the user to return to the latest telegram.
+
+Each retained record shall contain a sequence number, receive time, active profile, reported version, validation status, and the exact raw data received for the accepted frame. The raw view shall preserve original line endings and the trailer, and shall display text without interpreting it as HTML. A decoded summary shall show available electricity measurements and enabled M-Bus channels from that same telegram. Receive time, meter time, and M-Bus measurement time shall remain distinct. If wall-clock time is unavailable, receive age or uptime shall be shown explicitly.
+
+The view shall distinguish input awaiting configuration, input awaiting data, an accepted telegram, a stale last reading, and a receiver or parser error. Rejected candidates shall update diagnostics without replacing the last accepted telegram. Diagnostics shall include available reasons and receive counters. RAM limits shall be explicit and shall accommodate at least two maximum-sized supported telegram records in the documented target configuration. The oldest record shall be evicted first. Slow or disconnected browser clients shall have no effect on UART reception.
+
+6. Integration and build
+
+• The receive path shall use dsmrUartStart() and dsmrUartStop(), setting dsmrUartConfig.rxPin from active settings and requestGpio to -1 for external request. Parser initialization shall use dsmrParserInit() with caller-owned workspace sized by dsmrParserWorkspaceSizeNeeded(). Configuration changes shall stop and join the receive task before reinitializing the parser and starting the UART with the new settings. The runtime shall preserve the previous saved configuration until the new receiver is ready and restore it if the change fails. The adapter shall report UART overflow and framing errors as data loss. The inspected adapter uses polling without a UART event queue, so explicit reporting of these events shall be added or verified in the production dependency.
+• The logger requires a public, read-only raw byte view and length on the accepted dsmrTelegramResult. At the baseline, the result exposes decoded fields and the decoder modifies the framing buffer in place. The parser shall preserve a bounded copy of the complete received frame before in-place decoding, including every original line ending and trailer byte. It shall expose that copy only with the accepted event, with a lifetime through the callback, and include its storage in workspace sizing. The logger shall copy that view and the decoded result into its history. Framing and CRC shall remain the responsibility of parserDSMR.
+• One receive task shall own the receiver and parser state. Callback data needed by the SPA shall be copied within its documented lifetime. HTTP handlers shall read consistent snapshots and shall avoid holding receive-side locks during network writes.
+• ESP-IDF esp_http_server shall serve the SPA and its API from the same origin. The API shall expose active settings and valid choices, settings updates, reception status and diagnostics, recent telegram metadata, and individual telegram details and raw bytes. The SPA shall transfer only recent metadata and telegrams it needs. All assets shall work over the local network without an external service.
+• Use MichMich's `esp-idf-wifi-provisioner` component for connecting with saved Wi-Fi credentials and captive-portal fallback when credentials are not yet provisioned or the saved network cannot be joined. Document the first-boot provisioning flow without requiring firmware recompilation. The logger shall continue processing P1 telegrams while Wi-Fi is disconnected and shall serve the SPA again after reconnecting. The project shall document the local URL or how to find the device IP.
+• The deliverable shall include the ESP-IDF project files, the pinned parser dependency, embedded SPA assets, and a README with build, flash, monitor, Wi-Fi setup, P1 wiring, and hardware verification instructions. The normal build path shall use idf.py set-target esp32s3, idf.py build, and idf.py -p PORT flash monitor.
+
+7. Acceptance criteria
+
+1. The project builds with ESP-IDF 6.0.2 for ESP32-S3. After flash and documented Wi-Fi setup, the device serves both SPA views.
+2. Saving a supported GPIO, country/profile, and M-Bus configuration activates the complete configuration and survives a power cycle. Invalid pins, mismatched country/profile pairs, and unsupported M-Bus settings produce feedback and preserve the active configuration.
+3. Representative valid Dutch and Belgian fixtures travel through the normal receive path and appear in the SPA. The raw response matches the supplied accepted frame byte for byte. The decoded summary matches parser output, including units and missing values.
+4. Invalid CRC, truncated input and input received during a profile change leave the most recent accepted record intact. Reception recovers on the next complete valid frame.
+5. M-Bus Auto, Disabled, and expected-type mismatch behavior is verified with more than one channel. Raw data remains available for every channel in an accepted frame.
+6. At the fastest supported telegram cadence, the history remains bounded and a slow browser does not stall reception. A network disconnect and reconnect preserves reception and restores access to the web interface.
+7. On the physical target, a conditioned P1 signal on a selectable J5 pin is received with the documented interface settings. The selected RX GPIO and console operate together and the board’s reserved peripheral pins remain available for their assigned functions.
