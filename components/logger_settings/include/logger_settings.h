@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.h - versioned settings service
-//-- Date: 2026-11-14 · Build: 1
+//-- Date: 2026-11-15 · Build: 1
 //--
 //-- The settings service stores the complete versioned configuration in
 //-- ESP-IDF NVS, validates it against the parserDSMR built-in profiles and
@@ -30,7 +30,16 @@
 #define LOGGER_P1_GPIO_COUNT 8
 extern const int loggerP1GpioChoices[LOGGER_P1_GPIO_COUNT];
 
+//-- Special RX selection: -1 selects the internal test data generator. No
+//-- UART is started; the receiver feeds synthetic telegrams through the
+//-- parser instead. It is a mode marker, not a board pin, so it stays out of
+//-- the J5 allowlist and is validated separately.
+#define LOGGER_RX_GPIO_TEST (-1)
+
 bool loggerSettingsIsSelectableGpio(int gpio);
+
+//-- True when the selection is the internal test data generator.
+bool loggerSettingsIsTestGpio(int gpio);
 
 //-- --------------------------------------------------------------------------
 //-- Settings model

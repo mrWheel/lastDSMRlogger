@@ -1,3 +1,6 @@
 {
-    "claudeCode.disableLoginPrompt": true
+    "claudeCode.disableLoginPrompt": true,
+    "idf.currentSetup": "/Users/willema/.espressif/v6.0.2/esp-idf",
+    "idf.port": "/dev/tty.usbmodem202401",
+    "idf.flashType": "UART"
 }

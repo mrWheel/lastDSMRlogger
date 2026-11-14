@@ -1,7 +1,7 @@
 # lastDSMRlogger
 
 Buildnumber: 1
-Last update-date: 2026-11-14
+Last update-date: 2026-11-15
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -113,14 +113,23 @@ your router for the host name `esp32-s3-<mac>`.
 ## 6. Web interface
 
 The SPA is served by the device from the same origin as the API, with all
-assets embedded in the firmware. No external service is required.
+assets embedded in the firmware. No external service is required. All
+dynamic data (status, telegram list, settings, details, raw frames) travels
+over one WebSocket at `/ws`: the device pushes status every second and the
+telegram list whenever a telegram was accepted, the browser sends
+form-urlencoded commands, and raw telegram bytes arrive as a binary frame.
+The HTTP API remains available for diagnostics and clients without
+WebSocket support. The SPA opens with the **Telegrams** view.
 
-- **Settings**: P1 RX GPIO (board allowlist), country, protocol profile
-  (human-readable label, stable ID persisted, kept separate from the version
-  reported by the meter), and M-Bus channels 1–4 with Auto, Disabled or an
-  explicit device type. Save validates and applies the complete configuration
-  as one operation and stores it in NVS; on any failure the active
-  configuration is preserved and the reason is shown.
+- **Settings**: prefilled with the configuration currently stored in NVS and
+  refilled after every save, so the form always shows the settings in force.
+  P1 RX GPIO (board allowlist, plus the *Test data* selection), country,
+  protocol profile (human-readable label, stable ID persisted, kept separate
+  from the version reported by the meter), and M-Bus channels 1–4 with Auto,
+  Disabled or an explicit device type. All dropdowns are filled from the
+  valid choices the device reports. Save validates and applies the complete
+  configuration as one operation and stores it in NVS; on any failure the
+  active configuration is preserved and the reason is shown.
 - **Telegrams**: updates automatically, latest accepted telegram by default,
   selection of a recent record. New arrivals leave the selected record in
   view; an aged-out selection is reported with a button back to the latest.
@@ -138,13 +147,28 @@ telegram, and the Wi-Fi portal/connected state.
 
 |Method |Path                        |Purpose                                                       |
 |-------|----------------------------|--------------------------------------------------------------|
-|GET    |`/api/config`               |Active settings + valid choices (GPIOs, countries, profiles)  |
+|WS     |`/ws`                       |SPA transport: status/telegram pushes + `cmd=config\|save\|status\|telegrams\|telegram\|raw\|view`, raw bytes as binary frame |
+|GET    |`/api/config`               |NVS settings + active state + valid choices (GPIOs, countries, profiles) |
 |POST   |`/api/config`               |Save form-urlencoded settings (one atomic operation)          |
 |GET    |`/api/status`               |Reception state, counters, last diagnostic, uptime            |
 |GET    |`/api/telegrams`            |Metadata of retained records, newest first                    |
 |GET    |`/api/telegram/<seq>`       |Decoded detail of one record                                  |
 |GET    |`/api/telegram/<seq>/raw`   |Exact accepted frame bytes as `text/plain`                    |
 |POST   |`/api/view`                 |Reports the active browser screen name to the device display  |
+
+### Test data mode
+
+Selecting **Test data (no UART)** (RX GPIO `-1`) in the Settings view starts
+an internal generator instead of the UART receiver. It feeds complete,
+CRC-correct synthetic telegrams through the same parser and event path at
+the profile cadence (clamped to 1–5 s), randomising the timestamps and the
+measurement values (power, energy totals, tariff, voltages, currents and,
+once an M-Bus channel is declared as an expected device type, its reading).
+The frames follow the shapes of the verified parser fixtures, so Dutch and
+Belgian profiles both decode. The status strip then shows
+*test data (no UART)*. This selection is validated like any other pin: it
+must pass through the settings service, and it is the only value outside the
+J5 allowlist that is accepted.
 
 ## 7. RAM limits (documented target configuration)
 

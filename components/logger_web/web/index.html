@@ -10,15 +10,15 @@
   <header>
     <h1>lastDSMRlogger</h1>
     <nav>
-      <button id="tabSettings" class="tab active" type="button">Settings</button>
-      <button id="tabTelegrams" class="tab" type="button">Telegrams</button>
+      <button id="tabSettings" class="tab" type="button">Settings</button>
+      <button id="tabTelegrams" class="tab active" type="button">Telegrams</button>
     </nav>
   </header>
 
   <div id="statusStrip" class="status">Connecting to the logger...</div>
 
   <main>
-    <section id="viewSettings">
+    <section id="viewSettings" hidden>
       <h2>Settings</h2>
       <div id="settingsMessage" class="message"></div>
       <form id="settingsForm">
@@ -55,7 +55,7 @@
       </form>
     </section>
 
-    <section id="viewTelegrams" hidden>
+    <section id="viewTelegrams">
       <h2>Telegrams</h2>
       <div id="telegramState" class="message"></div>
       <select id="telegramList" size="6" aria-label="Recent telegrams"></select>

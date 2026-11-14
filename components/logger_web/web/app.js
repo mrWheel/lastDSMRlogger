@@ -1,22 +1,28 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-14 · Build: 1
+// Date: 2026-11-15 · Build: 1
 //
-// Two views share one page: Settings and Telegrams. The page polls the
-// device; every rendering path uses textContent so telegram text is never
-// interpreted as HTML. The active screen name is reported to the device so
-// the on-device debug lines show what the browser is displaying.
+// Two views share one page: Settings and Telegrams, the Telegrams view
+// opens first. All dynamic data travels over one WebSocket at /ws: the
+// device pushes status and the telegram list, the browser sends
+// form-urlencoded commands (cmd=config, cmd=save, cmd=telegram, cmd=raw,
+// cmd=view, cmd=telegrams). Raw telegram bytes arrive as a binary frame
+// behind their JSON header. Every rendering path uses textContent so
+// telegram text is never interpreted as HTML. The active screen name is
+// reported to the device so the on-device debug lines show what the browser
+// is displaying. If the link drops, the client reconnects and re-requests
+// what the current view needs.
 
 "use strict";
 
-const POLL_MS = 2000;
-
 const state =
 {
-  screen: "settings",
+  screen: "telegrams",
   config: null,
   selectedSeq: null,
   latestSeq: null,
-  telegramTimer: null,
+  pendingRawSeq: null,
+  ws: null,
+  wsReady: false,
 };
 
 const el = {};
@@ -44,19 +50,162 @@ function formatUptime(ms)
   return hours + "h " + String(minutes).padStart(2, "0") + "m " + String(seconds).padStart(2, "0") + "s";
 }
 
-async function postForm(path, body)
+//-- --------------------------------------------------------------------------
+//-- WebSocket transport
+//-- --------------------------------------------------------------------------
+
+function wsSend(command)
 {
-  return fetch(path,
+  if (state.wsReady && (state.ws !== null))
   {
-    method: "POST",
-    headers: {"Content-Type": "application/x-www-form-urlencoded"},
-    body: body,
-  });
+    state.ws.send(command);
+  }
+}
+
+function requestCurrentView()
+{
+  reportActiveScreen();
+
+  if (state.screen === "settings")
+  {
+    wsSend("cmd=config");
+  }
+  else
+  {
+    wsSend("cmd=telegrams");
+  }
+}
+
+function wsConnect()
+{
+  const proto = (location.protocol === "https:") ? "wss:" : "ws:";
+  const socket = new WebSocket(proto + "//" + location.host + "/ws");
+  state.ws = socket;
+
+  socket.binaryType = "arraybuffer";
+
+  socket.onopen = () =>
+  {
+    state.wsReady = true;
+    el.statusStrip.textContent = "Connected to the logger.";
+    requestCurrentView();
+  };
+
+  socket.onclose = () =>
+  {
+    state.wsReady = false;
+    state.ws = null;
+    el.statusStrip.textContent = "Connection to the logger lost: reconnecting...";
+    setTimeout(wsConnect, 2000);
+  };
+
+  socket.onerror = () =>
+  {
+    try
+    {
+      socket.close();
+    }
+    catch (error)
+    {
+      // The close handler schedules the reconnect.
+    }
+  };
+
+  socket.onmessage = (event) =>
+  {
+    if (typeof event.data === "string")
+    {
+      try
+      {
+        handleTextMessage(JSON.parse(event.data));
+      }
+      catch (error)
+      {
+        // Ignore anything that is not a valid protocol message.
+      }
+    }
+    else
+    {
+      handleRawFrame(event.data);
+    }
+  };
+}
+
+function handleTextMessage(message)
+{
+  switch (message.type)
+  {
+    case "status":
+      renderStatus(message);
+      break;
+
+    case "telegrams":
+      renderTelegramList(message.telegrams || []);
+      break;
+
+    case "config":
+      renderSettings(message);
+      break;
+
+    case "telegram":
+      renderDetail(message);
+      break;
+
+    case "raw":
+      state.pendingRawSeq = message.sequence;
+      break;
+
+    case "save":
+      handleSaveResult(message);
+      break;
+
+    case "error":
+      handleServerError(message);
+      break;
+
+    default:
+      break;
+  }
+}
+
+function handleRawFrame(buffer)
+{
+  if (state.pendingRawSeq === null)
+  {
+    return;
+  }
+
+  // textContent preserves the original line endings and never interprets
+  // the telegram text as HTML.
+  el.rawView.textContent = new TextDecoder("utf-8").decode(buffer);
+  state.pendingRawSeq = null;
+}
+
+function handleServerError(message)
+{
+  if (message.request === "telegram")
+  {
+    el.telegramDetail.hidden = true;
+    setTelegramState(message.error || "Telegram unavailable.");
+  }
+  else if (message.request === "raw")
+  {
+    el.rawView.textContent = "(" + (message.error || "raw bytes unavailable") + ")";
+    state.pendingRawSeq = null;
+  }
+  else if (message.request === "save")
+  {
+    el.settingsMessage.textContent = "Rejected: " + message.error + ". The active configuration is preserved.";
+  }
+  else
+  {
+    el.settingsMessage.textContent = "Device error: " + message.error;
+  }
 }
 
 function reportActiveScreen()
 {
-  postForm("/api/view", "screen=" + encodeURIComponent(state.screen)).catch(() => {});
+  wsSend("cmd=view&screen=" + encodeURIComponent(state.screen));
 }
 
 //-- --------------------------------------------------------------------------
@@ -72,59 +221,50 @@ const STATE_LABELS =
   error: "Receiver or parser error",
 };
 
-async function pollStatus()
+function renderStatus(status)
 {
-  try
+  let text = "State: " + (STATE_LABELS[status.state] || status.state);
+
+  if (status.activeProfileId)
   {
-    const response = await fetch("/api/status");
-    const status = await response.json();
-
-    let text = "State: " + (STATE_LABELS[status.state] || status.state);
-
-    if (status.activeProfileId)
-    {
-      text += "  ·  profile " + status.activeProfileId;
-    }
-
-    if (status.receiverRunning)
-    {
-      text += "  ·  RX GPIO " + status.rxGpio;
-    }
-
-    // Wall clock time is unavailable in this release: show receive age and
-    // uptime explicitly instead.
-    text += "  ·  uptime " + formatUptime(status.uptimeMs);
-
-    if (status.hasLastAccepted)
-    {
-      text += "  ·  last received " + formatUptime(status.lastAcceptedAgeMs) + " ago";
-    }
-
-    text += "  ·  accepted " + status.acceptedCount + ", rejected " + status.rejectedCount + ", data loss " + status.dataLossCount;
-
-    if (status.lastDiagReason)
-    {
-      text += "  ·  last diagnostic: " + status.lastDiagReason;
-
-      if (status.lastDiagObis)
-      {
-        text += " @ " + status.lastDiagObis;
-      }
-    }
-
-    if (status.lastError)
-    {
-      text += "  ·  error: " + status.lastError;
-    }
-
-    el.statusStrip.textContent = text;
-    el.statusStrip.classList.toggle("error", status.state === "error");
-    el.footerInfo.textContent = "lastDSMRlogger · first release · telegram history stays in RAM";
+    text += "  ·  profile " + status.activeProfileId;
   }
-  catch (error)
+
+  if (status.receiverRunning)
   {
-    el.statusStrip.textContent = "Cannot reach the logger: " + error;
+    // A test selection has no UART: say so instead of showing GPIO -1.
+    text += status.testMode ? "  ·  test data (no UART)" : "  ·  RX GPIO " + status.rxGpio;
   }
+
+  // Wall clock time is unavailable in this release: show receive age and
+  // uptime explicitly instead.
+  text += "  ·  uptime " + formatUptime(status.uptimeMs);
+
+  if (status.hasLastAccepted)
+  {
+    text += "  ·  last received " + formatUptime(status.lastAcceptedAgeMs) + " ago";
+  }
+
+  text += "  ·  accepted " + status.acceptedCount + ", rejected " + status.rejectedCount + ", data loss " + status.dataLossCount;
+
+  if (status.lastDiagReason)
+  {
+    text += "  ·  last diagnostic: " + status.lastDiagReason;
+
+    if (status.lastDiagObis)
+    {
+      text += " @ " + status.lastDiagObis;
+    }
+  }
+
+  if (status.lastError)
+  {
+    text += "  ·  error: " + status.lastError;
+  }
+
+  el.statusStrip.textContent = text;
+  el.statusStrip.classList.toggle("error", status.state === "error");
+  el.footerInfo.textContent = "lastDSMRlogger · first release · telegram history stays in RAM";
 }
 
 //-- --------------------------------------------------------------------------
@@ -176,27 +316,31 @@ function fillProfiles(country, preferredId)
   }
 }
 
-async function loadSettings()
+function renderSettings(message)
 {
-  try
+  state.config = message;
+
+  const choices = message.choices;
+  const settings = message.settings;
+
+  if (message.hasStored)
   {
-    const response = await fetch("/api/config");
-    state.config = await response.json();
+    el.settingsMessage.textContent = "Stored configuration shown. It is applied as one operation and survives a power cycle.";
   }
-  catch (error)
+  else if (message.hasActive)
   {
-    el.settingsMessage.textContent = "Cannot load the configuration: " + error;
-    return;
+    el.settingsMessage.textContent = "Active configuration shown; it could not be read back from storage.";
+  }
+  else
+  {
+    el.settingsMessage.textContent = "No valid configuration yet: reception awaits a valid configuration below.";
   }
 
-  const choices = state.config.choices;
-  const settings = state.config.settings;
-
-  el.settingsMessage.textContent = state.config.hasActive
-    ? "Active configuration shown. It is applied as one operation and survives a power cycle."
-    : "No valid configuration yet: reception awaits a valid configuration below.";
-
-  fillSelect(el.selGpio, choices.gpios, choices.gpios.map((gpio) => "GPIO" + gpio));
+  // The RX dropdown offers every eligible J5 input plus the test selection.
+  const testGpio = (choices.testGpio === undefined) ? -1 : choices.testGpio;
+  const gpioValues = (choices.gpios || []).concat([testGpio]);
+  const gpioLabels = (choices.gpios || []).map((gpio) => "GPIO" + gpio).concat(["Test data (no UART)"]);
+  fillSelect(el.selGpio, gpioValues, gpioLabels);
   fillSelect(el.selCountry, choices.countries);
 
   const mbus = mbusOptions(choices.mbusTypes || []);
@@ -224,17 +368,18 @@ async function loadSettings()
   }
   else
   {
-    el.selCountry.value = choices.countries[0] || "NL";
+    el.selCountry.value = (choices.countries && choices.countries[0]) || "NL";
     fillProfiles(el.selCountry.value, null);
   }
 }
 
-async function saveSettings(event)
+function saveSettings(event)
 {
   event.preventDefault();
   el.settingsMessage.textContent = "Saving...";
 
-  const body = "rxGpio=" + encodeURIComponent(el.selGpio.value) +
+  const body = "cmd=save" +
+               "&rxGpio=" + encodeURIComponent(el.selGpio.value) +
                "&country=" + encodeURIComponent(el.selCountry.value) +
                "&profileId=" + encodeURIComponent(el.selProfile.value) +
                "&mbus1=" + encodeURIComponent(el.selMbus1.value) +
@@ -242,25 +387,18 @@ async function saveSettings(event)
                "&mbus3=" + encodeURIComponent(el.selMbus3.value) +
                "&mbus4=" + encodeURIComponent(el.selMbus4.value);
 
-  try
-  {
-    const response = await postForm("/api/config", body);
-    const result = await response.json();
+  wsSend(body);
+}
 
-    if (result.ok)
-    {
-      el.settingsMessage.textContent = "Configuration activated and stored.";
-      await loadSettings();
-      await pollStatus();
-    }
-    else
-    {
-      el.settingsMessage.textContent = "Rejected: " + result.error + ". The active configuration is preserved.";
-    }
-  }
-  catch (error)
+function handleSaveResult(message)
+{
+  if (message.ok)
   {
-    el.settingsMessage.textContent = "Save failed: " + error + ". The active configuration is preserved.";
+    el.settingsMessage.textContent = "Configuration activated and stored.";
+  }
+  else
+  {
+    el.settingsMessage.textContent = "Rejected: " + message.error + ". The active configuration is preserved.";
   }
 }
 
@@ -273,86 +411,59 @@ function setTelegramState(message)
   el.telegramState.textContent = message;
 }
 
-async function pollTelegrams()
+function renderTelegramList(telegrams)
 {
-  try
+  if (telegrams.length === 0)
   {
-    const response = await fetch("/api/telegrams");
-    const data = await response.json();
-    const telegrams = data.telegrams || [];
-
-    if (telegrams.length === 0)
-    {
-      el.telegramList.textContent = "";
-      el.telegramDetail.hidden = true;
-      el.agedOutNotice.hidden = true;
-      setTelegramState("No telegram accepted yet.");
-      return;
-    }
-
-    el.latestSeq = telegrams[0].sequence;
-
     el.telegramList.textContent = "";
-    telegrams.forEach((telegram) =>
-    {
-      const option = document.createElement("option");
-      option.value = String(telegram.sequence);
-      const crc = telegram.crcVerified ? "crc ok" : "no crc";
-      option.textContent = "#" + telegram.sequence + "  " + telegram.profileId +
-                           "  v" + telegram.reportedVersion + "  " + crc +
-                           "  at " + formatUptime(telegram.receivedUptimeMs);
-      el.telegramList.appendChild(option);
-    });
-
-    const stillAvailable = telegrams.some((telegram) => telegram.sequence === state.selectedSeq);
-
-    if (state.selectedSeq === null)
-    {
-      selectTelegram(el.latestSeq);
-      return;
-    }
-
-    if (stillAvailable)
-    {
-      // A new arrival leaves the user's selected telegram in view.
-      el.agedOutNotice.hidden = true;
-      el.telegramList.value = String(state.selectedSeq);
-    }
-    else
-    {
-      el.agedOutNotice.hidden = false;
-    }
+    el.telegramDetail.hidden = true;
+    el.agedOutNotice.hidden = true;
+    setTelegramState("No telegram accepted yet.");
+    return;
   }
-  catch (error)
+
+  el.latestSeq = telegrams[0].sequence;
+
+  el.telegramList.textContent = "";
+  telegrams.forEach((telegram) =>
   {
-    setTelegramState("Cannot reach the logger: " + error);
+    const option = document.createElement("option");
+    option.value = String(telegram.sequence);
+    const crc = telegram.crcVerified ? "crc ok" : "no crc";
+    option.textContent = "#" + telegram.sequence + "  " + telegram.profileId +
+                         "  v" + telegram.reportedVersion + "  " + crc +
+                         "  at " + formatUptime(telegram.receivedUptimeMs);
+    el.telegramList.appendChild(option);
+  });
+
+  const stillAvailable = telegrams.some((telegram) => telegram.sequence === state.selectedSeq);
+
+  if (state.selectedSeq === null)
+  {
+    selectTelegram(el.latestSeq);
+    return;
+  }
+
+  if (stillAvailable)
+  {
+    // A new arrival leaves the user's selected telegram in view.
+    el.agedOutNotice.hidden = true;
+    el.telegramList.value = String(state.selectedSeq);
+  }
+  else
+  {
+    el.agedOutNotice.hidden = false;
   }
 }
 
-async function selectTelegram(sequence)
+function selectTelegram(sequence)
 {
   state.selectedSeq = sequence;
   el.agedOutNotice.hidden = true;
   el.telegramDetail.hidden = false;
-
-  try
-  {
-    const response = await fetch("/api/telegram/" + sequence);
-    const detail = await response.json();
-
-    if (detail.ok === false)
-    {
-      el.telegramDetail.hidden = true;
-      setTelegramState(detail.error || "Telegram unavailable.");
-      return;
-    }
-
-    renderDetail(detail);
-  }
-  catch (error)
-  {
-    setTelegramState("Cannot load the telegram: " + error);
-  }
+  el.telegramList.value = String(sequence);
+  wsSend("cmd=telegram&seq=" + encodeURIComponent(sequence));
+  wsSend("cmd=raw&seq=" + encodeURIComponent(sequence));
 }
 
 function renderDetail(detail)
@@ -442,29 +553,6 @@ function renderDetail(detail)
   });
 
   setTelegramState("");
-  loadRaw(meta.sequence);
-}
-
-async function loadRaw(sequence)
-{
-  try
-  {
-    const response = await fetch("/api/telegram/" + sequence + "/raw");
-
-    if (!response.ok)
-    {
-      el.rawView.textContent = "(raw bytes unavailable)";
-      return;
-    }
-
-    // textContent preserves the original line endings and never interprets
-    // the telegram text as HTML.
-    el.rawView.textContent = await response.text();
-  }
-  catch (error)
-  {
-    el.rawView.textContent = "(cannot load raw bytes: " + error + ")";
-  }
 }
 
 //-- --------------------------------------------------------------------------
@@ -481,26 +569,14 @@ function showScreen(name)
 
   if (name === "settings")
   {
-    loadSettings();
+    wsSend("cmd=config");
   }
   else
   {
-    pollTelegrams();
+    wsSend("cmd=telegrams");
   }
 
   reportActiveScreen();
-}
-
-function startTimers()
-{
-  setInterval(pollStatus, POLL_MS);
-  state.telegramTimer = setInterval(() =>
-  {
-    if (state.screen === "telegrams")
-    {
-      pollTelegrams();
-    }
-  }, POLL_MS);
 }
 
 function boot()
@@ -529,9 +605,8 @@ function boot()
     }
   });
 
-  pollStatus();
-  showScreen("settings");
-  startTimers();
+  wsConnect();
+  showScreen("telegrams");
 }
 
 document.addEventListener("DOMContentLoaded", boot);

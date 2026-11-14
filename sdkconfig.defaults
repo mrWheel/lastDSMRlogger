@@ -1,5 +1,5 @@
 # lastDSMRlogger - default SDK configuration
-# Date: 2026-11-14 · Build: 1
+# Date: 2026-11-15 · Build: 1
 
 # Hardware target: ESP32-S3 on the TFT LCD Display EC11 Piggyback Board v3.
 CONFIG_IDF_TARGET="esp32s3"
@@ -8,6 +8,10 @@ CONFIG_IDF_TARGET="esp32s3"
 # hardware UART (UART1) so reception never shares the console.
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_UART_NUM=0
+
+# The SPA exchanges its dynamic data with the device over a WebSocket; the
+# esp_http_server WebSocket support must be compiled in.
+CONFIG_HTTPD_WS_SUPPORT=y
 
 # The SPA assets are embedded in the firmware image; the default single
 # application partition is large enough for this release.

@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.c - versioned settings service
-//-- Date: 2026-11-14 · Build: 1
+//-- Date: 2026-11-15 · Build: 1
 //--
 //-- The complete configuration is stored as one versioned blob so a save is
 //-- atomic. A stored blob that fails validation is treated as absent: the
@@ -91,6 +91,11 @@ bool loggerSettingsIsSelectableGpio(int gpio)
   return false;
 }
 
+bool loggerSettingsIsTestGpio(int gpio)
+{
+  return gpio == LOGGER_RX_GPIO_TEST;
+}
+
 uint8_t loggerSettingsBuildMbusDevices(const loggerSettingsConfig *config, dsmrMbusDevice *outDevices, uint8_t deviceCapacity)
 {
   if ((config == NULL) || (outDevices == NULL))
@@ -133,9 +138,11 @@ bool loggerSettingsValidate(const loggerSettingsConfig *config)
     return false;
   }
 
-  if (!loggerSettingsIsSelectableGpio(config->rxGpio))
+  //-- The RX selection must be an eligible J5 input or the internal test
+  //-- data generator (-1). Validation is identical for SPA and API input.
+  if (!loggerSettingsIsSelectableGpio(config->rxGpio) && !loggerSettingsIsTestGpio(config->rxGpio))
   {
-    ESP_LOGW(tag, "rejecting RX GPIO %d: not on the board allowlist", config->rxGpio);
+    ESP_LOGW(tag, "rejecting RX GPIO %d: neither on the board allowlist nor the test selection", config->rxGpio);
     return false;
   }
 

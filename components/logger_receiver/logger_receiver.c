@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.c - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-14 · Build: 1
+//-- Date: 2026-11-15 · Build: 1
 //--
 //-- The parserDSMR adapter task owns the parser instance while it runs. The
 //-- event callback copies the complete accepted frame and the decoded fields
@@ -20,11 +20,13 @@
 #include "driver/uart.h"
 #include "dsmr_uart_esp32.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "logger_board.h"
+#include "logger_testdata.h"
 
 static const char *tag = "loggerReceiver";
 
@@ -337,6 +339,124 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
 }
 
 //-- --------------------------------------------------------------------------
+//-- Test data generator (RX selection LOGGER_RX_GPIO_TEST)
+//-- --------------------------------------------------------------------------
+
+//-- When the RX selection is -1 no UART is opened: this task becomes the
+//-- single feed task for the parser (the ownership rule of the receive task
+//-- still holds — exactly one task feeds the parser at any time). It builds
+//-- a complete telegram per period with the shape of the verified parser
+//-- fixtures, randomising at least the timestamps and the measurement
+//-- values, and passes it through dsmrParserFeed into the same event
+//-- callback the UART adapter uses. The line shapes are taken from the
+//-- accepted fixtures of the parser repository so the frames verify their
+//-- CRC and decode under the selected profile; lines a profile does not
+//-- define are skipped by the parser's unknown-field policy.
+
+#define TEST_TELEGRAM_BUFFER_BYTES 2048
+#define TEST_TASK_JOIN_TIMEOUT_MS 15000u
+
+static volatile bool testTaskRunning;
+static TaskHandle_t testTaskHandle;
+
+typedef struct
+{
+  LoggerReceiver *self;
+  const dsmrProfile *profile;
+} TestTaskArguments;
+
+static TestTaskArguments testArguments;
+static char testTelegram[TEST_TELEGRAM_BUFFER_BYTES];
+
+//-- The frame builder lives in logger_testdata.c so it can also be checked
+//-- on the host against the real parser; randomness comes from the ESP
+//-- random source.
+static uint32_t testRandomLimit(uint32_t limit)
+{
+  return esp_random() % limit;
+}
+
+static void testGeneratorTask(void *argument)
+{
+  TestTaskArguments *arguments = (TestTaskArguments *)argument;
+  LoggerReceiver *self = arguments->self;
+  const dsmrProfile *profile = arguments->profile;
+
+  uint32_t periodMs = (profile != NULL) ? profile->telegramIntervalMs : 1000u;
+
+  //-- Test data stays lively without pretending to be faster than the
+  //-- profile cadence: clamp between one and five seconds.
+  if (periodMs < 1000u)
+  {
+    periodMs = 1000u;
+  }
+
+  if (periodMs > 5000u)
+  {
+    periodMs = 5000u;
+  }
+
+  while (testTaskRunning)
+  {
+    vTaskDelay(pdMS_TO_TICKS((TickType_t)periodMs));
+
+    if (!testTaskRunning)
+    {
+      break;
+    }
+
+    size_t length = loggerTestDataBuild(profile, testTelegram, sizeof testTelegram);
+
+    if (length > 0u)
+    {
+      dsmrParserFeed(&self->parser, (const uint8_t *)testTelegram, length, uptimeMs(), onParserEvent, self);
+    }
+  }
+
+  testTaskHandle = NULL;
+  vTaskDelete(NULL);
+}
+
+static esp_err_t startTestGenerator(LoggerReceiver *self, const loggerSettingsConfig *config)
+{
+  testArguments.self = self;
+  testArguments.profile = dsmrProfileLookup(config->profileId);
+
+  //-- Random seeds so every run produces different measurement progressions.
+  loggerTestDataSeed(testRandomLimit);
+
+  testTaskRunning = true;
+
+  BaseType_t created = xTaskCreate(testGeneratorTask, "p1TestData", LOGGER_P1_TASK_STACK_BYTES,
+                                   &testArguments, LOGGER_P1_TASK_PRIORITY, &testTaskHandle);
+
+  if (created != pdPASS)
+  {
+    testTaskRunning = false;
+    testTaskHandle = NULL;
+    return ESP_ERR_NO_MEM;
+  }
+
+  ESP_LOGI(tag, "test data generator active (no UART): profile %s", config->profileId);
+  return ESP_OK;
+}
+
+static void stopTestGenerator(void)
+{
+  testTaskRunning = false;
+
+  uint32_t waitedMs = 0u;
+
+  //-- Join the generator task: it may be inside dsmrParserFeed right now and
+  //-- the parser must not be reinitialised under a running feed.
+  while ((testTaskHandle != NULL) && (waitedMs < TEST_TASK_JOIN_TIMEOUT_MS))
+  {
+    vTaskDelay(pdMS_TO_TICKS(20));
+    waitedMs += 20u;
+  }
+}
+
+//-- --------------------------------------------------------------------------
 //-- Receiver start / stop (callers hold the mutex)
 //-- --------------------------------------------------------------------------
 
@@ -368,31 +488,43 @@ static esp_err_t startLocked(LoggerReceiver *self, const loggerSettingsConfig *c
     return ESP_FAIL;
   }
 
-  dsmrUartConfig uartConfig;
-  memset(&uartConfig, 0, sizeof uartConfig);
-  uartConfig.uartPort = LOGGER_P1_UART_PORT;
-  uartConfig.rxPin = config->rxGpio;
-  uartConfig.txPin = -1;
+  esp_err_t result;
 
-  //-- The first release uses an externally enabled request signal.
-  uartConfig.requestGpio = -1;
-  uartConfig.requestActiveHigh = true;
-  uartConfig.taskStackSize = LOGGER_P1_TASK_STACK_BYTES;
-  uartConfig.taskPriority = LOGGER_P1_TASK_PRIORITY;
+  if (loggerSettingsIsTestGpio(config->rxGpio))
+  {
+    //-- No UART is opened: the test data generator becomes the single feed
+    //-- task and passes synthetic frames through the same parser and event
+    //-- callback as the UART adapter.
+    result = startTestGenerator(self, config);
+  }
+  else
+  {
+    dsmrUartConfig uartConfig;
+    memset(&uartConfig, 0, sizeof uartConfig);
+    uartConfig.uartPort = LOGGER_P1_UART_PORT;
+    uartConfig.rxPin = config->rxGpio;
+    uartConfig.txPin = -1;
+
+    //-- The first release uses an externally enabled request signal.
+    uartConfig.requestGpio = -1;
+    uartConfig.requestActiveHigh = true;
+    uartConfig.taskStackSize = LOGGER_P1_TASK_STACK_BYTES;
+    uartConfig.taskPriority = LOGGER_P1_TASK_PRIORITY;
 
 #if defined(CONFIG_LASTDSMRLOGGER_P1_RX_INVERTED)
-  uartConfig.invertRx = true;
+    uartConfig.invertRx = true;
 #else
-  uartConfig.invertRx = false;
+    uartConfig.invertRx = false;
 #endif
 
-  esp_err_t result = dsmrUartStart(&self->uart, &self->parser, &uartConfig, onParserEvent, self);
+    result = dsmrUartStart(&self->uart, &self->parser, &uartConfig, onParserEvent, self);
+  }
 
   xSemaphoreTake(self->mutex, portMAX_DELAY);
 
   if (result != ESP_OK)
   {
-    snprintf(self->lastError, sizeof self->lastError, "uart start failed on GPIO %d: %s", config->rxGpio, esp_err_to_name(result));
+    snprintf(self->lastError, sizeof self->lastError, "receiver start failed on GPIO %d: %s", config->rxGpio, esp_err_to_name(result));
   }
   else
   {
@@ -420,7 +552,17 @@ static void stopJoined(LoggerReceiver *self)
     return;
   }
 
-  dsmrUartStop(&self->uart);
+  //-- The running feed task is either the UART adapter task or, with the
+  //-- test selection, the test data generator task. Both are joined before
+  //-- the parser is reinitialised.
+  if (loggerSettingsIsTestGpio(self->activeConfig.rxGpio))
+  {
+    stopTestGenerator();
+  }
+  else
+  {
+    dsmrUartStop(&self->uart);
+  }
 
   xSemaphoreTake(self->mutex, portMAX_DELAY);
   self->receiverRunning = false;
