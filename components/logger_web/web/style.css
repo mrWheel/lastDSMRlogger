@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-15 · Build: 4 */
+   Date: 2026-11-15 · Build: 5 */
 
 :root
 {
@@ -213,7 +213,8 @@ select:hover
   border-color: var(--hairline);
 }
 
-/* Data-source toggle (Live data / Test data), iOS flavoured switch. */
+/* iOS flavoured switches: data source (Live data / Test data) and the P1 RX
+   polarity (Normal / Inverted). */
 .toggleRow
 {
   display: flex;
@@ -235,7 +236,8 @@ select:hover
   font-weight: 600;
 }
 
-#srcToggle
+#srcToggle,
+#rxPolarityToggle
 {
   position: absolute;
   opacity: 0;
@@ -270,17 +272,20 @@ select:hover
   transition: transform 0.2s ease;
 }
 
-#srcToggle:checked + .switch
+#srcToggle:checked + .switch,
+#rxPolarityToggle:checked + .switch
 {
   background: var(--accent);
 }
 
-#srcToggle:checked + .switch .switchKnob
+#srcToggle:checked + .switch .switchKnob,
+#rxPolarityToggle:checked + .switch .switchKnob
 {
   transform: translateX(20px);
 }
 
-#srcToggle:focus-visible + .switch
+#srcToggle:focus-visible + .switch,
+#rxPolarityToggle:focus-visible + .switch
 {
   outline: 2px solid var(--accent);
   outline-offset: 2px;

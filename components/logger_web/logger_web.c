@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-15 · Build: 3
+//-- Date: 2026-11-15 · Build: 4
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status and telegram-list JSON and answers form-urlencoded commands
@@ -525,6 +525,12 @@ static void appendSettingsJson(stringBuilder *sb, const loggerSettingsConfig *co
   sbAppendJsonString(sb, config->countryCode);
   sbAppend(sb, ",\"profileId\":");
   sbAppendJsonString(sb, config->profileId);
+
+  //-- Live P1 RX polarity: false reads the idle-high signal directly, true
+  //-- inverts the receive line for interfaces that invert.
+  sbAppend(sb, ",\"rxInverted\":");
+  sbAppend(sb, config->rxInverted ? "true" : "false");
+
   sbAppend(sb, ",\"mbus\":[");
 
   for (uint8_t channel = DSMR_MBUS_CHANNEL_MIN; channel <= DSMR_MBUS_CHANNEL_MAX; channel++)
@@ -721,6 +727,14 @@ static const char *applySettingsFromForm(const char *body)
 
   candidate.intervalSeconds = (uint32_t)interval;
 
+  //-- P1 RX polarity toggle: 1 inverts the receive line (interfaces that
+  //-- invert before the ESP32-S3), 0 or an absent field reads the idle-high
+  //-- signal directly.
+  if (formGet(body, "rxInverted", text, sizeof text))
+  {
+    candidate.rxInverted = (text[0] == '1');
+  }
+
   if (!formGet(body, "country", candidate.countryCode, sizeof candidate.countryCode))
   {
     return "missing country";
@@ -789,7 +803,8 @@ static const char *applySettingsFromForm(const char *body)
     return "persistence failed";
   }
 
-  ESP_LOGI(tag, "configuration applied and stored: gpio %d, profile %s", candidate.rxGpio, candidate.profileId);
+  ESP_LOGI(tag, "configuration applied and stored: gpio %d, profile %s, rx polarity %s", candidate.rxGpio, candidate.profileId,
+           candidate.rxInverted ? "inverted" : "normal");
   return NULL;
 }
 

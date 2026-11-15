@@ -1,6 +1,6 @@
 # lastDSMRlogger
 
-Buildnumber: 4
+Buildnumber: 5
 Last update-date: 2026-11-15
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
@@ -88,10 +88,16 @@ encoder and buttons (1, 6, 16, 17); the encoder/button inputs are never
 started, so those pins stay untouched. The former J5 RX pin selection is
 retired: P1 always uses the fixed UART0 pin pair 43/44.
 
-RX polarity is a build-time interface setting: choose
-`lastDSMRlogger P1 Interface → P1 RX signal polarity` in
-`idf.py menuconfig`. Use *Inverted* only when the interface board presents an
-inverted signal; otherwise the default *Direct* applies.
+RX polarity is a runtime setting in the SPA (Settings view → *P1 RX
+polarity*): *Normal* reads the idle-high signal directly and *Inverted* flips
+the receive line for interface boards that invert before the ESP32-S3. The
+choice is stored with the configuration and applied on the next receiver
+start; the console confirms it with `P1 RX on UART0 gpio 44, polarity
+...`. If a live source stays *awaiting data* and the monitor only shows
+`diagnostic: size limit` or `diagnostic: inter-byte timeout`, the bytes are
+arriving but are unreadable — a wrong RX polarity (or a baud/frame mismatch)
+is the usual cause, so try the other switch position. The former build-time
+Kconfig polarity choice is retired.
 
 ## 5. Wi-Fi first-boot setup
 
@@ -139,7 +145,9 @@ the device.
   refilled after every save, so the form always shows the settings in force.
   A *Data source* toggle (iOS-style switch) switches between **Live data**
   (the fixed P1 input on UART0, GPIO43/44) and **Test data** (the internal
-  generator); an **Interval** field in seconds sets how often a telegram is
+  generator); a *P1 RX polarity* toggle (iOS-style switch) selects **Normal**
+  or **Inverted** reading of the live signal (ignored by the test generator);
+  an **Interval** field in seconds sets how often a telegram is
   read: only one telegram is accepted per interval. The interval is
   validated by clamping — a value below 2 becomes 2 and a value above 600
   becomes 600 — so a save never fails over the interval alone. Country, protocol
@@ -174,7 +182,7 @@ telegram, and the Wi-Fi portal/connected state.
 |-------|----------------------------|--------------------------------------------------------------|
 |WS     |`/ws`                       |SPA transport: status/telegram pushes + `cmd=config\|save\|status\|telegrams\|telegram\|raw\|view`, raw bytes as binary frame |
 |GET    |`/api/config`               |NVS settings + active state + valid choices (data sources, interval bounds, countries, profiles) |
-|POST   |`/api/config`               |Save form-urlencoded settings incl. `rxGpio` and `interval` (interval clamped to 2..600; one atomic operation) |
+|POST   |`/api/config`               |Save form-urlencoded settings incl. `rxGpio`, `rxInverted` (0/1) and `interval` (interval clamped to 2..600; one atomic operation) |
 |GET    |`/api/status`               |Reception state, counters, last diagnostic, uptime            |
 |GET    |`/api/telegrams`            |Metadata of retained records (incl. `meterTimeText` from OBIS `0-0:1.0.0`), newest first |
 |GET    |`/api/telegram/<seq>`       |Decoded detail of one record                                  |
@@ -232,10 +240,14 @@ effect on UART reception.
 ## 8. Hardware verification
 
 1. `idf.py -p PORT flash monitor` shows the board debug lines after boot.
-2. Open the SPA, set the data-source slider to **Live data**, choose an
+2. Open the SPA, set the data-source slider to **Live data**, choose the P1
+   RX polarity (Normal/Inverted) matching the interface board, choose an
    interval (2–600 s), country and profile, then Save. The console shows
+   `P1 RX on UART0 gpio 44, polarity ...` plus
    `receiving on UART 0 at ... baud, profile ...` and the status strip moves
    from *awaiting configuration* to *awaiting data* to *accepted telegram*.
+   (After updating from settings version 2 the stored configuration is
+   rejected once: open Settings and Save to store the version 3 blob.)
 3. With a conditioned P1 signal on GPIO44, one telegram per configured
    interval is read into the Telegrams view; console and reception operate
    together.

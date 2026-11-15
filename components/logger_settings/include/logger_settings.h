@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.h - versioned settings service
-//-- Date: 2026-11-15 · Build: 2
+//-- Date: 2026-11-15 · Build: 3
 //--
 //-- The settings service stores the complete versioned configuration in
 //-- ESP-IDF NVS, validates it against the parserDSMR built-in profiles and
@@ -61,7 +61,10 @@ typedef enum
 
 //-- Version 2: the P1 port is fixed on UART0 (GPIO43/44) and the telegram
 //-- read interval became a setting; stored version 1 blobs are rejected.
-#define LOGGER_SETTINGS_VERSION 2u
+//-- Version 3: the P1 RX polarity became a runtime setting (Normal/Inverted)
+//-- instead of a build-time Kconfig choice; stored version 2 blobs are
+//-- rejected, so one save is required after updating.
+#define LOGGER_SETTINGS_VERSION 3u
 #define LOGGER_SETTINGS_PROFILE_ID_MAX 32
 #define LOGGER_SETTINGS_COUNTRY_MAX 3
 
@@ -74,6 +77,11 @@ typedef struct
 {
   uint32_t structVersion;
   int rxGpio;
+
+  //-- P1 RX polarity for the live UART0 input. False reads the signal
+  //-- directly (idle high); true inverts the receive line for interfaces
+  //-- that invert before the ESP32-S3. Ignored by the test generator.
+  bool rxInverted;
 
   //-- Read interval in seconds (LOGGER_SETTINGS_INTERVAL_MIN_S through
   //-- LOGGER_SETTINGS_INTERVAL_MAX_S).

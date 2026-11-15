@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-15 · Build: 4
+// Date: 2026-11-15 · Build: 5
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -46,7 +46,8 @@ const tabButtons = {};
 function bindElements()
 {
   const ids = ["tabBar", "statusStrip", "settingsMessage", "settingsForm",
-               "srcToggle", "srcLiveLabel", "srcTestLabel", "inpInterval",
+               "srcToggle", "srcLiveLabel", "srcTestLabel",
+               "rxPolarityToggle", "polNormalLabel", "polInvertedLabel", "inpInterval",
                "selCountry", "selProfile", "selMbus1", "selMbus2", "selMbus3", "selMbus4",
                "saveSettings", "telegramState", "showLast", "telegramLog",
                "telegramDetail", "recordMeta", "recordNotes", "summaryTable", "rawView", "footerInfo",
@@ -362,6 +363,14 @@ function updateSourceLabels()
   el.srcTestLabel.classList.toggle("active", isTest);
 }
 
+//-- Highlights the polarity end matching the RX polarity switch.
+function updatePolarityLabels()
+{
+  const isInverted = el.rxPolarityToggle.checked;
+  el.polNormalLabel.classList.toggle("active", !isInverted);
+  el.polInvertedLabel.classList.toggle("active", isInverted);
+}
+
 function renderSettings(message)
 {
   state.config = message;
@@ -387,6 +396,11 @@ function renderSettings(message)
   const source = sourceChoices();
   el.srcToggle.checked = !!(settings && (settings.rxGpio === source.testGpio));
   updateSourceLabels();
+
+  // The P1 RX polarity switch maps to the stored rxInverted flag: normal
+  // reads the idle-high signal directly, inverted flips the receive line.
+  el.rxPolarityToggle.checked = !!(settings && settings.rxInverted);
+  updatePolarityLabels();
 
   el.inpInterval.value = (settings && settings.intervalSeconds) ? String(settings.intervalSeconds) : "10";
 
@@ -448,8 +462,13 @@ function saveSettings(event)
 
   el.inpInterval.value = String(interval);
 
+  // The polarity switch position maps to the stored rxInverted flag; it only
+  // affects live reception, the test generator opens no UART.
+  const rxInverted = el.rxPolarityToggle.checked ? "1" : "0";
+
   const body = "cmd=save" +
                "&rxGpio=" + encodeURIComponent(rxGpio) +
+               "&rxInverted=" + rxInverted +
                "&interval=" + encodeURIComponent(interval) +
                "&country=" + encodeURIComponent(el.selCountry.value) +
                "&profileId=" + encodeURIComponent(el.selProfile.value) +
@@ -682,6 +701,7 @@ function boot()
   el.settingsForm.addEventListener("submit", saveSettings);
 
   el.srcToggle.addEventListener("change", updateSourceLabels);
+  el.rxPolarityToggle.addEventListener("change", updatePolarityLabels);
 
   // Show Last always (re)shows the last telegram that was read in.
   el.showLast.addEventListener("click", () =>

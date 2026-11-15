@@ -31,6 +31,14 @@
           <span id="srcTestLabel" class="toggleEnd">Test data</span>
         </div>
 
+        <label for="rxPolarityToggle">P1 RX polarity (live data)</label>
+        <div class="toggleRow">
+          <span id="polNormalLabel" class="toggleEnd active">Normal</span>
+          <input id="rxPolarityToggle" type="checkbox" role="switch" aria-label="Invert P1 RX polarity">
+          <label class="switch" for="rxPolarityToggle" aria-hidden="true"><span class="switchKnob"></span></label>
+          <span id="polInvertedLabel" class="toggleEnd">Inverted</span>
+        </div>
+
         <label for="inpInterval">Interval</label>
         <div class="intervalRow">
           <input id="inpInterval" type="number" step="1" value="10" inputmode="numeric">

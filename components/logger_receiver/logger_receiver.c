@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.c - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-15 · Build: 3
+//-- Date: 2026-11-15 · Build: 4
 //--
 //-- The parserDSMR adapter task owns the parser instance while it runs. The
 //-- event callback copies the complete accepted frame and the decoded fields
@@ -854,11 +854,13 @@ static esp_err_t startLocked(LoggerReceiver *self, const loggerSettingsConfig *c
     uartConfig.taskStackSize = LOGGER_P1_TASK_STACK_BYTES;
     uartConfig.taskPriority = LOGGER_P1_TASK_PRIORITY;
 
-#if defined(CONFIG_LASTDSMRLOGGER_P1_RX_INVERTED)
-    uartConfig.invertRx = true;
-#else
-    uartConfig.invertRx = false;
-#endif
+    //-- RX polarity is a runtime setting chosen in the SPA: normal reads the
+    //-- idle-high signal directly, inverted flips the receive line for
+    //-- interface boards that invert before the ESP32-S3.
+    uartConfig.invertRx = config->rxInverted;
+
+    ESP_LOGI(tag, "P1 RX on UART0 gpio %d, polarity %s", config->rxGpio,
+             config->rxInverted ? "inverted" : "normal");
 
     result = dsmrUartStart(&self->uart, &self->parser, &uartConfig, onParserEvent, self);
   }
