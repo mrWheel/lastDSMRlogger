@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-15 · Build: 5 */
+   Date: 2026-11-15 · Build: 6 */
 
 :root
 {
@@ -324,7 +324,7 @@ select:hover
   margin-top: 6px;
 }
 
-#showLast
+#showTelegram
 {
   appearance: none;
   font-family: inherit;
@@ -338,7 +338,7 @@ select:hover
   cursor: pointer;
 }
 
-#showLast:active
+#showTelegram:active
 {
   transform: scale(0.97);
 }

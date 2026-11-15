@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-15 · Build: 5
+// Date: 2026-11-15 · Build: 6
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -23,6 +23,7 @@ const state =
   config: null,
   selectedSeq: null,
   latestSeq: null,
+  followLatest: false,
   pendingRawSeq: null,
   ws: null,
   wsReady: false,
@@ -49,7 +50,7 @@ function bindElements()
                "srcToggle", "srcLiveLabel", "srcTestLabel",
                "rxPolarityToggle", "polNormalLabel", "polInvertedLabel", "inpInterval",
                "selCountry", "selProfile", "selMbus1", "selMbus2", "selMbus3", "selMbus4",
-               "saveSettings", "telegramState", "showLast", "telegramLog",
+               "saveSettings", "telegramState", "showTelegram", "telegramLog",
                "telegramDetail", "recordMeta", "recordNotes", "summaryTable", "rawView", "footerInfo",
                "viewSettings", "viewTelegrams"];
 
@@ -505,8 +506,9 @@ function setTelegramState(message)
 // not clickable and carry no selection. Each row shows the meter time of
 // OBIS 0-0:1.0.0 (for example 17:37:38) instead of a receive uptime. The
 // detail pane is filled once automatically and then stays frozen on that
-// record: new telegrams refresh the log rows only. Show Last (re)shows the
-// latest accepted record at any time.
+// record: new telegrams refresh the log rows only. Show starts a live
+// follow (the button becomes Pause): every newly accepted telegram is
+// shown until Pause freezes the shown record again.
 function renderTelegramList(telegrams)
 {
   el.telegramLog.textContent = "";
@@ -536,9 +538,15 @@ function renderTelegramList(telegrams)
 
   state.latestSeq = telegrams[0].sequence;
 
-  // Fill the detail pane once so it is never empty; after that it stays on
-  // the shown record until Show Last selects a new one.
-  if (state.selectedSeq === null)
+  // While Show is running every newly accepted telegram replaces the shown
+  // record in the decode summary and raw view; after Pause the pane stays
+  // frozen on the last shown record. Without any selection yet the pane is
+  // filled once so it is never empty.
+  if (state.followLatest && (telegrams[0].sequence !== state.selectedSeq))
+  {
+    selectTelegram(telegrams[0].sequence);
+  }
+  else if (state.selectedSeq === null)
   {
     selectTelegram(state.latestSeq);
   }
@@ -703,13 +711,18 @@ function boot()
   el.srcToggle.addEventListener("change", updateSourceLabels);
   el.rxPolarityToggle.addEventListener("change", updatePolarityLabels);
 
-  // Show Last always (re)shows the last telegram that was read in.
-  el.showLast.addEventListener("click", () =>
+  // Show starts the live follow of every newly accepted telegram (the
+  // button becomes Pause); Pause freezes the shown telegram again.
+  el.showTelegram.addEventListener("click", () =>
   {
-    if (state.latestSeq !== null)
+    state.followLatest = !state.followLatest;
+
+    if (state.followLatest && (state.latestSeq !== null))
     {
       selectTelegram(state.latestSeq);
     }
+
+    el.showTelegram.textContent = state.followLatest ? "Pause" : "Show";
   });
 
   el.selCountry.addEventListener("change", () =>
