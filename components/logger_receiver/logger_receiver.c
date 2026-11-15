@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.c - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-15 · Build: 8
+//-- Date: 2026-11-15 · Build: 9
 //--
 //-- The parserDSMR adapter task owns the parser instance while it runs. The
 //-- event callback copies the complete accepted frame and the decoded fields
@@ -34,6 +34,7 @@
 #include "freertos/task.h"
 #include "logger_board.h"
 #include "logger_testdata.h"
+#include "nvs.h"
 
 static const char *tag = "loggerReceiver";
 
@@ -65,6 +66,18 @@ static const char *tag = "loggerReceiver";
 //-- RX ring of the TX-only driver the receiver installs while the test data
 //-- generator runs (the live path forwards through the adapter's driver).
 #define LOGGER_TEST_TX_RX_BUFFER_BYTES 256
+
+//-- The accepted-telegram total is persisted to NVS every ten minutes so the
+//-- running counter survives a reset or a power cycle. On boot the receiver
+//-- restores the last persisted value and counts on from there.
+#define LOGGER_TELEGRAM_COUNTER_PERSIST_INTERVAL_MS 600000u
+#define LOGGER_TELEGRAM_COUNTER_TASK_STACK_BYTES 4096
+#define LOGGER_TELEGRAM_COUNTER_TASK_PRIORITY 3
+
+//-- NVS storage of the counter; the namespace is shared with the settings
+//-- service and the partition is initialised by the application at boot.
+#define LOGGER_NVS_NAMESPACE "dsmrlog"
+#define LOGGER_NVS_KEY_TELEGRAM_COUNT "telegramCount"
 
 typedef struct
 {
@@ -1008,6 +1021,67 @@ static void forwardTaskLoop(void *argument)
 }
 
 //-- --------------------------------------------------------------------------
+//-- Accepted-telegram counter persistence (dedicated task)
+//-- --------------------------------------------------------------------------
+
+//-- Writes the accepted-telegram total to NVS. The write is skipped when the
+//-- value has not changed since the last persist so an idle or unconfigured
+//-- meter does not wear the flash for nothing.
+static void persistTelegramCount(LoggerReceiver *self, uint32_t *lastPersistedCount)
+{
+  xSemaphoreTake(self->mutex, portMAX_DELAY);
+  uint32_t count = self->acceptedCount;
+  xSemaphoreGive(self->mutex);
+
+  if (count == *lastPersistedCount)
+  {
+    return;
+  }
+
+  nvs_handle_t handle;
+  esp_err_t result = nvs_open(LOGGER_NVS_NAMESPACE, NVS_READWRITE, &handle);
+
+  if (result != ESP_OK)
+  {
+    ESP_LOGE(tag, "opening the counter namespace failed: %s", esp_err_to_name(result));
+    return;
+  }
+
+  result = nvs_set_u32(handle, LOGGER_NVS_KEY_TELEGRAM_COUNT, count);
+
+  if (result == ESP_OK)
+  {
+    result = nvs_commit(handle);
+  }
+
+  nvs_close(handle);
+
+  if (result != ESP_OK)
+  {
+    ESP_LOGE(tag, "persisting the telegram counter failed: %s", esp_err_to_name(result));
+    return;
+  }
+
+  *lastPersistedCount = count;
+  ESP_LOGI(tag, "telegram counter persisted: %" PRIu32, count);
+}
+
+//-- Blocks the whole ten-minute interval and then persists the counter. The
+//-- task never touches the parser or the receiver control state and only
+//-- reads the counter under the data mutex, so it needs no join path.
+static void telegramCounterTaskLoop(void *argument)
+{
+  LoggerReceiver *self = (LoggerReceiver *)argument;
+  uint32_t lastPersistedCount = self->acceptedCount;
+
+  for (;;)
+  {
+    vTaskDelay(pdMS_TO_TICKS(LOGGER_TELEGRAM_COUNTER_PERSIST_INTERVAL_MS));
+    persistTelegramCount(self, &lastPersistedCount);
+  }
+}
+
+//-- --------------------------------------------------------------------------
 //-- Receiver start / stop (callers hold the mutex)
 //-- --------------------------------------------------------------------------
 
@@ -1155,6 +1229,24 @@ esp_err_t loggerReceiverInit(void)
     return ESP_ERR_NO_MEM;
   }
 
+  //-- The accepted-telegram total continues across a reset or power cycle:
+  //-- the value the counter task last persisted is the starting point of the
+  //-- new reception session. A missing key (first boot) simply keeps zero.
+  nvs_handle_t handle;
+
+  if (nvs_open(LOGGER_NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK)
+  {
+    uint32_t storedCount = 0u;
+
+    if (nvs_get_u32(handle, LOGGER_NVS_KEY_TELEGRAM_COUNT, &storedCount) == ESP_OK)
+    {
+      self->acceptedCount = storedCount;
+      ESP_LOGI(tag, "telegram counter restored from NVS: %" PRIu32, storedCount);
+    }
+
+    nvs_close(handle);
+  }
+
   //-- The forwarding task lives for the whole run and blocks until the
   //-- callback stages a burst; without a driver installed a burst is skipped.
   if (xTaskCreate(forwardTaskLoop, "p1Forward", LOGGER_FORWARD_TASK_STACK_BYTES, self,
@@ -1165,6 +1257,14 @@ esp_err_t loggerReceiverInit(void)
   else
   {
     ESP_LOGI(tag, "UART0 TX forwarding ready: each burst repeats the frame twice, at most one burst per 5 s (or per interval when larger)");
+  }
+
+  //-- The counter task persists the accepted-telegram total every ten
+  //-- minutes so the running total survives a reset or power cycle.
+  if (xTaskCreate(telegramCounterTaskLoop, "p1Counter", LOGGER_TELEGRAM_COUNTER_TASK_STACK_BYTES, self,
+                  LOGGER_TELEGRAM_COUNTER_TASK_PRIORITY, NULL) != pdPASS)
+  {
+    ESP_LOGW(tag, "telegram counter task could not be created: counter persistence disabled");
   }
 
   dsmrParserConfig probe;
