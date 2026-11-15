@@ -342,6 +342,14 @@ static esp_err_t sendError(httpd_req_t *req, httpd_err_code_t code, const char *
 
 static esp_err_t sendAsset(httpd_req_t *req, const char *start, const char *end, const char *contentType)
 {
+  //-- EMBED_TXTFILES appends a terminating NUL after the file bytes: never
+  //-- send it. A trailing NUL makes browsers reject the JavaScript with a
+  //-- syntax error, which silently kills the whole SPA (dead buttons).
+  while ((end > start) && (end[-1] == '\0'))
+  {
+    end--;
+  }
+
   httpd_resp_set_type(req, contentType);
   return httpd_resp_send(req, start, (end - start));
 }
@@ -1252,10 +1260,15 @@ static void wsHandleCommand(httpd_req_t *req, const char *body)
 
 static esp_err_t handleWebSocket(httpd_req_t *req)
 {
+  //-- ESP-IDF 6.0 answers the handshake inside httpd (httpd_uri.c returns
+  //-- without calling the handler), so this handler is only ever entered for
+  //-- data frames: that is where a client must be registered for pushes.
+  //-- wsClientAdd ignores sockets it already knows, so calling it on every
+  //-- frame is cheap and cannot miss a client.
+  wsClientAdd(httpd_req_to_sockfd(req));
+
   if (req->method == HTTP_GET)
   {
-    //-- Handshake complete: register this session for pushes.
-    wsClientAdd(httpd_req_to_sockfd(req));
     return ESP_OK;
   }
 

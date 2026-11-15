@@ -1,15 +1,45 @@
-/* lastDSMRlogger SPA
-   Date: 2026-11-14 · Build: 1 */
+/* lastDSMRlogger SPA — iOS/macOS look and feel
+   Date: 2026-11-15 · Build: 1 */
 
 :root
 {
-  --bg: #f4f5f7;
-  --fg: #1c1e21;
-  --accent: #0b6e4f;
-  --error: #b3261e;
-  --warning: #8a6d00;
+  --bg: #f2f2f7;
+  --fg: #1c1c1e;
+  --secondary: #6e6e73;
+  --accent: #007aff;
+  --accentPressed: #0062cc;
+  --error: #ff3b30;
+  --warning: #b26a00;
   --card: #ffffff;
-  --border: #d4d7dc;
+  --separator: rgba(60, 60, 67, 0.12);
+  --hairline: rgba(60, 60, 67, 0.29);
+  --controlFill: #e9e9eb;
+  --headerBg: rgba(249, 249, 249, 0.8);
+  --segActive: #ffffff;
+  --segActiveFg: #1c1c1e;
+  --codeBg: #1c1c1e;
+  --codeFg: #e5e5ea;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 14px rgba(0, 0, 0, 0.05);
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark)
+{
+  :root
+  {
+    --bg: #000000;
+    --fg: #f2f2f7;
+    --secondary: #98989f;
+    --card: #1c1c1e;
+    --separator: rgba(84, 84, 88, 0.6);
+    --hairline: rgba(84, 84, 88, 0.8);
+    --controlFill: #2c2c2e;
+    --headerBg: rgba(28, 28, 30, 0.8);
+    --segActive: #636366;
+    --segActiveFg: #ffffff;
+    --shadow: none;
+  }
 }
 
 *
@@ -20,49 +50,96 @@
 body
 {
   margin: 0;
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-family: var(--font);
+  font-size: 0.95rem;
   background: var(--bg);
   color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 header
 {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--headerBg);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 1px solid var(--separator);
+}
+
+.headerInner
+{
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 10px 20px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 20px;
-  background: var(--card);
-  border-bottom: 1px solid var(--border);
+  gap: 16px;
+  flex-wrap: wrap;
 }
 
 header h1
 {
-  font-size: 1.2rem;
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
   margin: 0;
 }
 
-nav .tab
+/* iOS segmented control: built by app.js from the VIEWS registry, so any
+   number of future feature buttons shares one consistent pill. */
+.segmented
 {
-  margin-left: 8px;
-  padding: 8px 18px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--card);
-  cursor: pointer;
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 3px;
+  background: var(--controlFill);
+  border-radius: 10px;
 }
 
-nav .tab.active
+.segmented .tab
 {
-  background: var(--accent);
-  color: #fff;
-  border-color: var(--accent);
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 0.9rem;
+  font-weight: 500;
+  padding: 7px 18px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.segmented .tab.active
+{
+  background: var(--segActive);
+  color: var(--segActiveFg);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18), 0 1px 1px rgba(0, 0, 0, 0.08);
+}
+
+.segmented .tab:not(.active):active
+{
+  background: var(--separator);
 }
 
 .status
 {
-  padding: 8px 20px;
-  font-size: 0.85rem;
-  background: #e8ecef;
+  max-width: 960px;
+  margin: 12px auto 0;
+  padding: 9px 16px;
+  font-size: 0.82rem;
+  color: var(--secondary);
+  background: var(--card);
+  border: 1px solid var(--separator);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
 }
 
 .status.error
@@ -73,17 +150,35 @@ nav .tab.active
 
 main
 {
-  padding: 20px;
+  padding: 16px 20px 8px;
   max-width: 960px;
   margin: 0 auto;
 }
 
-section
+/* Grouped content card, like the iOS Settings list. */
+.card
 {
   background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 16px 20px;
+  border: 1px solid var(--separator);
+  border-radius: 14px;
+  padding: 18px 20px;
+  box-shadow: var(--shadow);
+}
+
+h2
+{
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0 0 12px;
+}
+
+h3
+{
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 18px 0 8px;
 }
 
 form
@@ -95,11 +190,43 @@ form
   max-width: 520px;
 }
 
+select
+{
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  font-family: inherit;
+  font-size: 0.92rem;
+  color: var(--fg);
+  padding: 9px 34px 9px 12px;
+  border: 1px solid var(--separator);
+  border-radius: 9px;
+  background-color: var(--controlFill);
+  background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="%238e8e93" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>');
+  background-repeat: no-repeat;
+  background-position: right 11px center;
+  transition: border-color 0.15s ease;
+}
+
+select:hover
+{
+  border-color: var(--hairline);
+}
+
 fieldset
 {
   grid-column: 1 / 3;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  border: 1px solid var(--separator);
+  border-radius: 12px;
+  margin: 8px 0 0;
+  padding: 10px 14px;
+}
+
+legend
+{
+  font-weight: 600;
+  font-size: 0.9rem;
+  padding: 0 6px;
 }
 
 .mbusRow
@@ -107,25 +234,44 @@ fieldset
   display: grid;
   grid-template-columns: max-content 1fr;
   gap: 10px;
+  align-items: center;
   margin: 6px 0;
 }
 
 #saveSettings
 {
   grid-column: 2;
-  padding: 8px 18px;
+  margin-top: 6px;
+  padding: 10px 22px;
   background: var(--accent);
   color: #fff;
+  font-family: inherit;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
   border: none;
-  border-radius: 6px;
+  border-radius: 11px;
   cursor: pointer;
+  box-shadow: 0 1px 4px rgba(0, 122, 255, 0.35);
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+
+#saveSettings:hover
+{
+  background: var(--accentPressed);
+}
+
+#saveSettings:active
+{
+  transform: scale(0.97);
 }
 
 .message
 {
   grid-column: 1 / 3;
   margin: 6px 0;
-  font-size: 0.9rem;
+  font-size: 0.88rem;
+  color: var(--secondary);
 }
 
 .message.warning
@@ -133,18 +279,50 @@ fieldset
   color: var(--warning);
 }
 
+#backToLatest
+{
+  appearance: none;
+  font-family: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--controlFill);
+  border: none;
+  border-radius: 8px;
+  padding: 6px 14px;
+  margin-left: 8px;
+  cursor: pointer;
+}
+
+/* Grouped list of records, like the iOS Settings rows. */
 #telegramList
 {
   width: 100%;
   margin: 8px 0;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  padding: 4px;
+  border: 1px solid var(--separator);
+  border-radius: 11px;
+  background: var(--card);
+  font-family: inherit;
+  font-size: 0.88rem;
+}
+
+#telegramList option
+{
+  padding: 9px 10px;
+  border-radius: 8px;
+}
+
+#telegramList option:checked
+{
+  background: var(--accent) linear-gradient(0deg, var(--accent), var(--accent));
+  color: #fff;
 }
 
 .meta
 {
   font-size: 0.85rem;
-  color: #555;
+  color: var(--secondary);
   margin-bottom: 8px;
 }
 
@@ -153,28 +331,40 @@ table
   border-collapse: collapse;
   width: 100%;
   font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
 }
 
 th, td
 {
-  border: 1px solid var(--border);
-  padding: 4px 8px;
+  border: none;
+  border-bottom: 1px solid var(--separator);
+  padding: 8px 10px;
   text-align: left;
 }
 
 th
 {
-  background: #eef0f3;
+  background: transparent;
+  font-weight: 600;
+  color: var(--secondary);
+  border-bottom: 1px solid var(--hairline);
+}
+
+tbody tr:last-child td
+{
+  border-bottom: none;
 }
 
 pre
 {
-  background: #101418;
-  color: #d8e0e8;
-  padding: 12px;
-  border-radius: 6px;
+  background: var(--codeBg);
+  color: var(--codeFg);
+  font-family: var(--mono);
+  padding: 14px;
+  border-radius: 12px;
   overflow: auto;
   font-size: 0.8rem;
+  line-height: 1.45;
   white-space: pre;
 }
 
@@ -182,6 +372,12 @@ footer
 {
   text-align: center;
   font-size: 0.75rem;
-  color: #777;
-  padding: 14px;
+  color: var(--secondary);
+  padding: 16px;
+}
+
+:is(button, select):focus-visible
+{
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }

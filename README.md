@@ -121,6 +121,13 @@ form-urlencoded commands, and raw telegram bytes arrive as a binary frame.
 The HTTP API remains available for diagnostics and clients without
 WebSocket support. The SPA opens with the **Telegrams** view.
 
+The interface uses an iOS/macOS look and feel (system fonts, translucent
+header, grouped cards, an iOS blue accent, automatic light/dark mode). The
+tab bar is an iOS-style segmented control built by `app.js` from the `VIEWS`
+registry: adding a feature button takes one registry entry in `app.js`, a
+matching `<section>` in `index.html`, and an answer to the view's command on
+the device.
+
 - **Settings**: prefilled with the configuration currently stored in NVS and
   refilled after every save, so the form always shows the settings in force.
   P1 RX GPIO (board allowlist, plus the *Test data* selection), country,

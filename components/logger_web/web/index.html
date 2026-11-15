@@ -8,17 +8,18 @@
 </head>
 <body>
   <header>
-    <h1>lastDSMRlogger</h1>
-    <nav>
-      <button id="tabSettings" class="tab" type="button">Settings</button>
-      <button id="tabTelegrams" class="tab active" type="button">Telegrams</button>
-    </nav>
+    <div class="headerInner">
+      <h1>lastDSMRlogger</h1>
+      <!-- The tab bar is built by app.js from the VIEWS registry so new
+           feature buttons only need one registry entry and one section. -->
+      <nav id="tabBar" class="segmented" role="tablist" aria-label="Views"></nav>
+    </div>
   </header>
 
   <div id="statusStrip" class="status">Connecting to the logger...</div>
 
   <main>
-    <section id="viewSettings" hidden>
+    <section id="viewSettings" class="card" hidden>
       <h2>Settings</h2>
       <div id="settingsMessage" class="message"></div>
       <form id="settingsForm">
@@ -55,7 +56,7 @@
       </form>
     </section>
 
-    <section id="viewTelegrams">
+    <section id="viewTelegrams" class="card">
       <h2>Telegrams</h2>
       <div id="telegramState" class="message"></div>
       <select id="telegramList" size="6" aria-label="Recent telegrams"></select>

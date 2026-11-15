@@ -1,8 +1,11 @@
 // lastDSMRlogger SPA
 // Date: 2026-11-15 · Build: 1
 //
-// Two views share one page: Settings and Telegrams, the Telegrams view
-// opens first. All dynamic data travels over one WebSocket at /ws: the
+// Views share one page and are listed in the VIEWS registry: the tab bar
+// (an iOS-style segmented control) is built from it, so a new feature only
+// needs one registry entry plus a matching section in index.html and a
+// command on the device. The Telegrams view opens first.
+// All dynamic data travels over one WebSocket at /ws: the
 // device pushes status and the telegram list, the browser sends
 // form-urlencoded commands (cmd=config, cmd=save, cmd=telegram, cmd=raw,
 // cmd=view, cmd=telegrams). Raw telegram bytes arrive as a binary frame
@@ -25,11 +28,24 @@ const state =
   wsReady: false,
 };
 
+// One entry per feature view: the tab bar and the view switching are driven
+// by this registry. To add a feature: add an entry here, add a matching
+// <section class="card" hidden id="viewXxx"> to index.html and answer the
+// view's command on the device.
+const VIEWS =
+[
+  {id: "settings", label: "Settings", section: "viewSettings", command: "cmd=config"},
+  {id: "telegrams", label: "Telegrams", section: "viewTelegrams", command: "cmd=telegrams"},
+];
+
 const el = {};
+
+// Built once by buildTabBar(); maps a view id to its tab button.
+const tabButtons = {};
 
 function bindElements()
 {
-  const ids = ["tabSettings", "tabTelegrams", "statusStrip", "settingsMessage", "settingsForm",
+  const ids = ["tabBar", "statusStrip", "settingsMessage", "settingsForm",
                "selGpio", "selCountry", "selProfile", "selMbus1", "selMbus2", "selMbus3", "selMbus4",
                "saveSettings", "telegramState", "telegramList", "agedOutNotice", "backToLatest",
                "telegramDetail", "recordMeta", "recordNotes", "summaryTable", "rawView", "footerInfo",
@@ -62,17 +78,20 @@ function wsSend(command)
   }
 }
 
+function viewById(name)
+{
+  return VIEWS.find((view) => view.id === name);
+}
+
 function requestCurrentView()
 {
   reportActiveScreen();
 
-  if (state.screen === "settings")
+  const view = viewById(state.screen);
+
+  if (view !== undefined)
   {
-    wsSend("cmd=config");
-  }
-  else
-  {
-    wsSend("cmd=telegrams");
+    wsSend(view.command);
   }
 }
 
@@ -559,32 +578,51 @@ function renderDetail(detail)
 //-- View switching and boot
 //-- --------------------------------------------------------------------------
 
+// Builds the segmented control from the VIEWS registry: every future
+// feature button gets the same pill styling and click wiring for free.
+function buildTabBar()
+{
+  el.tabBar.textContent = "";
+
+  VIEWS.forEach((view) =>
+  {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "tab";
+    button.textContent = view.label;
+    button.setAttribute("role", "tab");
+    button.addEventListener("click", () => showScreen(view.id));
+    el.tabBar.appendChild(button);
+    tabButtons[view.id] = button;
+  });
+}
+
 function showScreen(name)
 {
-  state.screen = name;
-  el.viewSettings.hidden = (name !== "settings");
-  el.viewTelegrams.hidden = (name !== "telegrams");
-  el.tabSettings.classList.toggle("active", name === "settings");
-  el.tabTelegrams.classList.toggle("active", name === "telegrams");
+  const view = viewById(name);
 
-  if (name === "settings")
+  if (view === undefined)
   {
-    wsSend("cmd=config");
-  }
-  else
-  {
-    wsSend("cmd=telegrams");
+    return;
   }
 
+  state.screen = view.id;
+
+  VIEWS.forEach((entry) =>
+  {
+    el[entry.section].hidden = (entry.id !== view.id);
+    tabButtons[entry.id].classList.toggle("active", entry.id === view.id);
+    tabButtons[entry.id].setAttribute("aria-selected", String(entry.id === view.id));
+  });
+
+  wsSend(view.command);
   reportActiveScreen();
 }
 
 function boot()
 {
   bindElements();
-
-  el.tabSettings.addEventListener("click", () => showScreen("settings"));
-  el.tabTelegrams.addEventListener("click", () => showScreen("telegrams"));
+  buildTabBar();
   el.settingsForm.addEventListener("submit", saveSettings);
 
   el.selCountry.addEventListener("change", () =>
