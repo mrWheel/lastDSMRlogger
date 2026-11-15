@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.c - versioned settings service
-//-- Date: 2026-11-15 · Build: 1
+//-- Date: 2026-11-15 · Build: 2
 //--
 //-- The complete configuration is stored as one versioned blob so a save is
 //-- atomic. A stored blob that fails validation is treated as absent: the
@@ -22,8 +22,6 @@ static const char *tag = "loggerSettings";
 #define NVS_NAMESPACE "dsmrlog"
 #define NVS_KEY_CONFIG "cfg"
 
-//-- Selectable P1 RX input pins on the board J5 connector.
-const int loggerP1GpioChoices[LOGGER_P1_GPIO_COUNT] = {10, 38, 39, 40, 41, 42, 47, 48};
 
 //-- Human readable protocol version labels for the built-in profiles. The
 //-- stable profile identifier is what gets persisted.
@@ -78,17 +76,9 @@ static bool countryEquals(const char *left, const char *right)
   return (toUpperChar(left[0]) == toUpperChar(right[0])) && (toUpperChar(left[1]) == toUpperChar(right[1]));
 }
 
-bool loggerSettingsIsSelectableGpio(int gpio)
+bool loggerSettingsIsLiveGpio(int gpio)
 {
-  for (uint8_t index = 0; index < LOGGER_P1_GPIO_COUNT; index++)
-  {
-    if (loggerP1GpioChoices[index] == gpio)
-    {
-      return true;
-    }
-  }
-
-  return false;
+  return gpio == LOGGER_RX_GPIO_LIVE;
 }
 
 bool loggerSettingsIsTestGpio(int gpio)
@@ -138,11 +128,21 @@ bool loggerSettingsValidate(const loggerSettingsConfig *config)
     return false;
   }
 
-  //-- The RX selection must be an eligible J5 input or the internal test
-  //-- data generator (-1). Validation is identical for SPA and API input.
-  if (!loggerSettingsIsSelectableGpio(config->rxGpio) && !loggerSettingsIsTestGpio(config->rxGpio))
+  //-- The data source is either the fixed live P1 input on UART0 (RX GPIO44)
+  //-- or the internal test data generator (-1). Validation is identical for
+  //-- SPA and API input.
+  if (!loggerSettingsIsLiveGpio(config->rxGpio) && !loggerSettingsIsTestGpio(config->rxGpio))
   {
-    ESP_LOGW(tag, "rejecting RX GPIO %d: neither on the board allowlist nor the test selection", config->rxGpio);
+    ESP_LOGW(tag, "rejecting RX GPIO %d: neither the live UART0 pin nor the test selection", config->rxGpio);
+    return false;
+  }
+
+  //-- One telegram is read per interval; the interval must be within the
+  //-- documented bounds.
+  if ((config->intervalSeconds < LOGGER_SETTINGS_INTERVAL_MIN_S) || (config->intervalSeconds > LOGGER_SETTINGS_INTERVAL_MAX_S))
+  {
+    ESP_LOGW(tag, "rejecting interval %u s: outside %u..%u s", (unsigned)config->intervalSeconds,
+             (unsigned)LOGGER_SETTINGS_INTERVAL_MIN_S, (unsigned)LOGGER_SETTINGS_INTERVAL_MAX_S);
     return false;
   }
 

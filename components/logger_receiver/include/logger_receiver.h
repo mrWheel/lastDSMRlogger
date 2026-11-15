@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.h - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-14 · Build: 1
+//-- Date: 2026-11-15 · Build: 3
 //--
 //-- One receive task owns the receiver and parser state: the parserDSMR UART
 //-- adapter task feeds the parser and the event callback copies everything the
@@ -63,6 +63,12 @@ typedef struct
   uint32_t receivedUptimeMs;
   char profileId[LOGGER_SNAPSHOT_PROFILE_MAX];
   char reportedVersion[LOGGER_SNAPSHOT_VERSION_MAX];
+
+  //-- Meter time of OBIS 0-0:1.0.0 as "HH:MM:SS" (the YYMMDDHHMMSSW stamp,
+  //-- for example 260208173738S shown as 17:37:38). Empty when the frame
+  //-- published no usable timestamp.
+  char meterTimeText[12];
+
   bool crcVerified;
   uint16_t rawLength;
   uint16_t fieldCount;
@@ -84,6 +90,13 @@ typedef struct
   uint8_t rawBytes[DSMR_MAX_TELEGRAM_BYTES];
   loggerFieldSnapshot fields[LOGGER_SNAPSHOT_FIELDS_MAX];
 } loggerTelegramRecord;
+
+//-- Inspect one retained record in place instead of copying the whole
+//-- 23 KB structure: the callback receives a pointer to the retained slot
+//-- while the receive-side lock is held. The callback must only read from
+//-- the record and must never block or touch the network. Returns false
+//-- when the sequence is not (or no longer) retained.
+bool loggerReceiverInspectRecord(uint32_t sequence, bool (*inspect)(const loggerTelegramRecord *record, void *userData), void *userData);
 
 //-- --------------------------------------------------------------------------
 //-- Reception status and diagnostics
@@ -115,6 +128,11 @@ typedef struct
   //-- Active receiver-side values, kept separate from the stored settings
   //-- while a change is in progress.
   int rxGpio;
+
+  //-- Active read interval in seconds: at most one telegram is accepted
+  //-- per interval.
+  uint32_t intervalSeconds;
+
   char activeProfileId[LOGGER_SNAPSHOT_PROFILE_MAX];
 
   uint32_t uptimeMs;

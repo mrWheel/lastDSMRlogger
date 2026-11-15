@@ -1,6 +1,6 @@
 # lastDSMRlogger
 
-Buildnumber: 1
+Buildnumber: 4
 Last update-date: 2026-11-15
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
@@ -14,7 +14,7 @@ cycle; the recent telegram history lives in RAM.
 |Path                              |Role                                                                                   |
 |----------------------------------|---------------------------------------------------------------------------------------|
 |`main/`                           |Application entry, NVS init, Wi-Fi provisioner task, P1 interface Kconfig              |
-|`components/logger_settings/`     |Versioned NVS settings service, validation against parser profiles and board allowlist |
+|`components/logger_settings/`     |Versioned NVS settings service, validation against parser profiles, data source and interval rules |
 |`components/logger_receiver/`     |Receive task ownership of UART adapter + parser, diagnostics, RAM telegram history     |
 |`components/logger_web/`          |esp_http_server: SPA assets and JSON API                                               |
 |`components/logger_board/`        |On-device TFT debug lines through the esp32_s3_piggyback component                     |
@@ -74,17 +74,19 @@ conditioning and a 3.3 V-compatible signal at the ESP32-S3 input.
 
 |Signal     |Connection                                                                       |
 |-----------|---------------------------------------------------------------------------------|
-|P1 data    |P1 interface output → J5 pin of one selectable GPIO: 10, 38, 39, 40, 41, 42, 47, 48 |
+|P1 data    |P1 interface output → GPIO44 (UART0 RX), always the same pin                     |
+|P1 UART0 TX|GPIO43 (the fixed UART0 pin pair; the meter never needs our TX)                  |
 |P1 GND     |P1 interface GND → board GND (common ground with the meter interface)            |
 |P1 request |Externally enabled in this release (the meter's request line stays asserted)     |
-|Console    |UART0 on GPIO43/44 (USB connector of the board), never used for P1                |
+|Console    |Native USB serial/JTAG (the `usbmodem` port used for flashing), never UART0      |
 
-The receiver uses hardware UART1 with RX on the selected J5 GPIO and no TX
-pin. GPIO43/44 remain reserved for the console UART0. The board component
+The receiver always uses hardware UART0 on the fixed P1 pins RX GPIO44 and
+TX GPIO43; the P1 port selection is no longer configurable. The console runs
+on the native USB serial/JTAG peripheral so GPIO43/44 are free for P1. The board component
 reserves the display (2, 4, 5, 11, 12, 15) and, when inputs are used, the
 encoder and buttons (1, 6, 16, 17); the encoder/button inputs are never
-started, so those pins stay untouched. All eight selectable RX pins are wired
-only to J5 and are free for general use.
+started, so those pins stay untouched. The former J5 RX pin selection is
+retired: P1 always uses the fixed UART0 pin pair 43/44.
 
 RX polarity is a build-time interface setting: choose
 `lastDSMRlogger P1 Interface → P1 RX signal polarity` in
@@ -119,7 +121,12 @@ over one WebSocket at `/ws`: the device pushes status every second and the
 telegram list whenever a telegram was accepted, the browser sends
 form-urlencoded commands, and raw telegram bytes arrive as a binary frame.
 The HTTP API remains available for diagnostics and clients without
-WebSocket support. The SPA opens with the **Telegrams** view.
+WebSocket support. The SPA opens with the **Telegrams** view. Embedded
+assets are served with `Cache-Control: no-store` so a browser reload never
+runs a stale `app.js` after a firmware update. The web server task runs on
+an 8 KB stack: WebSocket command handling builds the telegram detail JSON
+(string builders plus `vsnprintf`) on that stack and the 4 KB default
+overflows, which previously killed the server and blanked the detail panes.
 
 The interface uses an iOS/macOS look and feel (system fonts, translucent
 header, grouped cards, an iOS blue accent, automatic light/dark mode). The
@@ -130,22 +137,33 @@ the device.
 
 - **Settings**: prefilled with the configuration currently stored in NVS and
   refilled after every save, so the form always shows the settings in force.
-  P1 RX GPIO (board allowlist, plus the *Test data* selection), country,
-  protocol profile (human-readable label, stable ID persisted, kept separate
-  from the version reported by the meter), and M-Bus channels 1–4 with Auto,
-  Disabled or an explicit device type. All dropdowns are filled from the
-  valid choices the device reports. Save validates and applies the complete
+  A *Data source* toggle (iOS-style switch) switches between **Live data**
+  (the fixed P1 input on UART0, GPIO43/44) and **Test data** (the internal
+  generator); an **Interval** field in seconds sets how often a telegram is
+  read: only one telegram is accepted per interval. The interval is
+  validated by clamping — a value below 2 becomes 2 and a value above 600
+  becomes 600 — so a save never fails over the interval alone. Country, protocol
+  profile (human-readable label, stable ID persisted, kept separate from the
+  version reported by the meter), and M-Bus channels 1–4 with Auto, Disabled
+  or an explicit device type. All dropdowns are filled from the valid
+  choices the device reports. Save validates and applies the complete
   configuration as one operation and stores it in NVS; on any failure the
   active configuration is preserved and the reason is shown.
-- **Telegrams**: updates automatically, latest accepted telegram by default,
-  selection of a recent record. New arrivals leave the selected record in
-  view; an aged-out selection is reported with a button back to the latest.
-  Each record shows sequence, receive time (uptime and age: wall clock time
-  is unavailable in this release), active profile, reported meter version,
-  validation status, the decoded summary (parser-supplied values, units and
-  timestamps; disabled channels omitted; a channel without a reading shows
-  `(unavailable)` while a measured zero stays visible) and the raw frame
-  shown as plain text with original line endings and trailer.
+- **Telegrams**: a read-only **scrolling log window** over the retained
+  records, newest on top. Rows are plain lines and carry no click selection.
+  Each row shows the sequence number and the **meter time of OBIS
+  `0-0:1.0.0`** — the `YYMMDDHHMMSSW` stamp (for example `260208173738S`,
+  `2026-02-08T17:37:38`) shown as `17:37:38`; `--:--:--` when the frame
+  publishes no usable timestamp. The detail pane fills once automatically
+  and then stays frozen on that record — new telegrams refresh the log rows
+  only, so the decoded summary and the raw telegram never blink away. The
+  **Show Last** button always (re)shows the last telegram that was read in. Each record shows sequence, meter time, receive
+  time (uptime and age: wall clock time is unavailable in this release),
+  active profile, reported meter version, validation status, the decoded
+  summary (parser-supplied values, units and timestamps; disabled channels
+  omitted; a channel without a reading shows `(unavailable)` while a
+  measured zero stays visible) and the raw frame shown as plain text with
+  original line endings and trailer.
 
 On-device TFT debug lines show the active browser screen, the last accepted
 telegram, and the Wi-Fi portal/connected state.
@@ -155,27 +173,47 @@ telegram, and the Wi-Fi portal/connected state.
 |Method |Path                        |Purpose                                                       |
 |-------|----------------------------|--------------------------------------------------------------|
 |WS     |`/ws`                       |SPA transport: status/telegram pushes + `cmd=config\|save\|status\|telegrams\|telegram\|raw\|view`, raw bytes as binary frame |
-|GET    |`/api/config`               |NVS settings + active state + valid choices (GPIOs, countries, profiles) |
-|POST   |`/api/config`               |Save form-urlencoded settings (one atomic operation)          |
+|GET    |`/api/config`               |NVS settings + active state + valid choices (data sources, interval bounds, countries, profiles) |
+|POST   |`/api/config`               |Save form-urlencoded settings incl. `rxGpio` and `interval` (interval clamped to 2..600; one atomic operation) |
 |GET    |`/api/status`               |Reception state, counters, last diagnostic, uptime            |
-|GET    |`/api/telegrams`            |Metadata of retained records, newest first                    |
+|GET    |`/api/telegrams`            |Metadata of retained records (incl. `meterTimeText` from OBIS `0-0:1.0.0`), newest first |
 |GET    |`/api/telegram/<seq>`       |Decoded detail of one record                                  |
 |GET    |`/api/telegram/<seq>/raw`   |Exact accepted frame bytes as `text/plain`                    |
 |POST   |`/api/view`                 |Reports the active browser screen name to the device display  |
 
 ### Test data mode
 
-Selecting **Test data (no UART)** (RX GPIO `-1`) in the Settings view starts
-an internal generator instead of the UART receiver. It feeds complete,
-CRC-correct synthetic telegrams through the same parser and event path at
-the profile cadence (clamped to 1–5 s), randomising the timestamps and the
+Selecting **Test data** on the data-source toggle (RX GPIO `-1`) in the
+Settings view starts an internal generator instead of the UART receiver. It
+feeds complete, CRC-correct synthetic telegrams through the same parser and
+event path once per configured interval (2–600 s), randomising the timestamps and the
 measurement values (power, energy totals, tariff, voltages, currents and,
 once an M-Bus channel is declared as an expected device type, its reading).
+A (re)started generator reads at least one complete telegram right away —
+after an interval change or any reconfiguration the view never waits a whole
+interval for the first reading.
 The frames follow the shapes of the verified parser fixtures, so Dutch and
 Belgian profiles both decode. The status strip then shows
-*test data (no UART)*. This selection is validated like any other pin: it
-must pass through the settings service, and it is the only value outside the
-J5 allowlist that is accepted.
+*test data (no UART)*. Both data-source selections (live on GPIO44, test on
+`-1`) and the interval bounds are validated by the settings service for
+every save path.
+
+### UART0 TX forwarding
+
+Every accepted telegram is also forwarded out on the UART0 TX pin (GPIO43)
+as the exact accepted frame bytes. At most one forwarding burst happens per
+five seconds — or per interval when the interval is larger — and every
+burst sends the frame **twice** back to back. The burst runs in a dedicated
+low-priority receiver task, so blocking writes never stall reception. Test
+mode installs its own TX driver for this (it opens no receive UART); the
+live path forwards through the driver owned by the parserDSMR adapter.
+
+After a reconfiguration IDF may log `uart: GPIO 43/44 is not usable, maybe
+used by others` once per driver (re)install. This is a cosmetic bookkeeping
+quirk of ESP-IDF 6.0.2: `uart_driver_delete()` keeps its revoked-pin mask in
+a 32-bit variable, so reservations of GPIOs ≥ 32 are never revoked and the
+next install reports them busy. The pin routing itself is applied normally
+and forwarding works; the warning can be ignored.
 
 ## 7. RAM limits (documented target configuration)
 
@@ -194,12 +232,12 @@ effect on UART reception.
 ## 8. Hardware verification
 
 1. `idf.py -p PORT flash monitor` shows the board debug lines after boot.
-2. Open the SPA, choose a J5 GPIO (for example GPIO10), country and profile,
-   then Save. The console shows `receiving on UART 1 at ... baud, profile ...`
-   and the status strip moves from *awaiting configuration* to *awaiting data*
-   to *accepted telegram*.
-3. With a conditioned P1 signal on the selected pin, telegrams appear in the
-   Telegrams view at the profile cadence; console and reception operate
+2. Open the SPA, set the data-source slider to **Live data**, choose an
+   interval (2–600 s), country and profile, then Save. The console shows
+   `receiving on UART 0 at ... baud, profile ...` and the status strip moves
+   from *awaiting configuration* to *awaiting data* to *accepted telegram*.
+3. With a conditioned P1 signal on GPIO44, one telegram per configured
+   interval is read into the Telegrams view; console and reception operate
    together.
 4. Power-cycle the device: the configuration survives and reception restarts.
 5. Reserved peripheral pins (display, encoder, buttons, SD connector, I²C

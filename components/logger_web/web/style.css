@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-15 · Build: 1 */
+   Date: 2026-11-15 · Build: 4 */
 
 :root
 {
@@ -213,6 +213,131 @@ select:hover
   border-color: var(--hairline);
 }
 
+/* Data-source toggle (Live data / Test data), iOS flavoured switch. */
+.toggleRow
+{
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.toggleEnd
+{
+  font-size: 0.82rem;
+  color: var(--secondary);
+  white-space: nowrap;
+  transition: color 0.15s ease;
+}
+
+.toggleEnd.active
+{
+  color: var(--accent);
+  font-weight: 600;
+}
+
+#srcToggle
+{
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.switch
+{
+  position: relative;
+  display: inline-block;
+  width: 51px;
+  height: 31px;
+  border-radius: 16px;
+  background: var(--controlFill);
+  border: none;
+  cursor: pointer;
+  transition: background 0.2s ease;
+  flex: none;
+}
+
+.switchKnob
+{
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 27px;
+  height: 27px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 1px 1px rgba(0, 0, 0, 0.12);
+  transition: transform 0.2s ease;
+}
+
+#srcToggle:checked + .switch
+{
+  background: var(--accent);
+}
+
+#srcToggle:checked + .switch .switchKnob
+{
+  transform: translateX(20px);
+}
+
+#srcToggle:focus-visible + .switch
+{
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.intervalRow
+{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#inpInterval
+{
+  width: 90px;
+  font-family: inherit;
+  font-size: 0.92rem;
+  color: var(--fg);
+  padding: 9px 12px;
+  border: 1px solid var(--separator);
+  border-radius: 9px;
+  background-color: var(--controlFill);
+  transition: border-color 0.15s ease;
+}
+
+#inpInterval:hover
+{
+  border-color: var(--hairline);
+}
+
+/* Toolbar row above the record log. */
+.listToolbar
+{
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+
+#showLast
+{
+  appearance: none;
+  font-family: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--controlFill);
+  border: none;
+  border-radius: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+
+#showLast:active
+{
+  transform: scale(0.97);
+}
+
 fieldset
 {
   grid-column: 1 / 3;
@@ -279,44 +404,36 @@ legend
   color: var(--warning);
 }
 
-#backToLatest
-{
-  appearance: none;
-  font-family: inherit;
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: var(--accent);
-  background: var(--controlFill);
-  border: none;
-  border-radius: 8px;
-  padding: 6px 14px;
-  margin-left: 8px;
-  cursor: pointer;
-}
-
-/* Grouped list of records, like the iOS Settings rows. */
-#telegramList
+/* Read-only scrolling log of the retained records. Nothing in it is
+   clickable: rows are plain lines, newest on top, and the pane scrolls. */
+#telegramLog
 {
   width: 100%;
+  height: 156px;
   margin: 8px 0;
-  padding: 4px;
+  padding: 2px 12px;
+  overflow-y: auto;
   border: 1px solid var(--separator);
   border-radius: 11px;
   background: var(--card);
   font-family: inherit;
   font-size: 0.88rem;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: none;
 }
 
-#telegramList option
+#telegramLog .logLine
 {
-  padding: 9px 10px;
-  border-radius: 8px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--separator);
+  white-space: nowrap;
+  color: var(--fg);
 }
 
-#telegramList option:checked
+#telegramLog .logLine:last-child
 {
-  background: var(--accent) linear-gradient(0deg, var(--accent), var(--accent));
-  color: #fff;
+  border-bottom: none;
 }
 
 .meta

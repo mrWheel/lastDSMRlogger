@@ -1,11 +1,12 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.h - versioned settings service
-//-- Date: 2026-11-15 · Build: 1
+//-- Date: 2026-11-15 · Build: 2
 //--
 //-- The settings service stores the complete versioned configuration in
 //-- ESP-IDF NVS, validates it against the parserDSMR built-in profiles and
-//-- the board allowlist, and exposes the valid choices for the settings view
+//-- the P1 data source and read interval rules, and exposes the valid
+//-- choices for the settings view
 //-- of the SPA. Validation runs identically for a selection arriving through
 //-- the SPA and through the API: only the service validates.
 //-- ==========================================================================
@@ -20,23 +21,25 @@
 #include "esp_err.h"
 
 //-- --------------------------------------------------------------------------
-//-- P1 RX pin allowlist
+//-- P1 data source selections
 //-- --------------------------------------------------------------------------
 
-//-- Selectable P1 RX input pins on the board J5 connector. These GPIOs are
-//-- wired only to J5 and are free for general use when the board component
-//-- drives the display, encoder, buttons, SD and I2C resources. GPIO43 and
-//-- GPIO44 stay reserved for the console on UART0.
-#define LOGGER_P1_GPIO_COUNT 8
-extern const int loggerP1GpioChoices[LOGGER_P1_GPIO_COUNT];
+//-- The P1 port of the smart meter always connects to UART0: RX on GPIO44,
+//-- TX on GPIO43 (the meter never needs our TX). These pins are fixed; the
+//-- console runs on the native USB serial/JTAG peripheral instead of UART0.
+#define LOGGER_P1_UART0_RX_GPIO 44
+#define LOGGER_P1_UART0_TX_GPIO 43
+
+//-- Stored RX selection for live data: the fixed UART0 receive pin.
+#define LOGGER_RX_GPIO_LIVE LOGGER_P1_UART0_RX_GPIO
 
 //-- Special RX selection: -1 selects the internal test data generator. No
 //-- UART is started; the receiver feeds synthetic telegrams through the
-//-- parser instead. It is a mode marker, not a board pin, so it stays out of
-//-- the J5 allowlist and is validated separately.
+//-- parser instead. It is a mode marker, not a board pin.
 #define LOGGER_RX_GPIO_TEST (-1)
 
-bool loggerSettingsIsSelectableGpio(int gpio);
+//-- True when the selection is the fixed live UART0 receive pin.
+bool loggerSettingsIsLiveGpio(int gpio);
 
 //-- True when the selection is the internal test data generator.
 bool loggerSettingsIsTestGpio(int gpio);
@@ -56,14 +59,26 @@ typedef enum
   LOGGER_MBUS_MODE_EXPECTED,
 } loggerMbusMode;
 
-#define LOGGER_SETTINGS_VERSION 1u
+//-- Version 2: the P1 port is fixed on UART0 (GPIO43/44) and the telegram
+//-- read interval became a setting; stored version 1 blobs are rejected.
+#define LOGGER_SETTINGS_VERSION 2u
 #define LOGGER_SETTINGS_PROFILE_ID_MAX 32
 #define LOGGER_SETTINGS_COUNTRY_MAX 3
+
+//-- Accepted read interval bounds in seconds: only one telegram is read
+//-- (accepted into the history) per interval.
+#define LOGGER_SETTINGS_INTERVAL_MIN_S 2u
+#define LOGGER_SETTINGS_INTERVAL_MAX_S 600u
 
 typedef struct
 {
   uint32_t structVersion;
   int rxGpio;
+
+  //-- Read interval in seconds (LOGGER_SETTINGS_INTERVAL_MIN_S through
+  //-- LOGGER_SETTINGS_INTERVAL_MAX_S).
+  uint32_t intervalSeconds;
+
   char countryCode[LOGGER_SETTINGS_COUNTRY_MAX];
   char profileId[LOGGER_SETTINGS_PROFILE_ID_MAX];
 

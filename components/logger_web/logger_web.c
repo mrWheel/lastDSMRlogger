@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-15 · Build: 1
+//-- Date: 2026-11-15 · Build: 3
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status and telegram-list JSON and answers form-urlencoded commands
@@ -350,6 +350,10 @@ static esp_err_t sendAsset(httpd_req_t *req, const char *start, const char *end,
     end--;
   }
 
+  //-- The assets are embedded in the firmware and change with every flash:
+  //-- always revalidate so a browser reload never runs a stale app.js after
+  //-- a firmware update.
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   httpd_resp_set_type(req, contentType);
   return httpd_resp_send(req, start, (end - start));
 }
@@ -406,14 +410,23 @@ static void urlDecode(const char *source, char *out, size_t outSize)
       out[position++] = ' ';
       source++;
     }
-    else if ((*source == '%') && isdigit((unsigned char)source[1]) && isdigit((unsigned char)source[2]))
+    else if ((*source == '%') && isxdigit((unsigned char)source[1]) && isxdigit((unsigned char)source[2]))
     {
       unsigned high = 0u;
       unsigned low = 0u;
-      hexDigit(source[1], &high);
-      hexDigit(source[2], &low);
-      out[position++] = (char)((high << 4) | low);
-      source += 3;
+
+      //-- Hex digits include A-F: the browser encodes the mode separator as
+      //-- %3A, so requiring decimal digits broke every expected:<type> value.
+      if (hexDigit(source[1], &high) && hexDigit(source[2], &low))
+      {
+        out[position++] = (char)((high << 4) | low);
+        source += 3;
+      }
+      else
+      {
+        out[position++] = *source;
+        source++;
+      }
     }
     else
     {
@@ -508,7 +521,7 @@ static bool mbusTypeFromString(const char *text, dsmrMbusDeviceType *out)
 
 static void appendSettingsJson(stringBuilder *sb, const loggerSettingsConfig *config)
 {
-  sbAppendFmt(sb, "{\"rxGpio\":%d,\"country\":", config->rxGpio);
+  sbAppendFmt(sb, "{\"rxGpio\":%d,\"intervalSeconds\":%" PRIu32 ",\"country\":", config->rxGpio, config->intervalSeconds);
   sbAppendJsonString(sb, config->countryCode);
   sbAppend(sb, ",\"profileId\":");
   sbAppendJsonString(sb, config->profileId);
@@ -582,14 +595,13 @@ static void appendConfigJson(stringBuilder *sb)
     sbAppend(sb, "null");
   }
 
-  sbAppend(sb, ",\"choices\":{\"gpios\":[");
-
-  for (uint8_t index = 0; index < LOGGER_P1_GPIO_COUNT; index++)
-  {
-    sbAppendFmt(sb, "%s%d", (index > 0u) ? "," : "", loggerP1GpioChoices[index]);
-  }
-
-  sbAppendFmt(sb, "],\"testGpio\":%d", LOGGER_RX_GPIO_TEST);
+  //-- The data source is a two-position choice: live data on the fixed P1
+  //-- UART0 pins or the internal test generator. The interval bounds are
+  //-- published so the SPA can configure its interval field.
+  sbAppendFmt(sb, ",\"choices\":{\"liveGpio\":%d", LOGGER_RX_GPIO_LIVE);
+  sbAppendFmt(sb, ",\"testGpio\":%d", LOGGER_RX_GPIO_TEST);
+  sbAppendFmt(sb, ",\"intervalMin\":%u", (unsigned)LOGGER_SETTINGS_INTERVAL_MIN_S);
+  sbAppendFmt(sb, ",\"intervalMax\":%u", (unsigned)LOGGER_SETTINGS_INTERVAL_MAX_S);
   sbAppend(sb, ",\"countries\":[");
   uint16_t profileCount = loggerSettingsProfileCount();
   char knownCountries[8][LOGGER_SETTINGS_COUNTRY_MAX];
@@ -686,6 +698,28 @@ static const char *applySettingsFromForm(const char *body)
   }
 
   candidate.rxGpio = atoi(text);
+
+  //-- The read interval in seconds is validated by clamping: a value below
+  //-- the minimum becomes the minimum, a value above the maximum becomes the
+  //-- maximum, so a save never fails over the interval alone.
+  if (!formGet(body, "interval", text, sizeof text))
+  {
+    return "missing interval";
+  }
+
+  int interval = atoi(text);
+
+  if (interval < (int)LOGGER_SETTINGS_INTERVAL_MIN_S)
+  {
+    interval = (int)LOGGER_SETTINGS_INTERVAL_MIN_S;
+  }
+
+  if (interval > (int)LOGGER_SETTINGS_INTERVAL_MAX_S)
+  {
+    interval = (int)LOGGER_SETTINGS_INTERVAL_MAX_S;
+  }
+
+  candidate.intervalSeconds = (uint32_t)interval;
 
   if (!formGet(body, "country", candidate.countryCode, sizeof candidate.countryCode))
   {
@@ -784,6 +818,7 @@ static void appendStatusJson(stringBuilder *sb, const loggerReceiverStatus *stat
   sbAppendFmt(sb, ",\"rxGpio\":%d", status->rxGpio);
   sbAppend(sb, ",\"testMode\":");
   sbAppend(sb, (loggerSettingsIsTestGpio(status->rxGpio) && status->receiverRunning) ? "true" : "false");
+  sbAppendFmt(sb, ",\"intervalSeconds\":%" PRIu32, status->intervalSeconds);
   sbAppend(sb, ",\"activeProfileId\":");
   sbAppendJsonString(sb, status->activeProfileId);
   sbAppendFmt(sb, ",\"uptimeMs\":%" PRIu32, status->uptimeMs);
@@ -813,6 +848,10 @@ static void appendMetaJson(stringBuilder *sb, const loggerTelegramMeta *meta)
   sbAppendJsonString(sb, meta->profileId);
   sbAppend(sb, ",\"reportedVersion\":");
   sbAppendJsonString(sb, meta->reportedVersion);
+
+  //-- Meter time of OBIS 0-0:1.0.0 as "HH:MM:SS"; empty when unavailable.
+  sbAppend(sb, ",\"meterTimeText\":");
+  sbAppendJsonString(sb, meta->meterTimeText);
   sbAppendFmt(sb, ",\"crcVerified\":%s", meta->crcVerified ? "true" : "false");
   sbAppendFmt(sb, ",\"rawLength\":%u", (unsigned)meta->rawLength);
   sbAppendFmt(sb, ",\"fieldCount\":%u", (unsigned)meta->fieldCount);
@@ -838,22 +877,12 @@ static void appendTelegramListJson(stringBuilder *sb)
   sbAppend(sb, "]}");
 }
 
-//-- Builds the decoded detail JSON of one retained record. False when the
-//-- sequence aged out; the caller reports that to the client.
-static bool appendTelegramDetailJson(stringBuilder *sb, uint32_t sequence)
+//-- Callback of appendTelegramDetailJson: renders one retained record in
+//-- place while the receive-side lock is held. Memory only: no network and
+//-- no blocking, as required by the inspect contract.
+static bool buildDetailFromRecord(const loggerTelegramRecord *record, void *userData)
 {
-  loggerTelegramRecord *record = malloc(sizeof *record);
-
-  if (record == NULL)
-  {
-    return false;
-  }
-
-  if (!loggerReceiverGetRecord(sequence, record))
-  {
-    free(record);
-    return false;
-  }
+  stringBuilder *sb = (stringBuilder *)userData;
 
   sbAppend(sb, "{\"type\":\"telegram\",\"meta\":");
   appendMetaJson(sb, &record->meta);
@@ -878,8 +907,17 @@ static bool appendTelegramDetailJson(stringBuilder *sb, uint32_t sequence)
   }
 
   sbAppend(sb, "]}");
-  free(record);
   return true;
+}
+
+//-- Builds the decoded detail JSON of one retained record. False when the
+//-- sequence aged out; the caller reports that to the client. The JSON is
+//-- rendered straight from the retained slot: copying the 23 KB record to
+//-- the heap next to the JSON buffer exhausted the free heap on this build
+//-- and made every detail request fail over as "aged out".
+static bool appendTelegramDetailJson(stringBuilder *sb, uint32_t sequence)
+{
+  return loggerReceiverInspectRecord(sequence, buildDetailFromRecord, sb);
 }
 
 //-- --------------------------------------------------------------------------
@@ -1450,6 +1488,12 @@ esp_err_t loggerWebStart(void)
 
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.max_uri_handlers = 12;
+
+  //-- WebSocket command handling builds the telegram detail JSON (nested
+  //-- string builders plus vsnprintf) on the httpd task stack: the 4 KB
+  //-- default overflows there, which silently killed the whole web server
+  //-- (dropped telegrams and details, blank panes). 8 KB measured headroom.
+  config.stack_size = 8192;
 
   //-- WebSocket sessions stay open for the life of the page; an LRU purge
   //-- could evict them to make room for ordinary requests.

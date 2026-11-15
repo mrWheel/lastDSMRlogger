@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-15 · Build: 1
+// Date: 2026-11-15 · Build: 4
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -46,8 +46,9 @@ const tabButtons = {};
 function bindElements()
 {
   const ids = ["tabBar", "statusStrip", "settingsMessage", "settingsForm",
-               "selGpio", "selCountry", "selProfile", "selMbus1", "selMbus2", "selMbus3", "selMbus4",
-               "saveSettings", "telegramState", "telegramList", "agedOutNotice", "backToLatest",
+               "srcToggle", "srcLiveLabel", "srcTestLabel", "inpInterval",
+               "selCountry", "selProfile", "selMbus1", "selMbus2", "selMbus3", "selMbus4",
+               "saveSettings", "telegramState", "showLast", "telegramLog",
                "telegramDetail", "recordMeta", "recordNotes", "summaryTable", "rawView", "footerInfo",
                "viewSettings", "viewTelegrams"];
 
@@ -140,7 +141,9 @@ function wsConnect()
       }
       catch (error)
       {
-        // Ignore anything that is not a valid protocol message.
+        // Anything that is not a valid protocol message is ignored, but a
+        // handler exception is surfaced in the console for field debugging.
+        console.error("ws message handling failed:", error, event.data);
       }
     }
     else
@@ -189,11 +192,8 @@ function handleTextMessage(message)
 
 function handleRawFrame(buffer)
 {
-  if (state.pendingRawSeq === null)
-  {
-    return;
-  }
-
+  // A binary frame is only ever the answer to cmd=raw: fill the view even
+  // when the header was missed, so the raw telegram can never stay blank.
   // textContent preserves the original line endings and never interprets
   // the telegram text as HTML.
   el.rawView.textContent = new TextDecoder("utf-8").decode(buffer);
@@ -204,7 +204,8 @@ function handleServerError(message)
 {
   if (message.request === "telegram")
   {
-    el.telegramDetail.hidden = true;
+    // The last shown detail stays on screen: a failed refresh must never
+    // blank the pane, only the state line reports the reason.
     setTelegramState(message.error || "Telegram unavailable.");
   }
   else if (message.request === "raw")
@@ -251,8 +252,14 @@ function renderStatus(status)
 
   if (status.receiverRunning)
   {
-    // A test selection has no UART: say so instead of showing GPIO -1.
-    text += status.testMode ? "  ·  test data (no UART)" : "  ·  RX GPIO " + status.rxGpio;
+    // A test selection has no UART; live data always arrives on the fixed
+    // P1 UART0 pins.
+    text += status.testMode ? "  ·  test data (no UART)" : "  ·  live data (UART0 GPIO43/44)";
+  }
+
+  if (status.intervalSeconds)
+  {
+    text += "  ·  read every " + status.intervalSeconds + " s";
   }
 
   // Wall clock time is unavailable in this release: show receive age and
@@ -335,6 +342,26 @@ function fillProfiles(country, preferredId)
   }
 }
 
+//-- The two data-source selections as published by the device, with the
+//-- firmware defaults as a fallback before the first config message.
+function sourceChoices()
+{
+  const choices = (state.config !== null && state.config.choices) ? state.config.choices : {};
+
+  return {
+    liveGpio: (choices.liveGpio === undefined) ? 44 : choices.liveGpio,
+    testGpio: (choices.testGpio === undefined) ? -1 : choices.testGpio,
+  };
+}
+
+//-- Highlights the toggle end matching the current switch position.
+function updateSourceLabels()
+{
+  const isTest = el.srcToggle.checked;
+  el.srcLiveLabel.classList.toggle("active", !isTest);
+  el.srcTestLabel.classList.toggle("active", isTest);
+}
+
 function renderSettings(message)
 {
   state.config = message;
@@ -355,11 +382,14 @@ function renderSettings(message)
     el.settingsMessage.textContent = "No valid configuration yet: reception awaits a valid configuration below.";
   }
 
-  // The RX dropdown offers every eligible J5 input plus the test selection.
-  const testGpio = (choices.testGpio === undefined) ? -1 : choices.testGpio;
-  const gpioValues = (choices.gpios || []).concat([testGpio]);
-  const gpioLabels = (choices.gpios || []).map((gpio) => "GPIO" + gpio).concat(["Test data (no UART)"]);
-  fillSelect(el.selGpio, gpioValues, gpioLabels);
+  // The data source is a two-position toggle: live data on the fixed P1
+  // UART0 pins (GPIO43/44) or the internal test generator.
+  const source = sourceChoices();
+  el.srcToggle.checked = !!(settings && (settings.rxGpio === source.testGpio));
+  updateSourceLabels();
+
+  el.inpInterval.value = (settings && settings.intervalSeconds) ? String(settings.intervalSeconds) : "10";
+
   fillSelect(el.selCountry, choices.countries);
 
   const mbus = mbusOptions(choices.mbusTypes || []);
@@ -371,7 +401,6 @@ function renderSettings(message)
 
   if (settings)
   {
-    el.selGpio.value = String(settings.rxGpio);
     el.selCountry.value = settings.country;
     fillProfiles(settings.country, settings.profileId);
 
@@ -397,8 +426,31 @@ function saveSettings(event)
   event.preventDefault();
   el.settingsMessage.textContent = "Saving...";
 
+  // The switch position maps to the stored RX selection: the fixed live
+  // UART0 pin or the test generator marker.
+  const source = sourceChoices();
+  const rxGpio = el.srcToggle.checked ? source.testGpio : source.liveGpio;
+
+  // The interval is validated by clamping: below the minimum becomes the
+  // minimum, above the maximum becomes the maximum, and the field shows the
+  // value that will actually be applied.
+  let interval = parseInt(el.inpInterval.value, 10);
+
+  if (!Number.isFinite(interval) || (interval < 2))
+  {
+    interval = 2;
+  }
+
+  if (interval > 600)
+  {
+    interval = 600;
+  }
+
+  el.inpInterval.value = String(interval);
+
   const body = "cmd=save" +
-               "&rxGpio=" + encodeURIComponent(el.selGpio.value) +
+               "&rxGpio=" + encodeURIComponent(rxGpio) +
+               "&interval=" + encodeURIComponent(interval) +
                "&country=" + encodeURIComponent(el.selCountry.value) +
                "&profileId=" + encodeURIComponent(el.selProfile.value) +
                "&mbus1=" + encodeURIComponent(el.selMbus1.value) +
@@ -430,57 +482,53 @@ function setTelegramState(message)
   el.telegramState.textContent = message;
 }
 
+// The log is a plain scrolling window over the retained records: rows are
+// not clickable and carry no selection. Each row shows the meter time of
+// OBIS 0-0:1.0.0 (for example 17:37:38) instead of a receive uptime. The
+// detail pane is filled once automatically and then stays frozen on that
+// record: new telegrams refresh the log rows only. Show Last (re)shows the
+// latest accepted record at any time.
 function renderTelegramList(telegrams)
 {
+  el.telegramLog.textContent = "";
+
   if (telegrams.length === 0)
   {
-    el.telegramList.textContent = "";
-    el.telegramDetail.hidden = true;
-    el.agedOutNotice.hidden = true;
-    setTelegramState("No telegram accepted yet.");
+    // Only a never-filled pane is hidden: a shown detail survives an empty
+    // list so the decode summary and raw telegram never blink away.
+    if (state.selectedSeq === null)
+    {
+      el.telegramDetail.hidden = true;
+      setTelegramState("No telegram accepted yet.");
+    }
     return;
   }
 
-  el.latestSeq = telegrams[0].sequence;
-
-  el.telegramList.textContent = "";
   telegrams.forEach((telegram) =>
   {
-    const option = document.createElement("option");
-    option.value = String(telegram.sequence);
+    const line = document.createElement("div");
+    line.className = "logLine";
     const crc = telegram.crcVerified ? "crc ok" : "no crc";
-    option.textContent = "#" + telegram.sequence + "  " + telegram.profileId +
-                         "  v" + telegram.reportedVersion + "  " + crc +
-                         "  at " + formatUptime(telegram.receivedUptimeMs);
-    el.telegramList.appendChild(option);
+    const meterTime = telegram.meterTimeText || "--:--:--";
+    line.textContent = "#" + telegram.sequence + "  " + meterTime + "  " + telegram.profileId +
+                       "  v" + telegram.reportedVersion + "  " + crc;
+    el.telegramLog.appendChild(line);
   });
 
-  const stillAvailable = telegrams.some((telegram) => telegram.sequence === state.selectedSeq);
+  state.latestSeq = telegrams[0].sequence;
 
+  // Fill the detail pane once so it is never empty; after that it stays on
+  // the shown record until Show Last selects a new one.
   if (state.selectedSeq === null)
   {
-    selectTelegram(el.latestSeq);
-    return;
-  }
-
-  if (stillAvailable)
-  {
-    // A new arrival leaves the user's selected telegram in view.
-    el.agedOutNotice.hidden = true;
-    el.telegramList.value = String(state.selectedSeq);
-  }
-  else
-  {
-    el.agedOutNotice.hidden = false;
+    selectTelegram(state.latestSeq);
   }
 }
 
 function selectTelegram(sequence)
 {
   state.selectedSeq = sequence;
-  el.agedOutNotice.hidden = true;
   el.telegramDetail.hidden = false;
-  el.telegramList.value = String(sequence);
   wsSend("cmd=telegram&seq=" + encodeURIComponent(sequence));
   wsSend("cmd=raw&seq=" + encodeURIComponent(sequence));
 }
@@ -489,7 +537,15 @@ function renderDetail(detail)
 {
   const meta = detail.meta;
 
-  el.recordMeta.textContent = "#" + meta.sequence + " · captured " + formatUptime(meta.receivedUptimeMs) +
+  // A message without a usable meta must never blank the shown record:
+  // keep the previous summary and raw view untouched instead.
+  if (!meta || (typeof meta.sequence !== "number"))
+  {
+    return;
+  }
+
+  el.recordMeta.textContent = "#" + meta.sequence + " · meter time " + (meta.meterTimeText || "unavailable") +
+                              " · captured " + formatUptime(meta.receivedUptimeMs) +
                               " after boot · profile " + meta.profileId +
                               " · meter version " + meta.reportedVersion +
                               " · " + (meta.crcVerified ? "CRC verified" : "CRC absent") +
@@ -625,22 +681,20 @@ function boot()
   buildTabBar();
   el.settingsForm.addEventListener("submit", saveSettings);
 
-  el.selCountry.addEventListener("change", () =>
-  {
-    fillProfiles(el.selCountry.value, null);
-  });
+  el.srcToggle.addEventListener("change", updateSourceLabels);
 
-  el.telegramList.addEventListener("change", () =>
-  {
-    selectTelegram(Number(el.telegramList.value));
-  });
-
-  el.backToLatest.addEventListener("click", () =>
+  // Show Last always (re)shows the last telegram that was read in.
+  el.showLast.addEventListener("click", () =>
   {
     if (state.latestSeq !== null)
     {
       selectTelegram(state.latestSeq);
     }
+  });
+
+  el.selCountry.addEventListener("change", () =>
+  {
+    fillProfiles(el.selCountry.value, null);
   });
 
   wsConnect();

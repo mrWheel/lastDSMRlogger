@@ -5,9 +5,10 @@ menu "lastDSMRlogger P1 Interface"
         default LASTDSMRLOGGER_P1_RX_DIRECT
         help
             Select how the chosen P1 interface presents the meter signal to
-            the ESP32-S3. The smart meter P1 port is an idle-high interface.
-            Use the setting documented for the interface board you wire to
-            J5; the selection is fixed at build time.
+            the ESP32-S3. The smart meter P1 port always connects to UART0:
+            RX on GPIO44, TX on GPIO43. The smart meter P1 port is an
+            idle-high interface. Use the setting documented for the
+            interface board; the selection is fixed at build time.
 
         config LASTDSMRLOGGER_P1_RX_DIRECT
             bool "Direct (non-inverted) signal from the P1 interface"
