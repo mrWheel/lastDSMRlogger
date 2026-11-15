@@ -21,6 +21,13 @@ extern "C" {
 #define TFT_EC11_YELLOW 0xFFE0
 
 typedef enum { TFT_EC11_PRESS_DOWN, TFT_EC11_PRESS_SHORT, TFT_EC11_PRESS_MEDIUM, TFT_EC11_PRESS_LONG } tft_ec11_press_t;
+
+//-- Native bitmap font faces. Each face stores its own glyph bitmaps and is
+//-- drawn pixel-accurate at its own size; glyphs are never scaled or
+//-- interpolated. Cells include the 1 px inter-character gap:
+//-- SMALL  = 5x7 glyph, 6x8 cell   MEDIUM = 7x12 glyph, 8x12 cell
+//-- LARGE  = 8x16 glyph, 9x16 cell
+typedef enum { TFT_EC11_FONT_SMALL, TFT_EC11_FONT_MEDIUM, TFT_EC11_FONT_LARGE } tft_ec11_font_t;
 typedef enum { TFT_EC11_EVENT_ROTATE, TFT_EC11_EVENT_ENCODER_BUTTON, TFT_EC11_EVENT_AUX_BUTTON } tft_ec11_event_type_t;
 typedef struct { tft_ec11_event_type_t type; int32_t steps; tft_ec11_press_t press; uint32_t duration_ms; } tft_ec11_event_t;
 typedef struct { uint16_t background; uint16_t foreground; uint8_t font_scale; } tft_ec11_text_style_t;
@@ -42,6 +49,8 @@ esp_err_t tft_ec11_draw_text_simple(int x, int y, const char *text);
 esp_err_t tft_ec11_draw_text_styled(int x, int y, const char *text, uint16_t background,
 									uint8_t font_scale, uint16_t foreground);
 esp_err_t tft_ec11_draw_text(int x, int y, size_t slot_chars, const char *text);
+esp_err_t tft_ec11_draw_text_font(int x, int y, const char *text, tft_ec11_font_t font,
+                                  uint16_t background, uint16_t foreground);
 esp_err_t tft_ec11_inputs_start(size_t queue_length);
 void tft_ec11_inputs_stop(void);
 QueueHandle_t tft_ec11_event_queue(void);

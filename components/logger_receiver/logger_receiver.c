@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.c - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-15 · Build: 4
+//-- Date: 2026-11-15 · Build: 8
 //--
 //-- The parserDSMR adapter task owns the parser instance while it runs. The
 //-- event callback copies the complete accepted frame and the decoded fields
@@ -21,6 +21,7 @@
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "driver/uart.h"
@@ -102,6 +103,15 @@ typedef struct
   char lastDiagReason[48];
   char lastDiagObis[LOGGER_SNAPSHOT_OBIS_MAX];
   char lastError[96];
+
+  //-- Console deduplication: the reason and OBIS of the diagnostic that was
+  //-- last logged. Repeated identical diagnostics (an M-Bus type mismatch
+  //-- repeats for every subfield of every telegram) reach the console only
+  //-- once per reception session; the counter and the web status stay
+  //-- complete. Reset on every receiver (re)start so a boot or a settings
+  //-- change shows the current diagnostics again.
+  char loggedDiagText[70];
+  bool loggedDiagValid;
 
   //-- mutex guards history, status and the active configuration for readers
   //-- and for the receive task's event callback. controlMutex serializes
@@ -261,6 +271,170 @@ static void extractMeterTimeText(loggerTelegramRecord *record)
 }
 
 //-- --------------------------------------------------------------------------
+//-- Power panel snapshot for the TFT (receive task context)
+//-- --------------------------------------------------------------------------
+
+//-- Copies the first numeric value published for the given OBIS code. An
+//-- unavailable reading (empty value) and a text field count as absent.
+static bool findNumericField(const loggerTelegramRecord *record, const char *obis, float *outValue)
+{
+  for (uint16_t index = 0u; index < record->meta.fieldCount; index++)
+  {
+    const loggerFieldSnapshot *field = &record->fields[index];
+
+    if ((strcmp(field->obis, obis) == 0) && (field->value[0] != '\0') && !field->valueIsText)
+    {
+      *outValue = (float)atof(field->value);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+//-- The power panel title shows the meter date and time of OBIS 0-0:1.0.0
+//-- as "DD-MM-YYYY HH:MM" (no seconds): the parser timestamp is preferred,
+//-- a plain YYMMDDHHMMSSW digit value is the fallback. Empty when unusable.
+static void extractPanelMeterTime(const loggerTelegramRecord *record, char *out, size_t outSize)
+{
+  out[0] = '\0';
+
+  for (uint16_t index = 0u; index < record->meta.fieldCount; index++)
+  {
+    const loggerFieldSnapshot *field = &record->fields[index];
+
+    if (strcmp(field->obis, "0-0:1.0.0") != 0)
+    {
+      continue;
+    }
+
+    if (field->hasTimestamp)
+    {
+      const char *timePart = strchr(field->timestamp, 'T');
+
+      if ((timePart != NULL) && ((size_t)(timePart - field->timestamp) == 10u) && isHmsText(timePart + 1))
+      {
+        snprintf(out, outSize, "%c%c-%c%c-%c%c%c%c %c%c:%c%c",
+                 field->timestamp[8], field->timestamp[9], field->timestamp[5], field->timestamp[6],
+                 field->timestamp[0], field->timestamp[1], field->timestamp[2], field->timestamp[3],
+                 timePart[1], timePart[2], timePart[4], timePart[5]);
+      }
+
+      return;
+    }
+
+    if (strlen(field->value) >= 12u)
+    {
+      bool allDigits = true;
+
+      for (uint8_t position = 0u; position < 12u; position++)
+      {
+        if (!isdigit((unsigned char)field->value[position]))
+        {
+          allDigits = false;
+          break;
+        }
+      }
+
+      if (allDigits)
+      {
+        snprintf(out, outSize, "%c%c-%c%c-20%c%c %c%c:%c%c",
+                 field->value[4], field->value[5], field->value[2], field->value[3],
+                 field->value[0], field->value[1], field->value[6], field->value[7],
+                 field->value[8], field->value[9]);
+      }
+    }
+
+    return;
+  }
+}
+
+//-- Builds the signed power frame for the TFT panel from the decoded fields,
+//-- following the DSMRlogger32 power bars: the net power of a phase is
+//-- returned minus delivered (negative is consumption, drawn red; positive
+//-- is feed-in, drawn green). The profile publishes delivered kW on
+//-- 1-0:21/41/61.7.0, returned kW on 1-0:22/42/62.7.0, current on
+//-- 1-0:31/51/71.7.0 and voltage on 1-0:32/52/72.7.0 (cross-checked with
+//-- dsmr2Lib). The header current is the signed net watt over the phase
+//-- voltage; the published unsigned current is the fallback magnitude. The
+//-- totals use the published total delivered/returned readings, with the
+//-- phase sum as fallback.
+static void extractPowerSnapshot(const loggerTelegramRecord *record, bool testData, uint32_t sequence, loggerPowerSnapshot *snapshot)
+{
+  static const char *const deliveredObis[3] = {"1-0:21.7.0", "1-0:41.7.0", "1-0:61.7.0"};
+  static const char *const returnedObis[3] = {"1-0:22.7.0", "1-0:42.7.0", "1-0:62.7.0"};
+  static const char *const ampObis[3] = {"1-0:31.7.0", "1-0:51.7.0", "1-0:71.7.0"};
+  static const char *const voltObis[3] = {"1-0:32.7.0", "1-0:52.7.0", "1-0:72.7.0"};
+
+  memset(snapshot, 0, sizeof *snapshot);
+  snapshot->testData = testData;
+  snapshot->sequence = sequence;
+
+  float deliveredTotalKw = 0.0f;
+  float returnedTotalKw = 0.0f;
+  bool hasDeliveredTotal = findNumericField(record, "1-0:1.7.0", &deliveredTotalKw);
+  bool hasReturnedTotal = findNumericField(record, "1-0:2.7.0", &returnedTotalKw);
+
+  float wattSum = 0.0f;
+  float deliveredSum = 0.0f;
+  float returnedSum = 0.0f;
+  float voltSum = 0.0f;
+  uint8_t voltCount = 0u;
+
+  for (uint8_t phase = 0u; phase < 3u; phase++)
+  {
+    float deliveredKw = 0.0f;
+    float returnedKw = 0.0f;
+    float publishedAmps = 0.0f;
+    float volts = 0.0f;
+
+    findNumericField(record, deliveredObis[phase], &deliveredKw);
+    findNumericField(record, returnedObis[phase], &returnedKw);
+    findNumericField(record, ampObis[phase], &publishedAmps);
+    findNumericField(record, voltObis[phase], &volts);
+
+    float watts = (returnedKw - deliveredKw) * 1000.0f;
+    snapshot->phaseWatts[phase] = watts;
+    snapshot->phaseDeliveredWatts[phase] = deliveredKw * 1000.0f;
+    snapshot->phaseReturnedWatts[phase] = returnedKw * 1000.0f;
+    snapshot->phaseVolts[phase] = volts;
+
+    if (volts > 0.0f)
+    {
+      snapshot->phaseAmps[phase] = watts / volts;
+      voltSum += volts;
+      voltCount++;
+    }
+    else
+    {
+      snapshot->phaseAmps[phase] = (watts < 0.0f) ? -publishedAmps : publishedAmps;
+    }
+
+    wattSum += watts;
+    deliveredSum += snapshot->phaseDeliveredWatts[phase];
+    returnedSum += snapshot->phaseReturnedWatts[phase];
+  }
+
+  if (hasDeliveredTotal || hasReturnedTotal)
+  {
+    snapshot->totalWatts = (returnedTotalKw - deliveredTotalKw) * 1000.0f;
+    snapshot->totalDeliveredWatts = deliveredTotalKw * 1000.0f;
+    snapshot->totalReturnedWatts = returnedTotalKw * 1000.0f;
+  }
+  else
+  {
+    snapshot->totalWatts = wattSum;
+    snapshot->totalDeliveredWatts = deliveredSum;
+    snapshot->totalReturnedWatts = returnedSum;
+  }
+
+  snapshot->totalVolts = (voltCount > 0u) ? (voltSum / (float)voltCount) : 0.0f;
+  snapshot->totalAmps = (snapshot->totalVolts > 0.0f) ? (snapshot->totalWatts / snapshot->totalVolts) : 0.0f;
+
+  extractPanelMeterTime(record, snapshot->meterTime, sizeof snapshot->meterTime);
+}
+
+//-- --------------------------------------------------------------------------
 //-- Parser event callback (receive task context)
 //-- --------------------------------------------------------------------------
 
@@ -390,8 +564,16 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     extractMeterTimeText(&stagingRecord);
 
     bool doForward = false;
+    bool testDataMode = false;
+    bool haveShownConfig = false;
+    loggerSettingsConfig shownConfig;
+    uint32_t acceptedShown = 0u;
+    uint32_t rejectedShown = 0u;
+    memset(&shownConfig, 0, sizeof shownConfig);
 
     xSemaphoreTake(self->mutex, portMAX_DELAY);
+
+    testDataMode = self->hasActiveConfig && loggerSettingsIsTestGpio(self->activeConfig.rxGpio);
 
     //-- Disabled is a display setting of the logger at capture time; the raw
     //-- view keeps every channel line regardless.
@@ -430,6 +612,13 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     self->lastAcceptedUptimeMs = result->receiveTimeMs;
     self->lastError[0] = '\0';
 
+    //-- Snapshot of the counters and the active configuration for the TFT
+    //-- system information view, taken under the same lock.
+    haveShownConfig = self->hasActiveConfig;
+    shownConfig = self->activeConfig;
+    acceptedShown = self->acceptedCount;
+    rejectedShown = self->rejectedCount;
+
     //-- The accepted frame is forwarded on the UART0 TX pin at most once per
     //-- five seconds (or per interval when larger); every burst repeats the
     //-- exact frame twice. The burst itself runs in the forwarding task.
@@ -458,6 +647,24 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     }
 
     loggerBoardNoteTelegram(stagingRecord.meta.sequence);
+
+    //-- The TFT power panel becomes the primary screen with the first
+    //-- accepted telegram: signed per-phase and total watts, phase
+    //-- currents and voltages and the meter date/time.
+    loggerPowerSnapshot powerSnapshot;
+    extractPowerSnapshot(&stagingRecord, testDataMode, stagingRecord.meta.sequence, &powerSnapshot);
+    powerSnapshot.acceptedCount = acceptedShown;
+    powerSnapshot.rejectedCount = rejectedShown;
+    powerSnapshot.uptimeSeconds = uptimeMs() / 1000u;
+
+    if (haveShownConfig)
+    {
+      snprintf(powerSnapshot.countryCode, sizeof powerSnapshot.countryCode, "%s", shownConfig.countryCode);
+      snprintf(powerSnapshot.profileId, sizeof powerSnapshot.profileId, "%s", shownConfig.profileId);
+      powerSnapshot.rxInverted = shownConfig.rxInverted;
+    }
+
+    loggerBoardShowPower(&powerSnapshot);
 
     //-- One console line per accepted telegram: sequence, meter time from
     //-- OBIS 0-0:1.0.0, size, CRC verdict and active profile.
@@ -493,19 +700,29 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     copyBounded(self->lastDiagReason, sizeof self->lastDiagReason, dsmrDiagReasonToString(diagnostic->reason));
     copyBounded(self->lastDiagObis, sizeof self->lastDiagObis, (diagnostic->obis != NULL) ? diagnostic->obis : "");
 
-    const char *obis = self->lastDiagObis;
-
     //-- Diagnostics reach the console with their reason (and OBIS when the
     //-- parser names the offending line); totals stay visible in the web
     //-- status strip. Not every diagnostic is a rejection: an accepted
-    //-- telegram can carry an M-Bus type mismatch.
-    if (obis[0] != '\0')
+    //-- telegram can carry an M-Bus type mismatch. An identical diagnostic
+    //-- text is logged once per reception session only, so a repeating
+    //-- M-Bus mismatch stays quiet until the next start or settings
+    //-- change, which resets the deduplication.
+    char diagText[70];
+
+    if (self->lastDiagObis[0] != '\0')
     {
-      ESP_LOGW(tag, "diagnostic: %s @ %s", self->lastDiagReason, obis);
+      snprintf(diagText, sizeof diagText, "%s @ %s", self->lastDiagReason, self->lastDiagObis);
     }
     else
     {
-      ESP_LOGW(tag, "diagnostic: %s", self->lastDiagReason);
+      snprintf(diagText, sizeof diagText, "%s", self->lastDiagReason);
+    }
+
+    if (!self->loggedDiagValid || (strcmp(self->loggedDiagText, diagText) != 0))
+    {
+      copyBounded(self->loggedDiagText, sizeof self->loggedDiagText, diagText);
+      self->loggedDiagValid = true;
+      ESP_LOGW(tag, "diagnostic: %s", diagText);
     }
 
     xSemaphoreGive(self->mutex);
@@ -875,6 +1092,11 @@ static esp_err_t startLocked(LoggerReceiver *self, const loggerSettingsConfig *c
   {
     self->receiverRunning = true;
     self->lastError[0] = '\0';
+
+    //-- A boot or a settings change starts a new reception session: the
+    //-- console deduplication is reset so the diagnostics of the new
+    //-- configuration each show once, and stay quiet after that.
+    self->loggedDiagValid = false;
   }
 
   xSemaphoreGive(self->mutex);

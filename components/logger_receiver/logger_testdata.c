@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_testdata.c - internal test data generator
-//-- Date: 2026-11-15 · Build: 1
+//-- Date: 2026-11-15 · Build: 2
 //--
 //-- The generator produces one complete DSMR-shaped telegram per call with
 //-- randomised timestamps and measurement values. Line shapes follow the
@@ -139,6 +139,40 @@ static void testFormatPower(char *out, size_t outSize, uint32_t milli)
   snprintf(out, outSize, "%03" PRIu32 ".%03" PRIu32 "*kW", milli / 1000u, milli % 1000u);
 }
 
+//-- Phase objects following the corrected profile table (cross-checked
+//-- against dsmr2Lib): delivered kW per phase on 1-0:21/41/61.7.0,
+//-- returned kW per phase on 1-0:22/42/62.7.0, current on 1-0:31/51/71.7.0
+//-- and voltage on 1-0:32/52/72.7.0. Every frame is either a consumption
+//-- frame or a feed-in frame so both panel colours are exercised.
+static bool testAppendPhaseObjects(TestFrame *frame, bool feedIn)
+{
+  static const char *const deliveredObis[3] = {"1-0:21.7.0", "1-0:41.7.0", "1-0:61.7.0"};
+  static const char *const returnedObis[3] = {"1-0:22.7.0", "1-0:42.7.0", "1-0:62.7.0"};
+  static const char *const ampObis[3] = {"1-0:31.7.0", "1-0:51.7.0", "1-0:71.7.0"};
+  static const char *const voltObis[3] = {"1-0:32.7.0", "1-0:52.7.0", "1-0:72.7.0"};
+
+  bool ok = true;
+
+  for (uint8_t phase = 0u; phase < 3u; phase++)
+  {
+    char value[32];
+
+    testFormatPower(value, sizeof value, feedIn ? 0u : testRandom(20000u));
+    ok = ok && testAppendFrame(frame, "%s(%s)\r\n", deliveredObis[phase], value);
+
+    testFormatPower(value, sizeof value, feedIn ? testRandom(20000u) : 0u);
+    ok = ok && testAppendFrame(frame, "%s(%s)\r\n", returnedObis[phase], value);
+
+    ok = ok && testAppendFrame(frame, "%s(00%" PRIu32 ".%02" PRIu32 "*A)\r\n", ampObis[phase],
+                               testRandom(10u), testRandom(100u));
+
+    ok = ok && testAppendFrame(frame, "%s(%03" PRIu32 ".%" PRIu32 "*V)\r\n", voltObis[phase],
+                               225u + testRandom(11u), testRandom(10u));
+  }
+
+  return ok;
+}
+
 size_t loggerTestDataBuild(const dsmrProfile *profile, char *buffer, size_t bufferSize)
 {
   TestFrame frame;
@@ -206,9 +240,13 @@ size_t loggerTestDataBuild(const dsmrProfile *profile, char *buffer, size_t buff
 
   ok = ok && testAppendFrame(&frame, "0-0:96.14.0(000%" PRIu32 ")\r\n", 1u + testRandom(2u));
 
-  testFormatPower(value, sizeof value, testRandom(50000u));
+  //-- One frame is either a consumption frame or a feed-in frame; the
+  //-- totals and the phase objects follow the same choice.
+  bool feedIn = (testRandom(4u) == 0u);
+
+  testFormatPower(value, sizeof value, feedIn ? testRandom(2000u) : testRandom(50000u));
   ok = ok && testAppendFrame(&frame, "1-0:1.7.0(%s)\r\n", value);
-  testFormatPower(value, sizeof value, (testRandom(4u) == 0u) ? testRandom(10000u) : 0u);
+  testFormatPower(value, sizeof value, feedIn ? testRandom(50000u) : 0u);
   ok = ok && testAppendFrame(&frame, "1-0:2.7.0(%s)\r\n", value);
 
   if (belgian)
@@ -224,12 +262,7 @@ size_t loggerTestDataBuild(const dsmrProfile *profile, char *buffer, size_t buff
     ok = ok && testAppendFrame(&frame, "0-0:98.1.0(1)(%06" PRIu32 ")(%s)\r\n",
                                testRandom(1000000u), meterTime);
 
-    ok = ok && testAppendFrame(&frame, "1-0:31.7.0(00%" PRIu32 ".%02" PRIu32 "*A)\r\n", testRandom(10u), testRandom(100u));
-    ok = ok && testAppendFrame(&frame, "1-0:51.7.0(00%" PRIu32 ".%02" PRIu32 "*A)\r\n", testRandom(10u), testRandom(100u));
-    ok = ok && testAppendFrame(&frame, "1-0:71.7.0(00%" PRIu32 ".%02" PRIu32 "*A)\r\n", testRandom(10u), testRandom(100u));
-    ok = ok && testAppendFrame(&frame, "1-0:32.8.0(%03" PRIu32 ".%" PRIu32 "*V)\r\n", 225u + testRandom(11u), testRandom(10u));
-    ok = ok && testAppendFrame(&frame, "1-0:52.8.0(%03" PRIu32 ".%" PRIu32 "*V)\r\n", 225u + testRandom(11u), testRandom(10u));
-    ok = ok && testAppendFrame(&frame, "1-0:72.8.0(%03" PRIu32 ".%" PRIu32 "*V)\r\n", 225u + testRandom(11u), testRandom(10u));
+    ok = ok && testAppendPhaseObjects(&frame, feedIn);
 
     //-- The gas channel reads 0-1:24.2.3 in the eMUCs profile.
     ok = ok && testAppendFrame(&frame, "0-1:24.1.0(001)\r\n");
@@ -239,21 +272,7 @@ size_t loggerTestDataBuild(const dsmrProfile *profile, char *buffer, size_t buff
   }
   else
   {
-    testFormatPower(value, sizeof value, testRandom(20000u));
-    ok = ok && testAppendFrame(&frame, "1-0:21.7.0(%s)\r\n", value);
-    ok = ok && testAppendFrame(&frame, "1-0:22.7.0(000.000*kW)\r\n");
-    testFormatPower(value, sizeof value, testRandom(20000u));
-    ok = ok && testAppendFrame(&frame, "1-0:23.7.0(%s)\r\n", value);
-    ok = ok && testAppendFrame(&frame, "1-0:24.7.0(000.000*kW)\r\n");
-    testFormatPower(value, sizeof value, testRandom(20000u));
-    ok = ok && testAppendFrame(&frame, "1-0:25.7.0(%s)\r\n", value);
-    ok = ok && testAppendFrame(&frame, "1-0:26.7.0(000.000*kW)\r\n");
-    ok = ok && testAppendFrame(&frame, "1-0:32.8.0(%03" PRIu32 ".%" PRIu32 "*V)\r\n", 225u + testRandom(11u), testRandom(10u));
-    ok = ok && testAppendFrame(&frame, "1-0:52.8.0(%03" PRIu32 ".%" PRIu32 "*V)\r\n", 225u + testRandom(11u), testRandom(10u));
-    ok = ok && testAppendFrame(&frame, "1-0:72.8.0(%03" PRIu32 ".%" PRIu32 "*V)\r\n", 225u + testRandom(11u), testRandom(10u));
-    ok = ok && testAppendFrame(&frame, "1-0:31.7.0(00%" PRIu32 ".%" PRIu32 "*A)\r\n", testRandom(10u), testRandom(10u));
-    ok = ok && testAppendFrame(&frame, "1-0:51.7.0(00%" PRIu32 ".%" PRIu32 "*A)\r\n", testRandom(10u), testRandom(10u));
-    ok = ok && testAppendFrame(&frame, "1-0:71.7.0(00%" PRIu32 ".%" PRIu32 "*A)\r\n", testRandom(10u), testRandom(10u));
+    ok = ok && testAppendPhaseObjects(&frame, feedIn);
     ok = ok && testAppendFrame(&frame, "0-0:96.7.21(000%" PRIu32 ")\r\n", testRandom(10u));
     ok = ok && testAppendFrame(&frame, "0-0:96.7.9(000%" PRIu32 ")\r\n", testRandom(2u));
 

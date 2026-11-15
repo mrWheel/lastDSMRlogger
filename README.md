@@ -1,6 +1,6 @@
 # lastDSMRlogger
 
-Buildnumber: 5
+Buildnumber: 11
 Last update-date: 2026-11-15
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
@@ -46,7 +46,7 @@ automatically.
 |Dependency                |Source                                                                                                     |Pin                                                          |
 |--------------------------|-----------------------------------------------------------------------------------------------------------|-------------------------------------------------------------|
 |parserDSMR                |`https://github.com/mrWheel/parserDSMR` checkout at `../parserDSMR`                                         |revision `5b4004508c6e6bf6f507c8c1931f5d458c71797f` + local raw-frame API changes (pending commit)|
-|esp32_s3_piggyback        |`https://github.com/mrWheel/esp32-s3-Piggyback`, component directory `components/esp32_s3_piggyback`       |commit `cd2901728f2acde393a2bc88c96b6e77ba9275c3`, vendored under `components/` |
+|esp32_s3_piggyback        |`https://github.com/mrWheel/esp32-s3-Piggyback`, component directory `components/esp32_s3_piggyback`       |commit `912fa25b86fdb62d8f1005ae57e227c5803db373` (v1.3.0), vendored under `components/` |
 |esp-idf-wifi-provisioner  |ESP Component Registry `michmich/esp-idf-wifi-provisioner`                                                  |version `0.4.0` (upstream commit `2c7aaa6aa0e319a429186ee470e137b8579f632f`) |
 
 parserDSMR is consumed as the checkout's `components/parserDSMR` directory
@@ -63,6 +63,15 @@ The raw byte view on `dsmrTelegramResult` (`rawBytes`/`rawLength`, the exact
 accepted frame including every original line ending and trailer byte) and the
 UART overflow/framing error reporting in the adapter are local additions to
 parserDSMR; commit them in the parser repository and update the pin above.
+
+The profile phase objects are a further local correction (host tests green,
+274 checks): the Dutch and Belgian phase tables now publish the objects the
+meters really use and that dsmr2Lib and the verified sample fixture confirm —
+per-phase delivered kW on `1-0:21/41/61.7.0`, per-phase returned kW on
+`1-0:22/42/62.7.0`, phase current on `1-0:31/51/71.7.0` and phase voltage on
+`1-0:32/52/72.7.0`. The earlier tables mapped current/voltage to wrong codes
+and carried non-existent `24/25/26.7.0` and `32.8.0` entries, which is why
+the phase current and voltage stayed at zero.
 
 The provisioner is resolved into `managed_components/` by the ESP-IDF
 component manager at configure time.
@@ -83,9 +92,9 @@ conditioning and a 3.3 V-compatible signal at the ESP32-S3 input.
 The receiver always uses hardware UART0 on the fixed P1 pins RX GPIO44 and
 TX GPIO43; the P1 port selection is no longer configurable. The console runs
 on the native USB serial/JTAG peripheral so GPIO43/44 are free for P1. The board component
-reserves the display (2, 4, 5, 11, 12, 15) and, when inputs are used, the
-encoder and buttons (1, 6, 16, 17); the encoder/button inputs are never
-started, so those pins stay untouched. The former J5 RX pin selection is
+reserves the display (2, 4, 5, 11, 12, 15) and, for the panel views
+described in section 6, the AUX button (1), the encoder (16/17) and the
+unused encoder push button (6). The former J5 RX pin selection is
 retired: P1 always uses the fixed UART0 pin pair 43/44.
 
 RX polarity is a runtime setting in the SPA (Settings view → *P1 RX
@@ -174,7 +183,48 @@ the device.
   original line endings and trailer.
 
 On-device TFT debug lines show the active browser screen, the last accepted
-telegram, and the Wi-Fi portal/connected state.
+telegram, and the Wi-Fi portal/connected state. With the first accepted
+telegram the screen is cleared and fully taken over by the **power panel**
+(no debug lines remain). Every screen opens with a white **name bar** at
+the top with its name left aligned in black text — `TELEGRAM nnn`,
+`PER FASE` or `SYSTEMINFO` — and a sub band below it with optional right
+aligned text (on the [TELEGRAM] screen the meter date and time of OBIS
+`0-0:1.0.0`, `DD-MM-YYYY HH:MM` without seconds; on the [PER FASE] screen
+the selected `Fase n` or `Totaal`). All panel text is rendered by the
+logger itself: it stretches the component's 5×7 font into a per-text cell
+size, so sizes like 9×14 or 7×11 are possible instead of only the two
+integer font scales of the component. The [TELEGRAM] screen shows one row
+per phase plus **Totaal**. Each row has a header band (phase current left
+and phase voltage right larger than the centred phase label; the total row
+shows the summed current and the average voltage) and a centre-zero watt
+bar carrying its integer scale labels (`-3800`, `0`, `3800`) inside the
+bar, followed by the watt value. Like the DSMRlogger32
+power bars, the net power is *returned minus delivered*: consumption reads
+negative and is drawn **red** to the left of centre, feed-in reads positive
+and is drawn **green** to the right. The bar scale adapts to the size of
+the largest absolute watt of the frame: the smallest step of
+3800 → 3100 → 2400 → 1700 → 1000 → 500 W that fits it (a frame above
+3800 W fills the bar at the 3800 W step). The panel layout adapts to the
+orientation reported by the board component (320×240 or 240×320).
+
+The board inputs are driven through the component's event queue (AUX button
+and encoder). A **short AUX press** from the power panel opens a text
+screen showing *Geleverd vermogen* and *Opgewekte vermogen* of the selected
+object; the **encoder** cycles Fase 1 → Fase 2 → Fase 3 → Totaal (and back
+when turning the other way). A **medium-long AUX press** replaces the bars
+with a system information view: accepted and rejected telegram counts, IP
+address, SSID, uptime, country/protocol and the P1 RX polarity (normal or
+inverted). Both AUX screens carry a white bottom bar with `AUX: Terug` on
+the left. A short AUX press returns to the graphics panel. New telegrams
+keep refreshing the graphics panel only; an open AUX view stays on screen
+until its own short press returns, and it shows the latest frame when
+opened or reselected with the encoder.
+
+Console diagnostics are deduplicated: an identical diagnostic text (for
+example a repeating `M-Bus device type mismatch @ 0-1:24.1.0`) reaches the
+console at most once per reception session — it shows again after a boot or
+a settings change, which resets the deduplication. The reception counters
+and the web status strip stay complete regardless.
 
 ### API
 
@@ -250,7 +300,12 @@ effect on UART reception.
    rejected once: open Settings and Save to store the version 3 blob.)
 3. With a conditioned P1 signal on GPIO44, one telegram per configured
    interval is read into the Telegrams view; console and reception operate
-   together.
+   together. The TFT switches to the power panel with the first accepted
+   telegram and shows the phase and total watt bars with the meter
+   date/time. A short AUX press opens the delivered/returned power text
+   screen (the encoder cycles Fase 1 → Fase 2 → Fase 3 → Totaal), a
+   medium-long AUX press shows the system information view, and a short
+   press returns to the bars.
 4. Power-cycle the device: the configuration survives and reception restarts.
 5. Reserved peripheral pins (display, encoder, buttons, SD connector, I²C
    header) remain available for their board functions.
