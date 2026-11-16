@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.h - versioned settings service
-//-- Date: 2026-11-15 · Build: 4
+//-- Date: 2026-11-16 · Build: 5
 //--
 //-- The settings service stores the complete versioned configuration in
 //-- ESP-IDF NVS, validates it against the parserDSMR built-in profiles and
@@ -67,7 +67,10 @@ typedef enum
 //-- Version 4: the TFT display orientation became a setting (Normal/Upside
 //-- down); stored version 3 blobs are rejected, so one save is required
 //-- after updating.
-#define LOGGER_SETTINGS_VERSION 4u
+//-- Version 5: the P1 TX polarity (Forwarding Data) became a setting
+//-- (Normal/Inverted) for both copies of a forwarding burst; stored version 4
+//-- blobs are rejected, so one save is required after updating.
+#define LOGGER_SETTINGS_VERSION 5u
 #define LOGGER_SETTINGS_PROFILE_ID_MAX 32
 #define LOGGER_SETTINGS_COUNTRY_MAX 3
 
@@ -85,6 +88,12 @@ typedef struct
   //-- directly (idle high); true inverts the receive line for interfaces
   //-- that invert before the ESP32-S3. Ignored by the test generator.
   bool rxInverted;
+
+  //-- P1 TX polarity for the UART0 forwarding bursts. False sends the two
+  //-- copies of the accepted frame as-is; true inverts TXD for interfaces
+  //-- that expect an inverted transmit line. It governs both copies of one
+  //-- burst; outside a burst TX idles at the polarity of rxInverted.
+  bool txInverted;
 
   //-- Read interval in seconds (LOGGER_SETTINGS_INTERVAL_MIN_S through
   //-- LOGGER_SETTINGS_INTERVAL_MAX_S).

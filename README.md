@@ -1,7 +1,7 @@
 # lastDSMRlogger
 
-Buildnumber: 11
-Last update-date: 2026-11-15
+Buildnumber: 15
+Last update-date: 2026-11-16
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -45,7 +45,7 @@ automatically.
 
 |Dependency                |Source                                                                                                     |Pin                                                          |
 |--------------------------|-----------------------------------------------------------------------------------------------------------|-------------------------------------------------------------|
-|parserDSMR                |`https://github.com/mrWheel/parserDSMR` checkout at `../parserDSMR`                                         |revision `5b4004508c6e6bf6f507c8c1931f5d458c71797f` + local raw-frame API changes (pending commit)|
+|parserDSMR                |`https://github.com/mrWheel/parserDSMR` checkout at `../parserDSMR`                                         |revision `686a3aeefb5c4b107ce9884023fab4014b184b31` (v0.9.1, includes the raw-frame API and `dsmrParserVersion()`; `PROG_VERSION` now has internal linkage, so it no longer clashes with the application's own symbol) |
 |esp32_s3_piggyback        |`https://github.com/mrWheel/esp32-s3-Piggyback`, component directory `components/esp32_s3_piggyback`       |commit `912fa25b86fdb62d8f1005ae57e227c5803db373` (v1.3.0), vendored under `components/` |
 |esp-idf-wifi-provisioner  |ESP Component Registry `michmich/esp-idf-wifi-provisioner`                                                  |version `0.4.0` (upstream commit `2c7aaa6aa0e319a429186ee470e137b8579f632f`) |
 
@@ -60,18 +60,17 @@ git clone https://github.com/mrWheel/parserDSMR.git
 ```
 
 The raw byte view on `dsmrTelegramResult` (`rawBytes`/`rawLength`, the exact
-accepted frame including every original line ending and trailer byte) and the
-UART overflow/framing error reporting in the adapter are local additions to
-parserDSMR; commit them in the parser repository and update the pin above.
+accepted frame including every original line ending and trailer byte), the
+UART overflow/framing error reporting in the adapter and the corrected phase
+tables are committed in the parser repository at the pinned revision. The
+same revision exposes `dsmrParserVersion()`; the application logs that
+version at boot and shows it on the display's boot debug lines.
 
-The profile phase objects are a further local correction (host tests green,
-274 checks): the Dutch and Belgian phase tables now publish the objects the
-meters really use and that dsmr2Lib and the verified sample fixture confirm —
-per-phase delivered kW on `1-0:21/41/61.7.0`, per-phase returned kW on
+The Dutch and Belgian phase tables publish the objects the meters really use
+and that dsmr2Lib and the verified sample fixture confirm — per-phase
+delivered kW on `1-0:21/41/61.7.0`, per-phase returned kW on
 `1-0:22/42/62.7.0`, phase current on `1-0:31/51/71.7.0` and phase voltage on
-`1-0:32/52/72.7.0`. The earlier tables mapped current/voltage to wrong codes
-and carried non-existent `24/25/26.7.0` and `32.8.0` entries, which is why
-the phase current and voltage stayed at zero.
+`1-0:32/52/72.7.0`.
 
 The provisioner is resolved into `managed_components/` by the ESP-IDF
 component manager at configure time.
@@ -156,6 +155,9 @@ the device.
   (the fixed P1 input on UART0, GPIO43/44) and **Test data** (the internal
   generator); a *P1 RX polarity* toggle (iOS-style switch) selects **Normal**
   or **Inverted** reading of the live signal (ignored by the test generator);
+  a *P1 Tx polarity (Forwarding Data)* toggle (iOS-style switch) selects
+  **Normal** or **Inverted** for both copies each forwarding burst sends out
+  on the UART0 TX pin (see *UART0 TX forwarding*);
   an **Interval** field in seconds sets how often a telegram is
   read: only one telegram is accepted per interval. The interval is
   validated by clamping — a value below 2 becomes 2 and a value above 600
@@ -259,12 +261,47 @@ every save path.
 ### UART0 TX forwarding
 
 Every accepted telegram is also forwarded out on the UART0 TX pin (GPIO43)
-as the exact accepted frame bytes. At most one forwarding burst happens per
-five seconds — or per interval when the interval is larger — and every
-burst sends the frame **twice** back to back. The burst runs in a dedicated
-low-priority receiver task, so blocking writes never stall reception. Test
-mode installs its own TX driver for this (it opens no receive UART); the
-live path forwards through the driver owned by the parserDSMR adapter.
+as the exact accepted frame bytes. Every burst sends the frame **twice**
+back to back at 115200 baud and runs in a dedicated low-priority receiver
+task, so the blocking writes never stall reception. Both copies go out
+straight from the retained history slot of the accepted telegram (sized for
+`DSMR_MAX_TELEGRAM_BYTES`, 12 KB — the parser's frame cap): reception is
+suspended for the whole burst, so the slot cannot be evicted while its
+bytes are on the wire and the forwarded bytes are exactly the bytes that
+were accepted. The per-burst UART0 driver sizes its TX ring to the frame
+plus slack, keeping only a few kilobytes of the internal heap busy while a
+burst runs.
+
+Normal reception is suspended for the duration of a burst and everything
+captured while it runs is discarded: the live path stops the parserDSMR
+adapter receive task — the only task allowed to feed the parser — installs
+its own UART0 driver to drive TX, deletes that driver again once the line is
+idle and restarts the adapter. Before resuming, the hardware RX FIFO is
+flushed and the parser's partial frame is dropped, so stale bytes can never
+reach the parser, the logger or a new forwarding trigger. If the meter is
+mid-telegram when reception resumes, the parser's start-of-telegram
+detection skips the overlapping frame whole and the next complete telegram
+is processed normally. Test mode opens no receive UART at all; frames the
+generator produces during a burst are discarded the same way.
+
+Polarity follows the two SPA toggles. During a burst both copies leave the
+pin at the selected *P1 Tx polarity*, and the RXD inversion of the current
+*P1 RX polarity* setting is kept in the mask while it is active. Once TX is
+idle again the TX line returns to the polarity of the current P1 Rx
+polarity setting (the hardware update is skipped when it is already
+correct), and on resume RX is restored to its own setting. Each copy is
+confirmed on the wire with `uart_wait_tx_done()` (5 s timeout; a
+maximum-sized copy takes ≈1.5 s); a partial write or timeout skips the
+remaining copies and reception is still restored safely. A settings change
+that arrives mid-burst waits for the burst to finish and applies to the
+next operation, so both copies of one telegram always share one polarity.
+The console runs on USB-Serial-JTAG and never touches UART0. The console
+reports every burst with `forwarded <n> bytes x 2 on UART0 TX, tx polarity
+..., sent in <ms> ms, free heap <n>`.
+
+At most one forwarding burst happens per five seconds — or per interval when
+the interval is larger — so bursts stay paced at the 2 and 4 second
+intervals, while above four seconds every accepted telegram is forwarded.
 
 After a reconfiguration IDF may log `uart: GPIO 43/44 is not usable, maybe
 used by others` once per driver (re)install. This is a cosmetic bookkeeping
@@ -278,8 +315,17 @@ and forwarding works; the warning can be ignored.
 |Item                                    |Size                                                            |
 |----------------------------------------|----------------------------------------------------------------|
 |Parser workspace (telegram + raw copy)  |`DSMR_DEFAULT_WORKSPACE_BYTES` ≈ 40 KB (2 × 12 KB + tables)     |
-|Telegram history                        |4 records × (12 KB raw + up to 96 field snapshots) ≈ 100 KB BSS |
+|Telegram history                        |4 records × (12 KB raw + up to 96 field snapshots) ≈ 100 KB     |
+|Per-burst UART0 TX driver               |TX ring = frame length + 512 B, internal heap, only during a burst |
 |Requirement                             |accommodates at least two maximum-sized telegram records        |
+
+The module carries 8 MB of octal PSRAM (@80 MHz, verified at boot:
+`Found 8MB PSRAM device`): the parser workspace, the staging record and the
+telegram history are allocated with `heap_caps_malloc(MALLOC_CAP_SPIRAM)`
+in `loggerReceiverInit()` and fall back to internal RAM when PSRAM is
+absent. Only task code touches those buffers — never an ISR or a DMA
+descriptor — so the radios, task stacks and drivers keep the internal DRAM
+heap (~200 KB free at rest) entirely to themselves.
 
 The oldest record is evicted first. Rejected candidates only update
 diagnostics and counters; the last accepted record stays intact. HTTP
@@ -291,13 +337,16 @@ effect on UART reception.
 
 1. `idf.py -p PORT flash monitor` shows the board debug lines after boot.
 2. Open the SPA, set the data-source slider to **Live data**, choose the P1
-   RX polarity (Normal/Inverted) matching the interface board, choose an
+   RX polarity (Normal/Inverted) matching the interface board, choose the
+   P1 Tx polarity (Normal/Inverted) for the forwarded copies, choose an
    interval (2–600 s), country and profile, then Save. The console shows
-   `P1 RX on UART0 gpio 44, polarity ...` plus
+   `P1 RX on UART0 gpio 44, polarity ..., tx idles at ...` plus
    `receiving on UART 0 at ... baud, profile ...` and the status strip moves
    from *awaiting configuration* to *awaiting data* to *accepted telegram*.
-   (After updating from settings version 2 the stored configuration is
-   rejected once: open Settings and Save to store the version 3 blob.)
+   Every accepted telegram then also produces a
+   `forwarded <n> bytes x 2 on UART0 TX, tx polarity ..., sent in <ms> ms`
+   line. (After updating from settings version 4 the stored configuration is
+   rejected once: open Settings and Save to store the version 5 blob.)
 3. With a conditioned P1 signal on GPIO44, one telegram per configured
    interval is read into the Telegrams view; console and reception operate
    together. The TFT switches to the power panel with the first accepted

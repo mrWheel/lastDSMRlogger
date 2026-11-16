@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_board.h - on-device TFT debug lines and power panel
-//-- Date: 2026-11-15 · Build: 8
+//-- Date: 2026-11-16 · Build: 9
 //--
 //-- The first release has no on-device user interface. The TFT shows debug
 //-- lines describing what the device is doing: the active browser screen
@@ -37,6 +37,10 @@ void loggerBoardSetRotation(bool upsideDown);
 
 //-- Shows the name of the screen the browser is currently on.
 void loggerBoardShowScreen(const char *screen);
+
+//-- Shows the parserDSMR library version on the boot debug lines, taken
+//-- from dsmrParserVersion(). An empty or NULL value leaves the line blank.
+void loggerBoardShowParserVersion(const char *version);
 
 //-- Notes an accepted telegram on the P1 input.
 void loggerBoardNoteTelegram(uint32_t sequence);

@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.c - versioned settings service
-//-- Date: 2026-11-15 · Build: 4
+//-- Date: 2026-11-16 · Build: 5
 //--
 //-- The complete configuration is stored as one versioned blob so a save is
 //-- atomic. A stored blob that fails validation is treated as absent: the
@@ -231,8 +231,9 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig *config)
     return ESP_ERR_NOT_FOUND;
   }
 
-  ESP_LOGI(tag, "loaded settings: gpio %d, profile %s, rx polarity %s, display %s", config->rxGpio, config->profileId,
-           config->rxInverted ? "inverted" : "normal", config->displayFlipped ? "upside down" : "normal");
+  ESP_LOGI(tag, "loaded settings: gpio %d, profile %s, rx polarity %s, tx polarity %s, display %s", config->rxGpio, config->profileId,
+           config->rxInverted ? "inverted" : "normal", config->txInverted ? "inverted" : "normal",
+           config->displayFlipped ? "upside down" : "normal");
   return ESP_OK;
 }
 
@@ -266,8 +267,9 @@ esp_err_t loggerSettingsSave(const loggerSettingsConfig *config)
     return result;
   }
 
-  ESP_LOGI(tag, "stored settings: gpio %d, profile %s, rx polarity %s, display %s", config->rxGpio, config->profileId,
-           config->rxInverted ? "inverted" : "normal", config->displayFlipped ? "upside down" : "normal");
+  ESP_LOGI(tag, "stored settings: gpio %d, profile %s, rx polarity %s, tx polarity %s, display %s", config->rxGpio, config->profileId,
+           config->rxInverted ? "inverted" : "normal", config->txInverted ? "inverted" : "normal",
+           config->displayFlipped ? "upside down" : "normal");
   return ESP_OK;
 }
 

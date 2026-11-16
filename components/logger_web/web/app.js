@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-16 · Build: 8
+// Date: 2026-11-16 · Build: 9
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -49,7 +49,8 @@ function bindElements()
   const ids = ["tabBar", "statusStrip", "settingsMessage", "settingsForm",
                "headerVersion", "headerClock",
                "srcToggle", "srcLiveLabel", "srcTestLabel",
-               "rxPolarityToggle", "polNormalLabel", "polInvertedLabel", "inpInterval",
+               "rxPolarityToggle", "polNormalLabel", "polInvertedLabel",
+               "txPolarityToggle", "txPolNormalLabel", "txPolInvertedLabel", "inpInterval",
                "displayRotationToggle", "rotNormalLabel", "rotUpsideDownLabel",
                "selCountry", "selProfile", "selMbus1", "selMbus2", "selMbus3", "selMbus4",
                "saveSettings", "telegramState", "showTelegram", "telegramLog",
@@ -383,6 +384,14 @@ function updatePolarityLabels()
   el.polInvertedLabel.classList.toggle("active", isInverted);
 }
 
+//-- Highlights the polarity end matching the TX (Forwarding Data) switch.
+function updateTxPolarityLabels()
+{
+  const isInverted = el.txPolarityToggle.checked;
+  el.txPolNormalLabel.classList.toggle("active", !isInverted);
+  el.txPolInvertedLabel.classList.toggle("active", isInverted);
+}
+
 //-- Highlights the orientation end matching the display rotation switch.
 function updateRotationLabels()
 {
@@ -421,6 +430,11 @@ function renderSettings(message)
   // reads the idle-high signal directly, inverted flips the receive line.
   el.rxPolarityToggle.checked = !!(settings && settings.rxInverted);
   updatePolarityLabels();
+
+  // The P1 Tx polarity (Forwarding Data) switch maps to the stored
+  // txInverted flag: both copies of a burst go out at this polarity.
+  el.txPolarityToggle.checked = !!(settings && settings.txInverted);
+  updateTxPolarityLabels();
 
   // The display rotation switch maps to the stored displayFlipped flag:
   // normal is the assembled landscape, upside down turns it 180 degrees.
@@ -491,12 +505,17 @@ function saveSettings(event)
   // affects live reception, the test generator opens no UART.
   const rxInverted = el.rxPolarityToggle.checked ? "1" : "0";
 
+  // The Tx polarity switch position maps to the stored txInverted flag; it
+  // governs both copies of every UART0 forwarding burst.
+  const txInverted = el.txPolarityToggle.checked ? "1" : "0";
+
   // The rotation switch position maps to the stored displayFlipped flag.
   const displayFlipped = el.displayRotationToggle.checked ? "1" : "0";
 
   const body = "cmd=save" +
                "&rxGpio=" + encodeURIComponent(rxGpio) +
                "&rxInverted=" + rxInverted +
+               "&txInverted=" + txInverted +
                "&displayFlipped=" + displayFlipped +
                "&interval=" + encodeURIComponent(interval) +
                "&country=" + encodeURIComponent(el.selCountry.value) +
@@ -738,6 +757,7 @@ function boot()
 
   el.srcToggle.addEventListener("change", updateSourceLabels);
   el.rxPolarityToggle.addEventListener("change", updatePolarityLabels);
+  el.txPolarityToggle.addEventListener("change", updateTxPolarityLabels);
   el.displayRotationToggle.addEventListener("change", updateRotationLabels);
 
   // Show starts the live follow of every newly accepted telegram (the

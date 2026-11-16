@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_board.c - on-device TFT debug lines and power panel
-//-- Date: 2026-11-15 · Build: 8
+//-- Date: 2026-11-16 · Build: 9
 //--
 //-- Everything is drawn through the documented API of the esp32_s3_piggyback
 //-- component: tft_ec11_init once, then filled rectangles and fixed-width
@@ -45,6 +45,7 @@ static const char *tag = "loggerBoard";
 #define BOARD_LEFT_X 4
 #define BOARD_LINE_PITCH (8 * BOARD_FONT_SCALE)
 
+#define BOARD_LINE_PARSER 1
 #define BOARD_LINE_SCREEN 2
 #define BOARD_LINE_P1 3
 #define BOARD_LINE_WIFI 4
@@ -124,6 +125,7 @@ typedef struct
   BoardMode mode;
   uint8_t powerIndex;
   loggerPowerSnapshot panel;
+  char parserVersion[BOARD_TEXT_MAX];
   char screen[BOARD_TEXT_MAX];
   char p1Note[BOARD_TEXT_MAX];
   char wifiStatus[BOARD_TEXT_MAX];
@@ -146,6 +148,7 @@ static void drawLine(uint8_t row, const char *label, const char *value)
 
 static void refreshDebugLines(void)
 {
+  drawLine(BOARD_LINE_PARSER, "parser : ", board.parserVersion);
   drawLine(BOARD_LINE_SCREEN, "screen : ", board.screen);
   drawLine(BOARD_LINE_P1, "p1     : ", board.p1Note);
   drawLine(BOARD_LINE_WIFI, "wifi   : ", board.wifiStatus);
@@ -656,6 +659,11 @@ void loggerBoardSetRotation(bool upsideDown)
 void loggerBoardShowScreen(const char *screen)
 {
   update(board.screen, sizeof board.screen, screen);
+}
+
+void loggerBoardShowParserVersion(const char *version)
+{
+  update(board.parserVersion, sizeof board.parserVersion, version);
 }
 
 void loggerBoardNoteTelegram(uint32_t sequence)

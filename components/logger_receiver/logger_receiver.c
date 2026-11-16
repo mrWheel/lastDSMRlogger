@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.c - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-15 · Build: 9
+//-- Date: 2026-11-16 · Build: 13
 //--
 //-- The parserDSMR adapter task owns the parser instance while it runs. The
 //-- event callback copies the complete accepted frame and the decoded fields
@@ -12,8 +12,15 @@
 //--
 //-- Every accepted frame is also forwarded on the UART0 TX pin by a small
 //-- dedicated task: at most one burst per five seconds (or per interval when
-//-- larger) and every burst repeats the exact frame twice. Test mode installs
-//-- its own TX driver for this because it opens no receive UART.
+//-- larger, so above four seconds every accepted telegram is forwarded) and
+//-- every burst repeats the exact frame twice. A burst suspends reception
+//-- for its whole duration: the live path joins the adapter receive task,
+//-- the test generator discards its frames meanwhile, bytes arriving on the
+//-- RX pin are dropped uncounted, the parser discards its partial frame and
+//-- reception resumes through the parser's own start-of-telegram detection.
+//-- The P1 Tx polarity (Forwarding Data) setting drives both copies; outside
+//-- a burst TX idles at the polarity of the P1 Rx polarity setting. Test mode
+//-- installs its own TX driver because it opens no receive UART.
 //-- ==========================================================================
 
 #include "logger_receiver.h"
@@ -26,8 +33,10 @@
 
 #include "driver/uart.h"
 #include "dsmr_uart_esp32.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -56,16 +65,33 @@ static const char *tag = "loggerReceiver";
 //-- sends the accepted frame twice back to back; when the configured read
 //-- interval is larger than this floor, one burst per interval applies.
 #define LOGGER_FORWARD_MIN_GAP_MS 5000u
-#define LOGGER_FORWARD_TASK_STACK_BYTES 3072
+#define LOGGER_FORWARD_TASK_STACK_BYTES 4096
 #define LOGGER_FORWARD_TASK_PRIORITY 4
+
+//-- TX ring of the driver a burst installs: sized to the frame plus slack,
+//-- so the full copy is buffered in one call and the ISR drains it at line
+//-- rate; uart_write_bytes() returns once the bytes are queued and
+//-- uart_wait_tx_done() confirms the copy left the pin. Sizing the ring to
+//-- the frame instead of the DSMR maximum keeps the heap free for the web
+//-- requests running alongside a burst.
+#define LOGGER_FORWARD_TX_SLACK_BYTES 512
+
+//-- RX ring of that driver: bytes arriving on the RX pin while reception is
+//-- suspended land here and are discarded; they never reach the parser.
+#define LOGGER_FORWARD_RX_BUFFER_BYTES 256
+
+//-- Budget for one copy to finish on the wire: a 13000-byte copy takes
+//-- about 1.5 s at 115200 baud, the margin absorbs ISR jitter. A timeout
+//-- aborts the burst safely and reception resumes.
+#define LOGGER_FORWARD_TX_WAIT_MS 5000
+
+//-- Budget for the test generator to leave a running dsmrParserFeed() call
+//-- when a burst suspends the parser.
+#define LOGGER_FORWARD_FEED_JOIN_MS 2000
 
 //-- Delay slice of the test data generator so a stop joins the task quickly
 //-- even with a 600 s interval.
 #define LOGGER_TEST_TASK_SLICE_MS 50u
-
-//-- RX ring of the TX-only driver the receiver installs while the test data
-//-- generator runs (the live path forwards through the adapter's driver).
-#define LOGGER_TEST_TX_RX_BUFFER_BYTES 256
 
 //-- The accepted-telegram total is persisted to NVS every ten minutes so the
 //-- running counter survives a reset or a power cycle. On boot the receiver
@@ -94,7 +120,11 @@ typedef struct
   uint32_t nextSequence;
   uint8_t writeIndex;
   bool slotUsed[LOGGER_HISTORY_CAPACITY];
-  loggerTelegramRecord records[LOGGER_HISTORY_CAPACITY];
+
+  //-- Retained history, allocated at init from PSRAM when the module has
+  //-- it: the slots are only ever touched by task code, so they do not
+  //-- belong on the small internal heap (see allocTelegramBuffer).
+  loggerTelegramRecord *records;
 
   bool hasLastAccepted;
   uint32_t lastAcceptedUptimeMs;
@@ -103,11 +133,35 @@ typedef struct
   //-- burst waits for the larger of five seconds and the read interval.
   uint32_t lastForwardUptimeMs;
 
-  //-- True while the receiver itself owns the UART0 driver (test mode). The
-  //-- live path uses the driver owned by the parserDSMR adapter instead.
+  //-- Sequence of the accepted telegram selected for the next UART0 TX
+  //-- burst. The burst sends straight from the retained history slot of
+  //-- that sequence: reception is suspended for the whole burst, so no new
+  //-- accept can recycle the slot while its bytes are on the wire (history
+  //-- capacity would first need four new frames), and the exact accepted
+  //-- bytes and their length stay valid for the entire operation.
+  bool forwardPending;
+  uint32_t forwardSequence;
+
+  //-- True while the receiver itself owns the UART0 driver (test mode keeps
+  //-- it installed across bursts). The live path installs the driver only
+  //-- while a burst runs; between bursts the parserDSMR adapter owns it.
   bool ownsTxDriver;
 
-  //-- Wakes the forwarding task after the callback staged a frame.
+  //-- True while a burst owns UART0. The test generator discards the frames
+  //-- it builds meanwhile: they must never reach the parser, update logger
+  //-- data or trigger another burst.
+  bool forwarding;
+
+  //-- True while the test generator is inside dsmrParserFeed(); a burst
+  //-- waits for it to clear before touching the parser state.
+  volatile bool generatorFeeding;
+
+  //-- Line-inverse mask currently applied to the receiver-owned UART0
+  //-- driver, or -1 when unknown (freshly installed drivers start with the
+  //-- mask cleared). Identical consecutive masks skip the hardware update.
+  int appliedInverseMask;
+
+  //-- Wakes the forwarding task after the callback selected a frame.
   SemaphoreHandle_t forwardWake;
 
   uint32_t acceptedCount;
@@ -139,18 +193,29 @@ static LoggerReceiver instance;
 
 //-- Telegram buffer, raw frame copy, field array, M-Bus and label copies are
 //-- all carved from this workspace by the parser.
-static uint8_t parserWorkspace[DSMR_DEFAULT_WORKSPACE_BYTES];
+static uint8_t *parserWorkspace;
 
 //-- Staging record filled by the parser event callback. The parser refuses
 //-- reentrant calls, so exactly one receive task ever writes this buffer.
-static loggerTelegramRecord stagingRecord;
+//-- Both buffers are allocated by loggerReceiverInit from PSRAM when the
+//-- module carries it (see allocTelegramBuffer).
+static loggerTelegramRecord *stagingRecord;
 
-//-- Exact accepted frame staged for the UART0 TX forwarding burst. The
-//-- callback fills it under the data mutex; the forwarding task reads it
-//-- while the burst runs. The minimum gap between bursts is far longer than
-//-- one burst takes, so the frame stays stable for the duration.
-static uint8_t forwardStaging[DSMR_MAX_TELEGRAM_BYTES];
-static uint16_t forwardStagingLength;
+//-- Carves one of the big telegram buffers (parser workspace, staging
+//-- record, retained history), preferring PSRAM: they are only touched by
+//-- task code, never by an ISR or a DMA descriptor. The internal fallback
+//-- keeps the logger alive on a module without external RAM.
+static void *allocTelegramBuffer(size_t size)
+{
+  void *buffer = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+
+  if (buffer == NULL)
+  {
+    buffer = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
+
+  return buffer;
+}
 
 static void copyBounded(char *dst, size_t dstSize, const char *src)
 {
@@ -546,19 +611,19 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
       return;
     }
 
-    memset(&stagingRecord, 0, sizeof stagingRecord);
-    stagingRecord.meta.receivedUptimeMs = result->receiveTimeMs;
-    stagingRecord.meta.crcVerified = (result->crcStatus == DSMR_CRC_STATUS_VERIFIED);
-    copyBounded(stagingRecord.meta.profileId, sizeof stagingRecord.meta.profileId, (result->profileId != NULL) ? result->profileId : "");
-    copyBounded(stagingRecord.meta.reportedVersion, sizeof stagingRecord.meta.reportedVersion, (result->reportedVersion != NULL) ? result->reportedVersion : "");
+    memset(stagingRecord, 0, sizeof *stagingRecord);
+    stagingRecord->meta.receivedUptimeMs = result->receiveTimeMs;
+    stagingRecord->meta.crcVerified = (result->crcStatus == DSMR_CRC_STATUS_VERIFIED);
+    copyBounded(stagingRecord->meta.profileId, sizeof *stagingRecord->meta.profileId, (result->profileId != NULL) ? result->profileId : "");
+    copyBounded(stagingRecord->meta.reportedVersion, sizeof *stagingRecord->meta.reportedVersion, (result->reportedVersion != NULL) ? result->reportedVersion : "");
 
     //-- The exact accepted frame: header, body, trailer bytes and every
     //-- original line ending, preserved by the parser before decoding.
     if ((result->rawBytes != NULL) && (result->rawLength > 0u))
     {
       size_t rawLength = (result->rawLength > DSMR_MAX_TELEGRAM_BYTES) ? DSMR_MAX_TELEGRAM_BYTES : result->rawLength;
-      memcpy(stagingRecord.rawBytes, result->rawBytes, rawLength);
-      stagingRecord.meta.rawLength = (uint16_t)rawLength;
+      memcpy(stagingRecord->rawBytes, result->rawBytes, rawLength);
+      stagingRecord->meta.rawLength = (uint16_t)rawLength;
     }
 
     uint16_t snapshotCount = result->fieldCount;
@@ -570,11 +635,11 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
 
     for (uint16_t index = 0; index < snapshotCount; index++)
     {
-      copyFieldSnapshot(&result->fields[index], &stagingRecord.fields[index]);
+      copyFieldSnapshot(&result->fields[index], &stagingRecord->fields[index]);
     }
 
-    stagingRecord.meta.fieldCount = snapshotCount;
-    extractMeterTimeText(&stagingRecord);
+    stagingRecord->meta.fieldCount = snapshotCount;
+    extractMeterTimeText(stagingRecord);
 
     bool doForward = false;
     bool testDataMode = false;
@@ -600,26 +665,26 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
       }
     }
 
-    stagingRecord.meta.disabledChannelsMask = disabledMask;
+    stagingRecord->meta.disabledChannelsMask = disabledMask;
 
     //-- The parser reports a contradiction with a configured device type as a
     //-- diagnostic after the accepted telegram; the logger detects a missing
     //-- published type itself from the decoded fields.
     for (uint8_t channel = DSMR_MBUS_CHANNEL_MIN; channel <= DSMR_MBUS_CHANNEL_MAX; channel++)
     {
-      if (channelPresent(&stagingRecord, channel) && !channelHasPublishedType(&stagingRecord, channel))
+      if (channelPresent(stagingRecord, channel) && !channelHasPublishedType(stagingRecord, channel))
       {
         char note[48];
         snprintf(note, sizeof note, "missing published device type on channel %u", (unsigned)channel);
-        appendNote(stagingRecord.meta.notes, sizeof stagingRecord.meta.notes, note);
+        appendNote(stagingRecord->meta.notes, sizeof *stagingRecord->meta.notes, note);
       }
     }
 
     self->writeIndex = (uint8_t)((self->writeIndex + 1u) % LOGGER_HISTORY_CAPACITY);
     self->nextSequence++;
-    stagingRecord.meta.sequence = self->nextSequence;
+    stagingRecord->meta.sequence = self->nextSequence;
     self->slotUsed[self->writeIndex] = true;
-    self->records[self->writeIndex] = stagingRecord;
+    self->records[self->writeIndex] = *stagingRecord;
     self->acceptedCount++;
     self->hasLastAccepted = true;
     self->lastAcceptedUptimeMs = result->receiveTimeMs;
@@ -632,9 +697,13 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     acceptedShown = self->acceptedCount;
     rejectedShown = self->rejectedCount;
 
-    //-- The accepted frame is forwarded on the UART0 TX pin at most once per
-    //-- five seconds (or per interval when larger); every burst repeats the
-    //-- exact frame twice. The burst itself runs in the forwarding task.
+    //-- The accepted frame is forwarded on the UART0 TX pin; every burst
+    //-- repeats the exact frame twice with reception suspended for its
+    //-- duration. A burst takes longer than the shortest intervals, so the
+    //-- pacing floor is five seconds: at intervals up to four seconds (the
+    //-- two-second cadence would collide with the burst itself) at most one
+    //-- burst per five seconds; above four seconds every accepted telegram
+    //-- is forwarded. The burst itself runs in the forwarding task.
     uint32_t forwardWindowMs = self->activeConfig.intervalSeconds * 1000u;
 
     if (forwardWindowMs < LOGGER_FORWARD_MIN_GAP_MS)
@@ -642,13 +711,16 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
       forwardWindowMs = LOGGER_FORWARD_MIN_GAP_MS;
     }
 
-    doForward = (stagingRecord.meta.rawLength > 0u) &&
+    doForward = (stagingRecord->meta.rawLength > 0u) &&
                 ((uint32_t)(result->receiveTimeMs - self->lastForwardUptimeMs) >= forwardWindowMs);
 
     if (doForward)
     {
-      memcpy(forwardStaging, stagingRecord.rawBytes, stagingRecord.meta.rawLength);
-      forwardStagingLength = stagingRecord.meta.rawLength;
+      //-- The burst reads the exact bytes and length from the history slot
+      //-- this commit just filled, addressed by sequence; the slot stays
+      //-- intact until the burst ends because reception is suspended.
+      self->forwardPending = true;
+      self->forwardSequence = stagingRecord->meta.sequence;
       self->lastForwardUptimeMs = result->receiveTimeMs;
     }
 
@@ -659,13 +731,13 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
       xSemaphoreGive(self->forwardWake);
     }
 
-    loggerBoardNoteTelegram(stagingRecord.meta.sequence);
+    loggerBoardNoteTelegram(stagingRecord->meta.sequence);
 
     //-- The TFT power panel becomes the primary screen with the first
     //-- accepted telegram: signed per-phase and total watts, phase
     //-- currents and voltages and the meter date/time.
     loggerPowerSnapshot powerSnapshot;
-    extractPowerSnapshot(&stagingRecord, testDataMode, stagingRecord.meta.sequence, &powerSnapshot);
+    extractPowerSnapshot(stagingRecord, testDataMode, stagingRecord->meta.sequence, &powerSnapshot);
     powerSnapshot.acceptedCount = acceptedShown;
     powerSnapshot.rejectedCount = rejectedShown;
     powerSnapshot.uptimeSeconds = uptimeMs() / 1000u;
@@ -682,11 +754,11 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     //-- One console line per accepted telegram: sequence, meter time from
     //-- OBIS 0-0:1.0.0, size, CRC verdict and active profile.
     ESP_LOGI(tag, "accepted telegram #%" PRIu32 ": meter %s, %u bytes, %s, profile %s",
-             stagingRecord.meta.sequence,
-             (stagingRecord.meta.meterTimeText[0] != '\0') ? stagingRecord.meta.meterTimeText : "--:--:--",
-             (unsigned)stagingRecord.meta.rawLength,
-             stagingRecord.meta.crcVerified ? "crc ok" : "no crc",
-             stagingRecord.meta.profileId);
+             stagingRecord->meta.sequence,
+             (stagingRecord->meta.meterTimeText[0] != '\0') ? stagingRecord->meta.meterTimeText : "--:--:--",
+             (unsigned)stagingRecord->meta.rawLength,
+             stagingRecord->meta.crcVerified ? "crc ok" : "no crc",
+             stagingRecord->meta.profileId);
   }
   else if (event->type == DSMR_EVENT_DIAGNOSTIC)
   {
@@ -846,7 +918,28 @@ static void testGeneratorTask(void *argument)
 
     if (length > 0u)
     {
-      dsmrParserFeed(&self->parser, (const uint8_t *)arguments->telegram, length, uptimeMs(), onParserEvent, self);
+      //-- While a burst owns UART0 the generated frames are discarded: they
+      //-- must never reach the parser, update logger data or trigger another
+      //-- burst. The flag and the feed marker change under one lock so a
+      //-- burst starting right now either sees the discarded frame or the
+      //-- running feed and waits for it to leave the parser.
+      bool discardForBurst;
+
+      xSemaphoreTake(self->mutex, portMAX_DELAY);
+      discardForBurst = self->forwarding;
+
+      if (!discardForBurst)
+      {
+        self->generatorFeeding = true;
+      }
+
+      xSemaphoreGive(self->mutex);
+
+      if (!discardForBurst)
+      {
+        dsmrParserFeed(&self->parser, (const uint8_t *)arguments->telegram, length, uptimeMs(), onParserEvent, self);
+        self->generatorFeeding = false;
+      }
     }
   }
 
@@ -920,12 +1013,62 @@ static void stopTestGenerator(void)
 //-- UART0 TX forwarding (dedicated task)
 //-- --------------------------------------------------------------------------
 
-//-- Test mode opens no receive UART, yet accepted test frames must reach the
-//-- UART0 TX pin as well, so the receiver installs its own driver there
-//-- while the generator runs. The line settings follow the resolved profile,
-//-- mirroring the adapter configuration. The live path forwards through the
-//-- driver owned by the adapter and needs no own driver.
-static void ensureTestTxDriver(LoggerReceiver *self)
+//-- Line-inverse mask while a burst transmits: the RX bit the P1 Rx polarity
+//-- setting requires plus the TX bit the P1 Tx polarity (Forwarding Data)
+//-- setting selects. uart_set_line_inverse() replaces the whole mask, so the
+//-- RX bit must be carried along on every call or reception would flip.
+static uint32_t forwardBurstMask(bool rxInverted, bool txInverted)
+{
+  uint32_t mask = rxInverted ? (uint32_t)UART_SIGNAL_RXD_INV : 0u;
+
+  if (txInverted)
+  {
+    mask |= (uint32_t)UART_SIGNAL_TXD_INV;
+  }
+
+  return mask;
+}
+
+//-- Line-inverse mask outside a burst: TX idles at the polarity the P1 Rx
+//-- polarity setting selects so both sides of the interface agree.
+static uint32_t forwardIdleMask(bool rxInverted)
+{
+  return rxInverted ? (uint32_t)(UART_SIGNAL_RXD_INV | UART_SIGNAL_TXD_INV) : 0u;
+}
+
+//-- Applies a full line-inverse mask to the receiver-owned UART0 driver.
+//-- Identical consecutive masks skip the hardware update; the tracked mask
+//-- becomes unknown whenever a driver is installed or deleted, because a
+//-- fresh driver starts with the inversion cleared.
+static void applyForwardMask(LoggerReceiver *self, uint32_t mask)
+{
+  if (!uart_is_driver_installed(LOGGER_P1_UART_PORT))
+  {
+    return;
+  }
+
+  if (self->appliedInverseMask == (int)mask)
+  {
+    return;
+  }
+
+  esp_err_t result = uart_set_line_inverse(LOGGER_P1_UART_PORT, mask);
+
+  if (result != ESP_OK)
+  {
+    ESP_LOGW(tag, "UART0 line inversion 0x%02" PRIX32 " failed: %s", mask, esp_err_to_name(result));
+    return;
+  }
+
+  self->appliedInverseMask = (int)mask;
+}
+
+//-- Installs the receiver's own driver on UART0 when none is installed. The
+//-- line settings follow the resolved profile, mirroring the adapter
+//-- configuration. Test mode keeps this driver installed across bursts (it
+//-- opens no receive UART); the live path installs it after the adapter
+//-- stopped and deletes it again when the burst has been written.
+static void ensureForwardTxDriver(LoggerReceiver *self, bool rxInverted, uint16_t frameLength)
 {
   if (uart_is_driver_installed(LOGGER_P1_UART_PORT))
   {
@@ -944,7 +1087,9 @@ static void ensureTestTxDriver(LoggerReceiver *self)
   uartConfig.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
   uartConfig.source_clk = UART_SCLK_DEFAULT;
 
-  esp_err_t result = uart_driver_install(LOGGER_P1_UART_PORT, LOGGER_TEST_TX_RX_BUFFER_BYTES, 0, 0, NULL, 0);
+  esp_err_t result = uart_driver_install(LOGGER_P1_UART_PORT, LOGGER_FORWARD_RX_BUFFER_BYTES,
+                                         (int)frameLength + LOGGER_FORWARD_TX_SLACK_BYTES,
+                                         0, NULL, 0);
 
   if (result == ESP_OK)
   {
@@ -957,9 +1102,15 @@ static void ensureTestTxDriver(LoggerReceiver *self)
                           UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
   }
 
+  xSemaphoreTake(self->mutex, portMAX_DELAY);
+
   if (result != ESP_OK)
   {
-    ESP_LOGW(tag, "test mode TX driver failed: %s (forwarding paused)", esp_err_to_name(result));
+    self->ownsTxDriver = false;
+    self->appliedInverseMask = -1;
+    xSemaphoreGive(self->mutex);
+
+    ESP_LOGW(tag, "UART0 TX driver could not be installed: %s (burst skipped)", esp_err_to_name(result));
 
     if (uart_is_driver_installed(LOGGER_P1_UART_PORT))
     {
@@ -969,16 +1120,19 @@ static void ensureTestTxDriver(LoggerReceiver *self)
     return;
   }
 
-  xSemaphoreTake(self->mutex, portMAX_DELAY);
   self->ownsTxDriver = true;
+  self->appliedInverseMask = 0;
   xSemaphoreGive(self->mutex);
+
+  applyForwardMask(self, forwardIdleMask(rxInverted));
 }
 
-static void releaseTestTxDriver(LoggerReceiver *self)
+static void releaseForwardTxDriver(LoggerReceiver *self)
 {
   xSemaphoreTake(self->mutex, portMAX_DELAY);
   bool owned = self->ownsTxDriver;
   self->ownsTxDriver = false;
+  self->appliedInverseMask = -1;
   xSemaphoreGive(self->mutex);
 
   if (owned && uart_is_driver_installed(LOGGER_P1_UART_PORT))
@@ -987,9 +1141,122 @@ static void releaseTestTxDriver(LoggerReceiver *self)
   }
 }
 
-//-- Sends every staged burst twice on the UART0 TX pin. Blocking writes run
-//-- in this task only, never in reception: at 115200 baud one burst takes a
-//-- little over two seconds, far less than the minimum gap between bursts.
+//-- Marks the UART0 line-inverse mask as unknown after the driver was
+//-- deleted from under the burst task (the adapter deletes it on stop).
+static void forgetForwardMask(LoggerReceiver *self)
+{
+  xSemaphoreTake(self->mutex, portMAX_DELAY);
+  self->appliedInverseMask = -1;
+  xSemaphoreGive(self->mutex);
+}
+
+//-- Starts the live adapter task on UART0 with the given configuration and
+//-- brings TX to its idle polarity. The adapter itself only applies the RX
+//-- inverse, so the tracked mask starts from what it sets and TX is aligned
+//-- here: TX idles at the polarity selected by the P1 Rx polarity setting.
+static esp_err_t startLiveAdapter(LoggerReceiver *self, const loggerSettingsConfig *config)
+{
+  dsmrUartConfig uartConfig;
+  memset(&uartConfig, 0, sizeof uartConfig);
+  uartConfig.uartPort = LOGGER_P1_UART_PORT;
+  uartConfig.rxPin = config->rxGpio;
+  uartConfig.txPin = LOGGER_P1_UART0_TX_GPIO;
+
+  //-- The first release uses an externally enabled request signal.
+  uartConfig.requestGpio = -1;
+  uartConfig.requestActiveHigh = true;
+  uartConfig.taskStackSize = LOGGER_P1_TASK_STACK_BYTES;
+  uartConfig.taskPriority = LOGGER_P1_TASK_PRIORITY;
+
+  //-- RX polarity is a runtime setting chosen in the SPA: normal reads the
+  //-- idle-high signal directly, inverted flips the receive line for
+  //-- interface boards that invert before the ESP32-S3.
+  uartConfig.invertRx = config->rxInverted;
+
+  ESP_LOGI(tag, "P1 RX on UART0 gpio %d, polarity %s, tx idles at %s", config->rxGpio,
+           config->rxInverted ? "inverted" : "normal",
+           config->rxInverted ? "inverted" : "normal");
+
+  esp_err_t result = dsmrUartStart(&self->uart, &self->parser, &uartConfig, onParserEvent, self);
+
+  xSemaphoreTake(self->mutex, portMAX_DELAY);
+  self->appliedInverseMask = (result != ESP_OK) ? -1 : (config->rxInverted ? (int)UART_SIGNAL_RXD_INV : 0);
+  xSemaphoreGive(self->mutex);
+
+  if (result == ESP_OK)
+  {
+    applyForwardMask(self, forwardIdleMask(config->rxInverted));
+
+    //-- The driver is fresh; drop anything left in the hardware FIFO from
+    //-- before the (re)start so the parser sees only new bytes.
+    uart_flush_input(LOGGER_P1_UART_PORT);
+  }
+
+  return result;
+}
+
+//-- Waits until the test generator is not inside dsmrParserFeed(): the
+//-- burst must not touch the parser state from two tasks at once.
+static void forwardJoinTestFeed(LoggerReceiver *self)
+{
+  uint32_t waitedMs = 0u;
+
+  while (self->generatorFeeding && (waitedMs < LOGGER_FORWARD_FEED_JOIN_MS))
+  {
+    vTaskDelay(pdMS_TO_TICKS(5));
+    waitedMs += 5u;
+  }
+}
+
+//-- The parser discards its partial frame on purpose when a burst ends:
+//-- that intentional drop must not update the receive counters or the
+//-- console, so the notification goes to this sink instead of the SPA
+//-- callback. The parser's own start-of-telegram detection then re-arms, so
+//-- reception resumes cleanly even when the meter is already partway
+//-- through a telegram: the overlapping frame is skipped whole.
+static void forwardDiscardCallback(const dsmrParser *parser, const dsmrParserEvent *event, void *userData)
+{
+  (void)parser;
+  (void)event;
+  (void)userData;
+}
+
+//-- Queues one copy of the retained frame and waits until it has finished
+//-- transmitting on the wire. The payload points into the history slot of
+//-- the forwarded sequence, which stays untouched until the burst ends.
+//-- Returns false on a partial write or timeout.
+static bool forwardCopy(LoggerReceiver *self, const uint8_t *payload, uint16_t length,
+                        bool rxInverted, bool txInverted)
+{
+  applyForwardMask(self, forwardBurstMask(rxInverted, txInverted));
+
+  int written = uart_write_bytes(LOGGER_P1_UART_PORT, (const char *)payload, length);
+
+  if (written != (int)length)
+  {
+    ESP_LOGW(tag, "UART0 TX copy incomplete: %d of %u bytes", written, (unsigned)length);
+    return false;
+  }
+
+  esp_err_t result = uart_wait_tx_done(LOGGER_P1_UART_PORT, pdMS_TO_TICKS(LOGGER_FORWARD_TX_WAIT_MS));
+
+  if (result != ESP_OK)
+  {
+    ESP_LOGW(tag, "UART0 TX copy did not finish on the wire within %d ms: %s",
+             LOGGER_FORWARD_TX_WAIT_MS, esp_err_to_name(result));
+    return false;
+  }
+
+  return true;
+}
+
+//-- Sends every selected burst twice on the UART0 TX pin. The whole sequence
+//-- runs under the control mutex, so a settings update or another task
+//-- cannot interrupt the polarity and parser sequence: a save arriving
+//-- during a burst waits and applies to the next operation, while both
+//-- copies of the current telegram keep one polarity. The console never
+//-- touches UART0 (it runs on USB-Serial-JTAG), so logging during a burst
+//-- is safe. Blocking writes run in this task only, never in reception.
 static void forwardTaskLoop(void *argument)
 {
   LoggerReceiver *self = (LoggerReceiver *)argument;
@@ -998,25 +1265,123 @@ static void forwardTaskLoop(void *argument)
   {
     xSemaphoreTake(self->forwardWake, portMAX_DELAY);
 
+    //-- Serialize the burst against start/stop/reconfigure.
+    xSemaphoreTake(self->controlMutex, portMAX_DELAY);
+
     xSemaphoreTake(self->mutex, portMAX_DELAY);
-    uint16_t length = forwardStagingLength;
-    forwardStagingLength = 0u;
+    uint16_t length = 0u;
+    const uint8_t *payload = NULL;
+
+    if (self->forwardPending)
+    {
+      self->forwardPending = false;
+
+      //-- Address the retained frame by sequence rather than copying it: the
+      //-- slot of the selected telegram cannot be recycled before the burst
+      //-- ends (reception is suspended and the history would need four new
+      //-- accepts to wrap around to it), so the exact accepted bytes and
+      //-- their length stay valid on the wire without a second buffer.
+      for (uint8_t slot = 0u; slot < LOGGER_HISTORY_CAPACITY; slot++)
+      {
+        if (self->slotUsed[slot] && (self->records[slot].meta.sequence == self->forwardSequence))
+        {
+          payload = self->records[slot].rawBytes;
+          length = self->records[slot].meta.rawLength;
+          break;
+        }
+      }
+    }
+
+    bool rxInverted = self->hasActiveConfig && self->activeConfig.rxInverted;
+    bool txInverted = self->hasActiveConfig && self->activeConfig.txInverted;
+    bool testMode = self->hasActiveConfig && loggerSettingsIsTestGpio(self->activeConfig.rxGpio);
+    loggerSettingsConfig resume = self->activeConfig;
+    bool configured = self->hasActiveConfig;
+
+    if (length > 0u)
+    {
+      self->forwarding = true;
+    }
+
     xSemaphoreGive(self->mutex);
 
-    if ((length == 0u) || (!uart_is_driver_installed(LOGGER_P1_UART_PORT)))
+    if ((length == 0u) || (!configured))
     {
+      xSemaphoreGive(self->controlMutex);
       continue;
     }
 
-    int first = uart_write_bytes(LOGGER_P1_UART_PORT, (const char *)forwardStaging, length);
-    int second = uart_write_bytes(LOGGER_P1_UART_PORT, (const char *)forwardStaging, length);
+    uint32_t startMs = uptimeMs();
 
-    //-- Silent on success: every burst is already visible as an accepted
-    //-- telegram. Only an incomplete burst reaches the console.
-    if ((first != (int)length) || (second != (int)length))
+    //-- Suspend normal reception before the first byte leaves the pin. The
+    //-- live path joins the adapter receive task, which is the only task
+    //-- allowed to feed the parser: no byte can reach the parser while the
+    //-- burst runs. The test generator observes the forwarding flag and the
+    //-- burst waits for a frame already inside the parser.
+    if (testMode)
     {
-      ESP_LOGW(tag, "UART0 TX burst incomplete: %d + %d of %u bytes", first, second, (unsigned)length);
+      forwardJoinTestFeed(self);
     }
+    else
+    {
+      dsmrUartStop(&self->uart);
+      forgetForwardMask(self);
+    }
+
+    ensureForwardTxDriver(self, rxInverted, length);
+
+    bool ok = uart_is_driver_installed(LOGGER_P1_UART_PORT);
+
+    if (ok)
+    {
+      ok = forwardCopy(self, payload, length, rxInverted, txInverted) &&
+           forwardCopy(self, payload, length, rxInverted, txInverted);
+    }
+
+    //-- TX idle again (or the burst was safely stopped): TX returns to the
+    //-- polarity selected by the current P1 Rx polarity setting; the full
+    //-- replacement mask keeps the RX bit of that same setting.
+    applyForwardMask(self, forwardIdleMask(rxInverted));
+
+    //-- Drop every byte the RX pin captured while reception was suspended so
+    //-- stale data can never reach the parser after the resume, then discard
+    //-- the parser's partial frame; its start-of-telegram detection re-arms
+    //-- reception on the next complete frame.
+    if (uart_is_driver_installed(LOGGER_P1_UART_PORT))
+    {
+      uart_flush_input(LOGGER_P1_UART_PORT);
+    }
+
+    dsmrParserNotifyDataLoss(&self->parser, forwardDiscardCallback, NULL);
+
+    if (!testMode)
+    {
+      releaseForwardTxDriver(self);
+
+      esp_err_t resumed = startLiveAdapter(self, &resume);
+
+      if (resumed != ESP_OK)
+      {
+        xSemaphoreTake(self->mutex, portMAX_DELAY);
+        snprintf(self->lastError, sizeof self->lastError, "receiver could not resume after forwarding: %s",
+                 esp_err_to_name(resumed));
+        self->receiverRunning = false;
+        xSemaphoreGive(self->mutex);
+        ESP_LOGE(tag, "%s", self->lastError);
+      }
+    }
+
+    //-- The free heap after the burst lets memory pressure be read from the
+    //-- console: web detail and raw requests malloc alongside the burst.
+    ESP_LOGI(tag, "forwarded %u bytes x 2 on UART0 TX, tx polarity %s, %s in %u ms, free heap %u",
+             (unsigned)length, txInverted ? "inverted" : "normal", ok ? "sent" : "aborted",
+             (unsigned)(uptimeMs() - startMs), (unsigned)esp_get_free_heap_size());
+
+    xSemaphoreTake(self->mutex, portMAX_DELAY);
+    self->forwarding = false;
+    xSemaphoreGive(self->mutex);
+
+    xSemaphoreGive(self->controlMutex);
   }
 }
 
@@ -1125,35 +1490,15 @@ static esp_err_t startLocked(LoggerReceiver *self, const loggerSettingsConfig *c
 
     if (result == ESP_OK)
     {
-      ensureTestTxDriver(self);
+      //-- The test driver stays installed across bursts, so its TX ring is
+      //-- sized for the largest frame the generator can build; every copy
+      //-- then queues in one non-blocking uart_write_bytes() call.
+      ensureForwardTxDriver(self, config->rxInverted, TEST_TELEGRAM_BUFFER_BYTES);
     }
   }
   else
   {
-    //-- Live P1 is fixed on UART0: RX GPIO44 (the validated stored rxGpio)
-    //-- and TX GPIO43. The meter never needs our TX; the pin is configured
-    //-- so the documented UART0 pin pair is the one in use.
-    dsmrUartConfig uartConfig;
-    memset(&uartConfig, 0, sizeof uartConfig);
-    uartConfig.uartPort = LOGGER_P1_UART_PORT;
-    uartConfig.rxPin = config->rxGpio;
-    uartConfig.txPin = LOGGER_P1_UART0_TX_GPIO;
-
-    //-- The first release uses an externally enabled request signal.
-    uartConfig.requestGpio = -1;
-    uartConfig.requestActiveHigh = true;
-    uartConfig.taskStackSize = LOGGER_P1_TASK_STACK_BYTES;
-    uartConfig.taskPriority = LOGGER_P1_TASK_PRIORITY;
-
-    //-- RX polarity is a runtime setting chosen in the SPA: normal reads the
-    //-- idle-high signal directly, inverted flips the receive line for
-    //-- interface boards that invert before the ESP32-S3.
-    uartConfig.invertRx = config->rxInverted;
-
-    ESP_LOGI(tag, "P1 RX on UART0 gpio %d, polarity %s", config->rxGpio,
-             config->rxInverted ? "inverted" : "normal");
-
-    result = dsmrUartStart(&self->uart, &self->parser, &uartConfig, onParserEvent, self);
+    result = startLiveAdapter(self, config);
   }
 
   xSemaphoreTake(self->mutex, portMAX_DELAY);
@@ -1199,11 +1544,12 @@ static void stopJoined(LoggerReceiver *self)
   if (loggerSettingsIsTestGpio(self->activeConfig.rxGpio))
   {
     stopTestGenerator();
-    releaseTestTxDriver(self);
+    releaseForwardTxDriver(self);
   }
   else
   {
     dsmrUartStop(&self->uart);
+    forgetForwardMask(self);
   }
 
   xSemaphoreTake(self->mutex, portMAX_DELAY);
@@ -1217,6 +1563,13 @@ static void stopJoined(LoggerReceiver *self)
 
 esp_err_t loggerReceiverInit(void)
 {
+  //-- The UART0 driver re-attaches GPIO 43/44 each time the driver around a
+  //-- forwarding burst is (re)installed; its pin reservation bookkeeping then
+  //-- reports "GPIO 43/44 is not usable, maybe used by others" although both
+  //-- pins serve UART0 on this board by design. Keep only the real errors of
+  //-- the driver tag and drop that warning and info noise from the console.
+  esp_log_level_set("uart", ESP_LOG_ERROR);
+
   LoggerReceiver *self = &instance;
   memset(self, 0, sizeof *self);
 
@@ -1226,6 +1579,19 @@ esp_err_t loggerReceiverInit(void)
 
   if ((self->mutex == NULL) || (self->controlMutex == NULL) || (self->forwardWake == NULL))
   {
+    return ESP_ERR_NO_MEM;
+  }
+
+  //-- The big telegram buffers (staging record, retained history, parser
+  //-- workspace further down) are carved here, preferring PSRAM: they keep
+  //-- more than a hundred kilobytes of frame storage off the small internal
+  //-- heap that the radios, task stacks and drivers need.
+  stagingRecord = (loggerTelegramRecord *)allocTelegramBuffer(sizeof *stagingRecord);
+  self->records = (loggerTelegramRecord *)allocTelegramBuffer(sizeof(*self->records) * LOGGER_HISTORY_CAPACITY);
+
+  if ((stagingRecord == NULL) || (self->records == NULL))
+  {
+    ESP_LOGE(tag, "telegram buffers could not be allocated");
     return ESP_ERR_NO_MEM;
   }
 
@@ -1256,7 +1622,7 @@ esp_err_t loggerReceiverInit(void)
   }
   else
   {
-    ESP_LOGI(tag, "UART0 TX forwarding ready: each burst repeats the frame twice, at most one burst per 5 s (or per interval when larger)");
+    ESP_LOGI(tag, "UART0 TX forwarding ready: each burst repeats the frame twice at the configured TX polarity with reception suspended, at most one burst per 5 s (or per interval when larger)");
   }
 
   //-- The counter task persists the accepted-telegram total every ten
@@ -1273,10 +1639,19 @@ esp_err_t loggerReceiverInit(void)
   probe.profileId = "nl.dsmr.5.0";
   self->workspaceSize = dsmrParserWorkspaceSizeNeeded(&probe);
 
-  if (self->workspaceSize > sizeof parserWorkspace)
+  if (self->workspaceSize > DSMR_DEFAULT_WORKSPACE_BYTES)
   {
-    ESP_LOGE(tag, "workspace too small: need %u have %u", (unsigned)self->workspaceSize, (unsigned)sizeof parserWorkspace);
+    ESP_LOGE(tag, "workspace too small: need %u have %u", (unsigned)self->workspaceSize,
+             (unsigned)DSMR_DEFAULT_WORKSPACE_BYTES);
     return ESP_ERR_INVALID_SIZE;
+  }
+
+  parserWorkspace = (uint8_t *)allocTelegramBuffer(DSMR_DEFAULT_WORKSPACE_BYTES);
+
+  if (parserWorkspace == NULL)
+  {
+    ESP_LOGE(tag, "parser workspace could not be allocated");
+    return ESP_ERR_NO_MEM;
   }
 
   self->workspace = parserWorkspace;

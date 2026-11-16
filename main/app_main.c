@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: app_main.c - application entry
-//-- Date: 2026-11-16 · Build: 3
+//-- Date: 2026-11-16 · Build: 5
 //--
 //-- Boot order: the board debug lines come up first, then NVS, then the P1
 //-- receiver. Reception starts as soon as a valid configuration is stored and
@@ -11,9 +11,9 @@
 //-- captive portal owns port 80 during provisioning.
 //-- ==========================================================================
 
-//-- never remove or change this line,
-//-- it indicates the program version
-const char* PROG_VERSION = "v0.4.2";
+//-- never remove or change in this line,
+//-- it indicates the program version (the part "x.y.z" can and will change)
+const char* PROG_VERSION = "v0.4.3";
 
 #include <stdio.h>
 #include <string.h>
@@ -27,6 +27,7 @@ const char* PROG_VERSION = "v0.4.2";
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "dsmr_parser.h"
 #include "logger_board.h"
 #include "logger_receiver.h"
 #include "logger_settings.h"
@@ -158,9 +159,14 @@ static void initialiseNvs(void)
 void app_main(void)
 {
   ESP_LOGI(tag, "lastDSMRlogger %s starting", PROG_VERSION);
+  ESP_LOGI(tag, "parserDSMR library version %s", dsmrParserVersion());
 
   loggerBoardInit();
   loggerBoardShowScreen("boot");
+
+  //-- The parser library version rides along on the boot debug lines so the
+  //-- panel shows which parser build is decoding the telegrams.
+  loggerBoardShowParserVersion(dsmrParserVersion());
 
   initialiseNvs();
 

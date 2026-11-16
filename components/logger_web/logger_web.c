@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-16 · Build: 6
+//-- Date: 2026-11-16 · Build: 7
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status and telegram-list JSON and answers form-urlencoded commands
@@ -536,6 +536,11 @@ static void appendSettingsJson(stringBuilder *sb, const loggerSettingsConfig *co
   sbAppend(sb, ",\"rxInverted\":");
   sbAppend(sb, config->rxInverted ? "true" : "false");
 
+  //-- P1 TX polarity for the forwarding bursts: false sends both copies
+  //-- as-is, true inverts TXD while the burst runs.
+  sbAppend(sb, ",\"txInverted\":");
+  sbAppend(sb, config->txInverted ? "true" : "false");
+
   //-- TFT display orientation: false is the assembled landscape, true turns
   //-- the panel 180 degrees.
   sbAppend(sb, ",\"displayFlipped\":");
@@ -745,6 +750,13 @@ static const char *applySettingsFromForm(const char *body)
     candidate.rxInverted = (text[0] == '1');
   }
 
+  //-- P1 TX polarity toggle for the forwarding bursts: 1 sends both copies
+  //-- of the frame inverted, 0 or an absent field sends them as-is.
+  if (formGet(body, "txInverted", text, sizeof text))
+  {
+    candidate.txInverted = (text[0] == '1');
+  }
+
   //-- Display orientation toggle: 1 turns the panel 180 degrees, 0 or an
   //-- absent field keeps the assembled landscape orientation.
   if (formGet(body, "displayFlipped", text, sizeof text))
@@ -824,8 +836,9 @@ static const char *applySettingsFromForm(const char *body)
   //-- only now, after activation and persistence both succeeded.
   loggerBoardSetRotation(candidate.displayFlipped);
 
-  ESP_LOGI(tag, "configuration applied and stored: gpio %d, profile %s, rx polarity %s, display %s", candidate.rxGpio,
+  ESP_LOGI(tag, "configuration applied and stored: gpio %d, profile %s, rx polarity %s, tx polarity %s, display %s", candidate.rxGpio,
            candidate.profileId, candidate.rxInverted ? "inverted" : "normal",
+           candidate.txInverted ? "inverted" : "normal",
            candidate.displayFlipped ? "upside down" : "normal");
   return NULL;
 }

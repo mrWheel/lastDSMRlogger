@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-16 · Build: 8 */
+   Date: 2026-11-16 · Build: 9 */
 
 :root
 {
@@ -227,8 +227,9 @@ select:hover
   border-color: var(--hairline);
 }
 
-/* iOS flavoured switches: data source (Live data / Test data) and the P1 RX
-   polarity (Normal / Inverted). */
+/* iOS flavoured switches: data source (Live data / Test data), the P1 RX
+   polarity (Normal / Inverted) and the P1 Tx polarity for forwarded data
+   (Normal / Inverted). The native checkbox behind every switch is hidden. */
 .toggleRow
 {
   display: flex;
@@ -252,6 +253,7 @@ select:hover
 
 #srcToggle,
 #rxPolarityToggle,
+#txPolarityToggle,
 #displayRotationToggle
 {
   position: absolute;
@@ -289,6 +291,7 @@ select:hover
 
 #srcToggle:checked + .switch,
 #rxPolarityToggle:checked + .switch,
+#txPolarityToggle:checked + .switch,
 #displayRotationToggle:checked + .switch
 {
   background: var(--accent);
@@ -296,6 +299,7 @@ select:hover
 
 #srcToggle:checked + .switch .switchKnob,
 #rxPolarityToggle:checked + .switch .switchKnob,
+#txPolarityToggle:checked + .switch .switchKnob,
 #displayRotationToggle:checked + .switch .switchKnob
 {
   transform: translateX(20px);
@@ -303,6 +307,7 @@ select:hover
 
 #srcToggle:focus-visible + .switch,
 #rxPolarityToggle:focus-visible + .switch,
+#txPolarityToggle:focus-visible + .switch,
 #displayRotationToggle:focus-visible + .switch
 {
   outline: 2px solid var(--accent);
