@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.c - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-16 · Build: 13
+//-- Date: 2026-11-16 · Build: 15
 //--
 //-- The parserDSMR adapter task owns the parser instance while it runs. The
 //-- event callback copies the complete accepted frame and the decoded fields
@@ -10,15 +10,15 @@
 //-- new parser profile and starts the UART with the new settings; on any
 //-- failure the previous configuration is restored.
 //--
-//-- Every accepted frame is also forwarded on the UART0 TX pin by a small
-//-- dedicated task: at most one burst per five seconds (or per interval when
-//-- larger, so above four seconds every accepted telegram is forwarded) and
-//-- every burst repeats the exact frame twice. A burst suspends reception
+//-- Every frame that is read is also forwarded on the UART0 TX pin by a
+//-- small dedicated task: every accepted and every interval-skipped frame
+//-- schedules one burst, the bursts queue behind each other, and every
+//-- burst sends the exact frame once. A burst suspends reception
 //-- for its whole duration: the live path joins the adapter receive task,
 //-- the test generator discards its frames meanwhile, bytes arriving on the
 //-- RX pin are dropped uncounted, the parser discards its partial frame and
 //-- reception resumes through the parser's own start-of-telegram detection.
-//-- The P1 Tx polarity (Forwarding Data) setting drives both copies; outside
+//-- The P1 Tx polarity (Forwarding Data) setting drives the copy; outside
 //-- a burst TX idles at the polarity of the P1 Rx polarity setting. Test mode
 //-- installs its own TX driver because it opens no receive UART.
 //-- ==========================================================================
@@ -61,10 +61,9 @@ static const char *tag = "loggerReceiver";
 //-- and this floor is reported as stale.
 #define LOGGER_STALE_FLOOR_MS 15000u
 
-//-- Minimum gap between two forwarding bursts on the UART0 TX pin. A burst
-//-- sends the accepted frame twice back to back; when the configured read
-//-- interval is larger than this floor, one burst per interval applies.
-#define LOGGER_FORWARD_MIN_GAP_MS 5000u
+//-- Bursts on the UART0 TX pin send the selected frame once; every telegram
+//-- that is read schedules one burst and the bursts queue behind each other
+//-- on the forwarding task and its control mutex.
 #define LOGGER_FORWARD_TASK_STACK_BYTES 4096
 #define LOGGER_FORWARD_TASK_PRIORITY 4
 
@@ -93,17 +92,21 @@ static const char *tag = "loggerReceiver";
 //-- even with a 600 s interval.
 #define LOGGER_TEST_TASK_SLICE_MS 50u
 
-//-- The accepted-telegram total is persisted to NVS every ten minutes so the
-//-- running counter survives a reset or a power cycle. On boot the receiver
-//-- restores the last persisted value and counts on from there.
-#define LOGGER_TELEGRAM_COUNTER_PERSIST_INTERVAL_MS 600000u
+//-- The accepted and rejected telegram totals are persisted to NVS whenever
+//-- either counter completes another block of 25: the first counter to
+//-- reach +25 triggers the write, so the running counters survive a reset
+//-- or a power cycle. Both counters always reach NVS in the same commit so
+//-- the stored pair stays consistent. On boot the receiver restores the
+//-- last persisted values and counts on from there.
+#define LOGGER_TELEGRAM_COUNTER_PERSIST_EVERY_N 25u
 #define LOGGER_TELEGRAM_COUNTER_TASK_STACK_BYTES 4096
 #define LOGGER_TELEGRAM_COUNTER_TASK_PRIORITY 3
 
-//-- NVS storage of the counter; the namespace is shared with the settings
+//-- NVS storage of the counters; the namespace is shared with the settings
 //-- service and the partition is initialised by the application at boot.
 #define LOGGER_NVS_NAMESPACE "dsmrlog"
 #define LOGGER_NVS_KEY_TELEGRAM_COUNT "telegramCount"
+#define LOGGER_NVS_KEY_REJECTED_COUNT "rejectedCount"
 
 typedef struct
 {
@@ -129,18 +132,13 @@ typedef struct
   bool hasLastAccepted;
   uint32_t lastAcceptedUptimeMs;
 
-  //-- Uptime of the last forwarding burst on the UART0 TX pin; the next
-  //-- burst waits for the larger of five seconds and the read interval.
-  uint32_t lastForwardUptimeMs;
-
-  //-- Sequence of the accepted telegram selected for the next UART0 TX
-  //-- burst. The burst sends straight from the retained history slot of
-  //-- that sequence: reception is suspended for the whole burst, so no new
-  //-- accept can recycle the slot while its bytes are on the wire (history
-  //-- capacity would first need four new frames), and the exact accepted
-  //-- bytes and their length stay valid for the entire operation.
+  //-- True while a burst was selected and waits for the forwarding task.
+  //-- The burst sends the exact bytes from the dedicated forward buffer
+  //-- (forwardFrameBuffer), which the receive task fills under the mutex
+  //-- for every forwarded telegram, accepted or only read: skipped frames
+  //-- have no history slot, so both paths share this one source.
   bool forwardPending;
-  uint32_t forwardSequence;
+  uint16_t forwardFrameLength;
 
   //-- True while the receiver itself owns the UART0 driver (test mode keeps
   //-- it installed across bursts). The live path installs the driver only
@@ -191,6 +189,11 @@ typedef struct
 
 static LoggerReceiver instance;
 
+//-- Handle of the counter persistence task, NULL when the task could not be
+//-- created; the receive task signals it after every persisted block of
+//-- accepted telegrams.
+static TaskHandle_t counterTaskHandle = NULL;
+
 //-- Telegram buffer, raw frame copy, field array, M-Bus and label copies are
 //-- all carved from this workspace by the parser.
 static uint8_t *parserWorkspace;
@@ -201,8 +204,19 @@ static uint8_t *parserWorkspace;
 //-- module carries it (see allocTelegramBuffer).
 static loggerTelegramRecord *stagingRecord;
 
+//-- Copy of the frame selected for the next UART0 TX burst. The receive
+//-- task fills it under the mutex for every forwarded telegram: accepted
+//-- frames and read-only (interval-skipped) frames share this one source.
+//-- The burst task snapshots it under the same lock into forwardBurstBuffer
+//-- (the only buffer the wire writes read from), so a frame never has to
+//-- stay pinned in the staging record or the history while its copy goes
+//-- out, and staging the next frame cannot mix bytes into a running burst.
+static uint8_t *forwardFrameBuffer;
+static uint8_t *forwardBurstBuffer;
+
 //-- Carves one of the big telegram buffers (parser workspace, staging
-//-- record, retained history), preferring PSRAM: they are only touched by
+//-- record, retained history, forward frame), preferring PSRAM: they are
+//-- only touched by
 //-- task code, never by an ISR or a DMA descriptor. The internal fallback
 //-- keeps the logger alive on a module without external RAM.
 static void *allocTelegramBuffer(size_t size)
@@ -597,19 +611,17 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
   {
     const dsmrTelegramResult *result = event->result;
 
-    //-- Only one telegram is read per configured interval: a complete
+    //-- Only one telegram is processed per configured interval: a complete
     //-- candidate arriving sooner than the interval after the last accepted
-    //-- record is ignored without touching the history or the counters.
+    //-- record is skipped. A skipped telegram stays out of the history and
+    //-- the counters, but it is still logged and forwarded like any read
+    //-- frame; the record is built first so the skip line can show the same
+    //-- meter time, size, CRC verdict and profile as an accepted one.
     xSemaphoreTake(self->mutex, portMAX_DELAY);
     bool tooEarly = self->hasLastAccepted &&
                     ((uint32_t)(result->receiveTimeMs - self->lastAcceptedUptimeMs) <
                      (self->activeConfig.intervalSeconds * 1000u));
     xSemaphoreGive(self->mutex);
-
-    if (tooEarly)
-    {
-      return;
-    }
 
     memset(stagingRecord, 0, sizeof *stagingRecord);
     stagingRecord->meta.receivedUptimeMs = result->receiveTimeMs;
@@ -641,7 +653,41 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     stagingRecord->meta.fieldCount = snapshotCount;
     extractMeterTimeText(stagingRecord);
 
+    if (tooEarly)
+    {
+      bool skipForwardScheduled = false;
+
+      //-- A correct frame that arrives inside the interval is a skip, not a
+      //-- processing: the log line carries the word skip where the accepted
+      //-- line shows the telegram number.
+      ESP_LOGI(tag, "correct telegram skip: meter %s, %u bytes, %s, profile %s",
+               (stagingRecord->meta.meterTimeText[0] != '\0') ? stagingRecord->meta.meterTimeText : "--:--:--",
+               (unsigned)stagingRecord->meta.rawLength,
+               stagingRecord->meta.crcVerified ? "crc ok" : "no crc",
+               stagingRecord->meta.profileId);
+
+      //-- Read-only frames are forwarded too, so the wire keeps the meter
+      //-- cadence: the newest scheduled frame takes the dedicated copy.
+      if ((stagingRecord->meta.rawLength > 0u) && (forwardFrameBuffer != NULL))
+      {
+        xSemaphoreTake(self->mutex, portMAX_DELAY);
+        memcpy(forwardFrameBuffer, stagingRecord->rawBytes, stagingRecord->meta.rawLength);
+        self->forwardFrameLength = stagingRecord->meta.rawLength;
+        self->forwardPending = true;
+        xSemaphoreGive(self->mutex);
+        skipForwardScheduled = true;
+      }
+
+      if (skipForwardScheduled && (self->forwardWake != NULL))
+      {
+        xSemaphoreGive(self->forwardWake);
+      }
+
+      return;
+    }
+
     bool doForward = false;
+    bool counterPersistDue = false;
     bool testDataMode = false;
     bool haveShownConfig = false;
     loggerSettingsConfig shownConfig;
@@ -690,6 +736,11 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     self->lastAcceptedUptimeMs = result->receiveTimeMs;
     self->lastError[0] = '\0';
 
+    //-- Every 25th accepted telegram asks the counter task to write both
+    //-- running totals to NVS; the rejected counter triggers the same joint
+    //-- write in the diagnostic path, whichever of the two reaches +25 first.
+    counterPersistDue = ((self->acceptedCount % LOGGER_TELEGRAM_COUNTER_PERSIST_EVERY_N) == 0u);
+
     //-- Snapshot of the counters and the active configuration for the TFT
     //-- system information view, taken under the same lock.
     haveShownConfig = self->hasActiveConfig;
@@ -697,31 +748,21 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     acceptedShown = self->acceptedCount;
     rejectedShown = self->rejectedCount;
 
-    //-- The accepted frame is forwarded on the UART0 TX pin; every burst
-    //-- repeats the exact frame twice with reception suspended for its
-    //-- duration. A burst takes longer than the shortest intervals, so the
-    //-- pacing floor is five seconds: at intervals up to four seconds (the
-    //-- two-second cadence would collide with the burst itself) at most one
-    //-- burst per five seconds; above four seconds every accepted telegram
-    //-- is forwarded. The burst itself runs in the forwarding task.
-    uint32_t forwardWindowMs = self->activeConfig.intervalSeconds * 1000u;
-
-    if (forwardWindowMs < LOGGER_FORWARD_MIN_GAP_MS)
-    {
-      forwardWindowMs = LOGGER_FORWARD_MIN_GAP_MS;
-    }
-
-    doForward = (stagingRecord->meta.rawLength > 0u) &&
-                ((uint32_t)(result->receiveTimeMs - self->lastForwardUptimeMs) >= forwardWindowMs);
+    //-- Every processed telegram is forwarded on the UART0 TX pin: the
+    //-- burst sends the exact frame once with reception suspended for its
+    //-- duration. Skipped frames schedule the same burst in the skip path
+    //-- above; the forwarding task queues the bursts behind each other, so
+    //-- the newest scheduled frame always wins the wire.
+    doForward = (stagingRecord->meta.rawLength > 0u) && (forwardFrameBuffer != NULL);
 
     if (doForward)
     {
-      //-- The burst reads the exact bytes and length from the history slot
-      //-- this commit just filled, addressed by sequence; the slot stays
-      //-- intact until the burst ends because reception is suspended.
+      //-- The burst reads the exact bytes and length from the dedicated
+      //-- copy; taken under this same lock, the copy can never mix two
+      //-- frames.
+      memcpy(forwardFrameBuffer, stagingRecord->rawBytes, stagingRecord->meta.rawLength);
+      self->forwardFrameLength = stagingRecord->meta.rawLength;
       self->forwardPending = true;
-      self->forwardSequence = stagingRecord->meta.sequence;
-      self->lastForwardUptimeMs = result->receiveTimeMs;
     }
 
     xSemaphoreGive(self->mutex);
@@ -729,6 +770,11 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     if (doForward && (self->forwardWake != NULL))
     {
       xSemaphoreGive(self->forwardWake);
+    }
+
+    if (counterPersistDue && (counterTaskHandle != NULL))
+    {
+      xTaskNotifyGive(counterTaskHandle);
     }
 
     loggerBoardNoteTelegram(stagingRecord->meta.sequence);
@@ -763,9 +809,15 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
   else if (event->type == DSMR_EVENT_DIAGNOSTIC)
   {
     const dsmrDiagnostic *diagnostic = event->diagnostic;
+    bool counterPersistDue = false;
 
     xSemaphoreTake(self->mutex, portMAX_DELAY);
     self->rejectedCount++;
+
+    //-- Every 25th rejected telegram asks the counter task to write both
+    //-- running totals to NVS; the accepted counter triggers the same joint
+    //-- write in the telegram path, whichever of the two reaches +25 first.
+    counterPersistDue = ((self->rejectedCount % LOGGER_TELEGRAM_COUNTER_PERSIST_EVERY_N) == 0u);
 
     if (diagnostic->reason == DSMR_DIAG_DATA_LOSS)
     {
@@ -811,6 +863,11 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     }
 
     xSemaphoreGive(self->mutex);
+
+    if (counterPersistDue && (counterTaskHandle != NULL))
+    {
+      xTaskNotifyGive(counterTaskHandle);
+    }
   }
 }
 
@@ -1221,9 +1278,9 @@ static void forwardDiscardCallback(const dsmrParser *parser, const dsmrParserEve
   (void)userData;
 }
 
-//-- Queues one copy of the retained frame and waits until it has finished
-//-- transmitting on the wire. The payload points into the history slot of
-//-- the forwarded sequence, which stays untouched until the burst ends.
+//-- Queues one copy of the selected frame and waits until it has finished
+//-- transmitting on the wire. The payload points into the forwarding task's
+//-- private burst copy, which stays untouched until the burst ends.
 //-- Returns false on a partial write or timeout.
 static bool forwardCopy(LoggerReceiver *self, const uint8_t *payload, uint16_t length,
                         bool rxInverted, bool txInverted)
@@ -1250,11 +1307,11 @@ static bool forwardCopy(LoggerReceiver *self, const uint8_t *payload, uint16_t l
   return true;
 }
 
-//-- Sends every selected burst twice on the UART0 TX pin. The whole sequence
+//-- Sends every selected burst once on the UART0 TX pin. The whole sequence
 //-- runs under the control mutex, so a settings update or another task
 //-- cannot interrupt the polarity and parser sequence: a save arriving
-//-- during a burst waits and applies to the next operation, while both
-//-- copies of the current telegram keep one polarity. The console never
+//-- during a burst waits and applies to the next operation, while the
+//-- copy of the current telegram keeps one polarity. The console never
 //-- touches UART0 (it runs on USB-Serial-JTAG), so logging during a burst
 //-- is safe. Blocking writes run in this task only, never in reception.
 static void forwardTaskLoop(void *argument)
@@ -1272,24 +1329,17 @@ static void forwardTaskLoop(void *argument)
     uint16_t length = 0u;
     const uint8_t *payload = NULL;
 
-    if (self->forwardPending)
+    if (self->forwardPending && (forwardBurstBuffer != NULL) && (forwardFrameBuffer != NULL) &&
+        (self->forwardFrameLength > 0u))
     {
       self->forwardPending = false;
 
-      //-- Address the retained frame by sequence rather than copying it: the
-      //-- slot of the selected telegram cannot be recycled before the burst
-      //-- ends (reception is suspended and the history would need four new
-      //-- accepts to wrap around to it), so the exact accepted bytes and
-      //-- their length stay valid on the wire without a second buffer.
-      for (uint8_t slot = 0u; slot < LOGGER_HISTORY_CAPACITY; slot++)
-      {
-        if (self->slotUsed[slot] && (self->records[slot].meta.sequence == self->forwardSequence))
-        {
-          payload = self->records[slot].rawBytes;
-          length = self->records[slot].meta.rawLength;
-          break;
-        }
-      }
+      //-- Snapshot into the task-owned buffer under the lock: the wire
+      //-- copy then runs from a private buffer while the receive task may
+      //-- already stage the next scheduled frame in the shared one.
+      memcpy(forwardBurstBuffer, forwardFrameBuffer, self->forwardFrameLength);
+      payload = forwardBurstBuffer;
+      length = self->forwardFrameLength;
     }
 
     bool rxInverted = self->hasActiveConfig && self->activeConfig.rxInverted;
@@ -1334,8 +1384,7 @@ static void forwardTaskLoop(void *argument)
 
     if (ok)
     {
-      ok = forwardCopy(self, payload, length, rxInverted, txInverted) &&
-           forwardCopy(self, payload, length, rxInverted, txInverted);
+      ok = forwardCopy(self, payload, length, rxInverted, txInverted);
     }
 
     //-- TX idle again (or the burst was safely stopped): TX returns to the
@@ -1373,7 +1422,7 @@ static void forwardTaskLoop(void *argument)
 
     //-- The free heap after the burst lets memory pressure be read from the
     //-- console: web detail and raw requests malloc alongside the burst.
-    ESP_LOGI(tag, "forwarded %u bytes x 2 on UART0 TX, tx polarity %s, %s in %u ms, free heap %u",
+    ESP_LOGI(tag, "forwarded %u bytes on UART0 TX, tx polarity %s, %s in %u ms, free heap %u",
              (unsigned)length, txInverted ? "inverted" : "normal", ok ? "sent" : "aborted",
              (unsigned)(uptimeMs() - startMs), (unsigned)esp_get_free_heap_size());
 
@@ -1386,19 +1435,21 @@ static void forwardTaskLoop(void *argument)
 }
 
 //-- --------------------------------------------------------------------------
-//-- Accepted-telegram counter persistence (dedicated task)
+//-- Accepted and rejected telegram counter persistence (dedicated task)
 //-- --------------------------------------------------------------------------
 
-//-- Writes the accepted-telegram total to NVS. The write is skipped when the
-//-- value has not changed since the last persist so an idle or unconfigured
-//-- meter does not wear the flash for nothing.
-static void persistTelegramCount(LoggerReceiver *self, uint32_t *lastPersistedCount)
+//-- Writes both telegram totals to NVS. The write is skipped when neither
+//-- value has changed since the last persist so an idle or unconfigured
+//-- meter does not wear the flash for nothing. Both keys share one commit,
+//-- so the stored pair always belongs to the same moment.
+static void persistCounters(LoggerReceiver *self, uint32_t *lastPersistedAccepted, uint32_t *lastPersistedRejected)
 {
   xSemaphoreTake(self->mutex, portMAX_DELAY);
-  uint32_t count = self->acceptedCount;
+  uint32_t accepted = self->acceptedCount;
+  uint32_t rejected = self->rejectedCount;
   xSemaphoreGive(self->mutex);
 
-  if (count == *lastPersistedCount)
+  if ((accepted == *lastPersistedAccepted) && (rejected == *lastPersistedRejected))
   {
     return;
   }
@@ -1412,7 +1463,12 @@ static void persistTelegramCount(LoggerReceiver *self, uint32_t *lastPersistedCo
     return;
   }
 
-  result = nvs_set_u32(handle, LOGGER_NVS_KEY_TELEGRAM_COUNT, count);
+  result = nvs_set_u32(handle, LOGGER_NVS_KEY_TELEGRAM_COUNT, accepted);
+
+  if (result == ESP_OK)
+  {
+    result = nvs_set_u32(handle, LOGGER_NVS_KEY_REJECTED_COUNT, rejected);
+  }
 
   if (result == ESP_OK)
   {
@@ -1423,26 +1479,29 @@ static void persistTelegramCount(LoggerReceiver *self, uint32_t *lastPersistedCo
 
   if (result != ESP_OK)
   {
-    ESP_LOGE(tag, "persisting the telegram counter failed: %s", esp_err_to_name(result));
+    ESP_LOGE(tag, "persisting the telegram counters failed: %s", esp_err_to_name(result));
     return;
   }
 
-  *lastPersistedCount = count;
-  ESP_LOGI(tag, "telegram counter persisted: %" PRIu32, count);
+  *lastPersistedAccepted = accepted;
+  *lastPersistedRejected = rejected;
+  ESP_LOGI(tag, "telegram counters persisted: %" PRIu32 " accepted, %" PRIu32 " rejected", accepted, rejected);
 }
 
-//-- Blocks the whole ten-minute interval and then persists the counter. The
-//-- task never touches the parser or the receiver control state and only
-//-- reads the counter under the data mutex, so it needs no join path.
+//-- Blocks until the receive task signals a new block of accepted telegrams
+//-- and then persists both counters. The task never touches the parser or
+//-- the receiver control state and only reads the counters under the data
+//-- mutex, so it needs no join path.
 static void telegramCounterTaskLoop(void *argument)
 {
   LoggerReceiver *self = (LoggerReceiver *)argument;
-  uint32_t lastPersistedCount = self->acceptedCount;
+  uint32_t lastPersistedAccepted = self->acceptedCount;
+  uint32_t lastPersistedRejected = self->rejectedCount;
 
   for (;;)
   {
-    vTaskDelay(pdMS_TO_TICKS(LOGGER_TELEGRAM_COUNTER_PERSIST_INTERVAL_MS));
-    persistTelegramCount(self, &lastPersistedCount);
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    persistCounters(self, &lastPersistedAccepted, &lastPersistedRejected);
   }
 }
 
@@ -1588,30 +1647,56 @@ esp_err_t loggerReceiverInit(void)
   //-- heap that the radios, task stacks and drivers need.
   stagingRecord = (loggerTelegramRecord *)allocTelegramBuffer(sizeof *stagingRecord);
   self->records = (loggerTelegramRecord *)allocTelegramBuffer(sizeof(*self->records) * LOGGER_HISTORY_CAPACITY);
+  forwardFrameBuffer = (uint8_t *)allocTelegramBuffer(DSMR_MAX_TELEGRAM_BYTES);
+  forwardBurstBuffer = (uint8_t *)allocTelegramBuffer(DSMR_MAX_TELEGRAM_BYTES);
 
-  if ((stagingRecord == NULL) || (self->records == NULL))
+  if ((stagingRecord == NULL) || (self->records == NULL) || (forwardFrameBuffer == NULL) ||
+      (forwardBurstBuffer == NULL))
   {
     ESP_LOGE(tag, "telegram buffers could not be allocated");
     return ESP_ERR_NO_MEM;
   }
 
-  //-- The accepted-telegram total continues across a reset or power cycle:
-  //-- the value the counter task last persisted is the starting point of the
-  //-- new reception session. A missing key (first boot) simply keeps zero.
+  //-- The accepted and rejected telegram totals continue across a reset or
+  //-- power cycle: the values the counter task last persisted are the
+  //-- starting point of the new reception session. Missing keys (first boot)
+  //-- simply keep zero.
   nvs_handle_t handle;
+  esp_err_t nvsResult = nvs_open(LOGGER_NVS_NAMESPACE, NVS_READONLY, &handle);
 
-  if (nvs_open(LOGGER_NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK)
+  if (nvsResult == ESP_OK)
   {
-    uint32_t storedCount = 0u;
+    uint32_t storedAccepted = 0u;
+    uint32_t storedRejected = 0u;
 
-    if (nvs_get_u32(handle, LOGGER_NVS_KEY_TELEGRAM_COUNT, &storedCount) == ESP_OK)
+    if (nvs_get_u32(handle, LOGGER_NVS_KEY_TELEGRAM_COUNT, &storedAccepted) == ESP_OK)
     {
-      self->acceptedCount = storedCount;
-      ESP_LOGI(tag, "telegram counter restored from NVS: %" PRIu32, storedCount);
+      self->acceptedCount = storedAccepted;
+    }
+
+    if (nvs_get_u32(handle, LOGGER_NVS_KEY_REJECTED_COUNT, &storedRejected) == ESP_OK)
+    {
+      self->rejectedCount = storedRejected;
     }
 
     nvs_close(handle);
+    ESP_LOGI(tag, "telegram counters restored from NVS: %" PRIu32 " accepted, %" PRIu32 " rejected",
+             self->acceptedCount, self->rejectedCount);
   }
+  else if (nvsResult == ESP_ERR_NVS_NOT_FOUND)
+  {
+    ESP_LOGI(tag, "no stored telegram counters yet, starting at zero");
+  }
+  else
+  {
+    ESP_LOGW(tag, "telegram counters could not be read from NVS: %s", esp_err_to_name(nvsResult));
+  }
+
+  //-- The console line, the telegram list and the panel number accepted
+  //-- telegrams by sequence; starting that sequence from the restored total
+  //-- makes the visible telegram numbers continue across a reset or power
+  //-- cycle as well, instead of beginning again at one every boot.
+  self->nextSequence = self->acceptedCount;
 
   //-- The forwarding task lives for the whole run and blocks until the
   //-- callback stages a burst; without a driver installed a burst is skipped.
@@ -1622,14 +1707,16 @@ esp_err_t loggerReceiverInit(void)
   }
   else
   {
-    ESP_LOGI(tag, "UART0 TX forwarding ready: each burst repeats the frame twice at the configured TX polarity with reception suspended, at most one burst per 5 s (or per interval when larger)");
+    ESP_LOGI(tag, "UART0 TX forwarding ready: every read telegram schedules a burst, each burst sends the frame once at the configured TX polarity with reception suspended, bursts queue behind each other");
   }
 
-  //-- The counter task persists the accepted-telegram total every ten
-  //-- minutes so the running total survives a reset or power cycle.
+  //-- The counter task persists both running totals whenever either counter
+  //-- completes another block of 25, so the totals survive a reset or power
+  //-- cycle.
   if (xTaskCreate(telegramCounterTaskLoop, "p1Counter", LOGGER_TELEGRAM_COUNTER_TASK_STACK_BYTES, self,
-                  LOGGER_TELEGRAM_COUNTER_TASK_PRIORITY, NULL) != pdPASS)
+                  LOGGER_TELEGRAM_COUNTER_TASK_PRIORITY, &counterTaskHandle) != pdPASS)
   {
+    counterTaskHandle = NULL;
     ESP_LOGW(tag, "telegram counter task could not be created: counter persistence disabled");
   }
 
