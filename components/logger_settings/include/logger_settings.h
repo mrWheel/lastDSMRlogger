@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.h - versioned settings service
-//-- Date: 2026-11-15 · Build: 3
+//-- Date: 2026-11-15 · Build: 4
 //--
 //-- The settings service stores the complete versioned configuration in
 //-- ESP-IDF NVS, validates it against the parserDSMR built-in profiles and
@@ -64,7 +64,10 @@ typedef enum
 //-- Version 3: the P1 RX polarity became a runtime setting (Normal/Inverted)
 //-- instead of a build-time Kconfig choice; stored version 2 blobs are
 //-- rejected, so one save is required after updating.
-#define LOGGER_SETTINGS_VERSION 3u
+//-- Version 4: the TFT display orientation became a setting (Normal/Upside
+//-- down); stored version 3 blobs are rejected, so one save is required
+//-- after updating.
+#define LOGGER_SETTINGS_VERSION 4u
 #define LOGGER_SETTINGS_PROFILE_ID_MAX 32
 #define LOGGER_SETTINGS_COUNTRY_MAX 3
 
@@ -93,6 +96,11 @@ typedef struct
   //-- Per M-Bus channel 1 through 4; index 0 is unused.
   loggerMbusMode mbusMode[DSMR_MBUS_CHANNEL_MAX + 1];
   dsmrMbusDeviceType mbusType[DSMR_MBUS_CHANNEL_MAX + 1];
+
+  //-- TFT display orientation. False keeps the assembled landscape
+  //-- orientation; true turns the panel 180 degrees for enclosures that
+  //-- mount the board the other way round.
+  bool displayFlipped;
 } loggerSettingsConfig;
 
 //-- Loads the stored configuration and validates it. Returns ESP_ERR_NOT_FOUND

@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-15 · Build: 4
+//-- Date: 2026-11-15 · Build: 5
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status and telegram-list JSON and answers form-urlencoded commands
@@ -531,6 +531,11 @@ static void appendSettingsJson(stringBuilder *sb, const loggerSettingsConfig *co
   sbAppend(sb, ",\"rxInverted\":");
   sbAppend(sb, config->rxInverted ? "true" : "false");
 
+  //-- TFT display orientation: false is the assembled landscape, true turns
+  //-- the panel 180 degrees.
+  sbAppend(sb, ",\"displayFlipped\":");
+  sbAppend(sb, config->displayFlipped ? "true" : "false");
+
   sbAppend(sb, ",\"mbus\":[");
 
   for (uint8_t channel = DSMR_MBUS_CHANNEL_MIN; channel <= DSMR_MBUS_CHANNEL_MAX; channel++)
@@ -735,6 +740,13 @@ static const char *applySettingsFromForm(const char *body)
     candidate.rxInverted = (text[0] == '1');
   }
 
+  //-- Display orientation toggle: 1 turns the panel 180 degrees, 0 or an
+  //-- absent field keeps the assembled landscape orientation.
+  if (formGet(body, "displayFlipped", text, sizeof text))
+  {
+    candidate.displayFlipped = (text[0] == '1');
+  }
+
   if (!formGet(body, "country", candidate.countryCode, sizeof candidate.countryCode))
   {
     return "missing country";
@@ -803,8 +815,13 @@ static const char *applySettingsFromForm(const char *body)
     return "persistence failed";
   }
 
-  ESP_LOGI(tag, "configuration applied and stored: gpio %d, profile %s, rx polarity %s", candidate.rxGpio, candidate.profileId,
-           candidate.rxInverted ? "inverted" : "normal");
+  //-- The persisted configuration owns the panel orientation too: apply it
+  //-- only now, after activation and persistence both succeeded.
+  loggerBoardSetRotation(candidate.displayFlipped);
+
+  ESP_LOGI(tag, "configuration applied and stored: gpio %d, profile %s, rx polarity %s, display %s", candidate.rxGpio,
+           candidate.profileId, candidate.rxInverted ? "inverted" : "normal",
+           candidate.displayFlipped ? "upside down" : "normal");
   return NULL;
 }
 

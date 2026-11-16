@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_board.h - on-device TFT debug lines and power panel
-//-- Date: 2026-11-15 · Build: 7
+//-- Date: 2026-11-15 · Build: 8
 //--
 //-- The first release has no on-device user interface. The TFT shows debug
 //-- lines describing what the device is doing: the active browser screen
@@ -18,6 +18,7 @@
 #ifndef LOGGER_BOARD_H
 #define LOGGER_BOARD_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -26,6 +27,13 @@
 //-- brought up, every other function becomes a harmless no-op so the logger
 //-- keeps running without a display.
 esp_err_t loggerBoardInit(void);
+
+//-- Turns the display 180 degrees through the component's rotation API so
+//-- enclosures that mount the board the other way round read the panel
+//-- correctly. False restores the assembled landscape orientation, true
+//-- flips it. The active view is immediately redrawn for the new geometry;
+//-- without a usable panel the call is a no-op.
+void loggerBoardSetRotation(bool upsideDown);
 
 //-- Shows the name of the screen the browser is currently on.
 void loggerBoardShowScreen(const char *screen);

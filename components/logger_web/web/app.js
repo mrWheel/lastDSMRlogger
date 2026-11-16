@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-15 · Build: 6
+// Date: 2026-11-15 · Build: 7
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -49,6 +49,7 @@ function bindElements()
   const ids = ["tabBar", "statusStrip", "settingsMessage", "settingsForm",
                "srcToggle", "srcLiveLabel", "srcTestLabel",
                "rxPolarityToggle", "polNormalLabel", "polInvertedLabel", "inpInterval",
+               "displayRotationToggle", "rotNormalLabel", "rotUpsideDownLabel",
                "selCountry", "selProfile", "selMbus1", "selMbus2", "selMbus3", "selMbus4",
                "saveSettings", "telegramState", "showTelegram", "telegramLog",
                "telegramDetail", "recordMeta", "recordNotes", "summaryTable", "rawView", "footerInfo",
@@ -372,6 +373,14 @@ function updatePolarityLabels()
   el.polInvertedLabel.classList.toggle("active", isInverted);
 }
 
+//-- Highlights the orientation end matching the display rotation switch.
+function updateRotationLabels()
+{
+  const isFlipped = el.displayRotationToggle.checked;
+  el.rotNormalLabel.classList.toggle("active", !isFlipped);
+  el.rotUpsideDownLabel.classList.toggle("active", isFlipped);
+}
+
 function renderSettings(message)
 {
   state.config = message;
@@ -402,6 +411,11 @@ function renderSettings(message)
   // reads the idle-high signal directly, inverted flips the receive line.
   el.rxPolarityToggle.checked = !!(settings && settings.rxInverted);
   updatePolarityLabels();
+
+  // The display rotation switch maps to the stored displayFlipped flag:
+  // normal is the assembled landscape, upside down turns it 180 degrees.
+  el.displayRotationToggle.checked = !!(settings && settings.displayFlipped);
+  updateRotationLabels();
 
   el.inpInterval.value = (settings && settings.intervalSeconds) ? String(settings.intervalSeconds) : "10";
 
@@ -467,9 +481,13 @@ function saveSettings(event)
   // affects live reception, the test generator opens no UART.
   const rxInverted = el.rxPolarityToggle.checked ? "1" : "0";
 
+  // The rotation switch position maps to the stored displayFlipped flag.
+  const displayFlipped = el.displayRotationToggle.checked ? "1" : "0";
+
   const body = "cmd=save" +
                "&rxGpio=" + encodeURIComponent(rxGpio) +
                "&rxInverted=" + rxInverted +
+               "&displayFlipped=" + displayFlipped +
                "&interval=" + encodeURIComponent(interval) +
                "&country=" + encodeURIComponent(el.selCountry.value) +
                "&profileId=" + encodeURIComponent(el.selProfile.value) +
@@ -710,6 +728,7 @@ function boot()
 
   el.srcToggle.addEventListener("change", updateSourceLabels);
   el.rxPolarityToggle.addEventListener("change", updatePolarityLabels);
+  el.displayRotationToggle.addEventListener("change", updateRotationLabels);
 
   // Show starts the live follow of every newly accepted telegram (the
   // button becomes Pause); Pause freezes the shown telegram again.

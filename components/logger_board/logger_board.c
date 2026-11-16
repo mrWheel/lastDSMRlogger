@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_board.c - on-device TFT debug lines and power panel
-//-- Date: 2026-11-15 · Build: 7
+//-- Date: 2026-11-15 · Build: 8
 //--
 //-- Everything is drawn through the documented API of the esp32_s3_piggyback
 //-- component: tft_ec11_init once, then filled rectangles and fixed-width
@@ -109,6 +109,12 @@ typedef enum
 } BoardMode;
 
 #define BOARD_INPUT_QUEUE_LEN 16u
+
+//-- Landscape rotations of the component: the assembled orientation is the
+//-- Kconfig default (3); rotation 1 is that same landscape turned 180
+//-- degrees, so the flip only swaps the vertical mirror.
+#define BOARD_ROTATION_NORMAL 3u
+#define BOARD_ROTATION_UPSIDE_DOWN 1u
 
 typedef struct
 {
@@ -626,6 +632,25 @@ esp_err_t loggerBoardInit(void)
 
   ESP_LOGI(tag, "debug lines ready on the board display");
   return ESP_OK;
+}
+
+void loggerBoardSetRotation(bool upsideDown)
+{
+  if (!board.available)
+  {
+    return;
+  }
+
+  xSemaphoreTake(board.mutex, portMAX_DELAY);
+  tft_ec11_set_rotation(upsideDown ? BOARD_ROTATION_UPSIDE_DOWN : BOARD_ROTATION_NORMAL);
+
+  //-- The panel geometry follows the width and height the component reports,
+  //-- so a full redraw lays the active view out for the new orientation.
+  tft_ec11_clear();
+  refreshAll();
+  xSemaphoreGive(board.mutex);
+
+  ESP_LOGI(tag, "display orientation: %s", upsideDown ? "upside down" : "normal");
 }
 
 void loggerBoardShowScreen(const char *screen)

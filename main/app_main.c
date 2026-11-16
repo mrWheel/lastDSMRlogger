@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: app_main.c - application entry
-//-- Date: 2026-11-14 · Build: 1
+//-- Date: 2026-11-15 · Build: 2
 //--
 //-- Boot order: the board debug lines come up first, then NVS, then the P1
 //-- receiver. Reception starts as soon as a valid configuration is stored and
@@ -134,6 +134,10 @@ void app_main(void)
 
   if (loggerSettingsLoad(&settings) == ESP_OK)
   {
+    //-- The panel orientation is part of the stored configuration: apply it
+    //-- before reception takes the screen over.
+    loggerBoardSetRotation(settings.displayFlipped);
+
     esp_err_t started = loggerReceiverStart(&settings);
 
     if (started != ESP_OK)

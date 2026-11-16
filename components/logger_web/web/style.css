@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-15 · Build: 6 */
+   Date: 2026-11-16 · Build: 7 */
 
 :root
 {
@@ -237,7 +237,8 @@ select:hover
 }
 
 #srcToggle,
-#rxPolarityToggle
+#rxPolarityToggle,
+#displayRotationToggle
 {
   position: absolute;
   opacity: 0;
@@ -273,19 +274,22 @@ select:hover
 }
 
 #srcToggle:checked + .switch,
-#rxPolarityToggle:checked + .switch
+#rxPolarityToggle:checked + .switch,
+#displayRotationToggle:checked + .switch
 {
   background: var(--accent);
 }
 
 #srcToggle:checked + .switch .switchKnob,
-#rxPolarityToggle:checked + .switch .switchKnob
+#rxPolarityToggle:checked + .switch .switchKnob,
+#displayRotationToggle:checked + .switch .switchKnob
 {
   transform: translateX(20px);
 }
 
 #srcToggle:focus-visible + .switch,
-#rxPolarityToggle:focus-visible + .switch
+#rxPolarityToggle:focus-visible + .switch,
+#displayRotationToggle:focus-visible + .switch
 {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
