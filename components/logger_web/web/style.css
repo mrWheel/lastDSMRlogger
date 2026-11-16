@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-16 · Build: 7 */
+   Date: 2026-11-16 · Build: 8 */
 
 :root
 {
@@ -87,6 +87,20 @@ header h1
   font-weight: 700;
   letter-spacing: -0.02em;
   margin: 0;
+}
+
+/* Program version above the device wall clock, stacked right aligned in the
+   header. Both are filled by the status push. */
+.headerInfo
+{
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--secondary);
+  white-space: nowrap;
 }
 
 /* iOS segmented control: built by app.js from the VIEWS registry, so any

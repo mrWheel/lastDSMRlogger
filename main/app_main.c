@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: app_main.c - application entry
-//-- Date: 2026-11-15 · Build: 2
+//-- Date: 2026-11-16 · Build: 3
 //--
 //-- Boot order: the board debug lines come up first, then NVS, then the P1
 //-- receiver. Reception starts as soon as a valid configuration is stored and
@@ -13,14 +13,17 @@
 
 //-- never remove or change this line,
 //-- it indicates the program version
-const char* PROG_VERSION = "v0.4.0";
+const char* PROG_VERSION = "v0.4.2";
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -41,9 +44,40 @@ static const char *tag = "appMain";
 
 static volatile bool wifiEverConnected = false;
 
+//-- Wall clock: SNTP sets the system clock once the station has joined. The
+//-- European time zone with the EU daylight-saving rules lets the SPA header
+//-- show the local date and time the way the user reads it.
+#define LOGGER_TIMEZONE "CET-1CEST,M3.5.0/2,M10.5.0/3"
+#define SNTP_SERVER "pool.ntp.org"
+
+static volatile bool sntpStarted = false;
+
+static void onSntpSynced(struct timeval *tv)
+{
+  (void)tv;
+  ESP_LOGI(tag, "clock synchronised via %s", SNTP_SERVER);
+}
+
 static void onWifiConnected(void)
 {
   wifiEverConnected = true;
+
+  //-- One start per boot is enough: the SNTP service keeps refreshing the
+  //-- system time on its own once it runs.
+  if (!sntpStarted)
+  {
+    sntpStarted = true;
+    setenv("TZ", LOGGER_TIMEZONE, 1);
+    tzset();
+
+    esp_sntp_config_t sntpConfig = ESP_NETIF_SNTP_DEFAULT_CONFIG(SNTP_SERVER);
+    sntpConfig.sync_cb = onSntpSynced;
+
+    if (esp_netif_sntp_init(&sntpConfig) != ESP_OK)
+    {
+      ESP_LOGW(tag, "SNTP could not start: the header clock stays unavailable");
+    }
+  }
 
   wifi_config_t stationConfig;
   memset(&stationConfig, 0, sizeof stationConfig);
@@ -123,7 +157,7 @@ static void initialiseNvs(void)
 
 void app_main(void)
 {
-  ESP_LOGI(tag, "lastDSMRlogger build 1 starting");
+  ESP_LOGI(tag, "lastDSMRlogger %s starting", PROG_VERSION);
 
   loggerBoardInit();
   loggerBoardShowScreen("boot");

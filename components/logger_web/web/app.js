@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-15 · Build: 7
+// Date: 2026-11-16 · Build: 8
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -47,6 +47,7 @@ const tabButtons = {};
 function bindElements()
 {
   const ids = ["tabBar", "statusStrip", "settingsMessage", "settingsForm",
+               "headerVersion", "headerClock",
                "srcToggle", "srcLiveLabel", "srcTestLabel",
                "rxPolarityToggle", "polNormalLabel", "polInvertedLabel", "inpInterval",
                "displayRotationToggle", "rotNormalLabel", "rotUpsideDownLabel",
@@ -294,6 +295,15 @@ function renderStatus(status)
   el.statusStrip.textContent = text;
   el.statusStrip.classList.toggle("error", status.state === "error");
   el.footerInfo.textContent = "lastDSMRlogger · first release · telegram history stays in RAM";
+
+  // The header carries the program version and the device wall clock from
+  // the status push; the clock stays empty until SNTP has set the time.
+  if (status.firmwareVersion)
+  {
+    el.headerVersion.textContent = status.firmwareVersion;
+  }
+
+  el.headerClock.textContent = status.deviceTime || "no time yet";
 }
 
 //-- --------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-15 · Build: 5
+//-- Date: 2026-11-16 · Build: 6
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status and telegram-list JSON and answers form-urlencoded commands
@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -34,6 +35,10 @@
 #include "logger_settings.h"
 
 static const char *tag = "loggerWeb";
+
+//-- The program version string is defined by the application entry
+//-- (main/app_main.c) and shown in the SPA header through the status JSON.
+extern const char *PROG_VERSION;
 
 //-- Embedded SPA assets (EMBED_TXTFILES in CMakeLists.txt).
 extern const char indexHtmlStart[] asm("_binary_index_html_start");
@@ -867,9 +872,25 @@ static void appendStatusJson(stringBuilder *sb, const loggerReceiverStatus *stat
   sbAppend(sb, ",\"lastError\":");
   sbAppendJsonString(sb, status->lastError);
 
-  //-- Wall clock time is unavailable in this release: the SPA shows receive
-  //-- age and uptime explicitly.
-  sbAppendFmt(sb, ",\"wallClock\":false}");
+  //-- Wall clock: the application's SNTP client sets the system clock after
+  //-- the station joins. Until the first sync the header shows the uptime
+  //-- instead, so the unavailability stays explicit.
+  time_t now = time(NULL);
+  bool wallClockAvailable = (now >= 1700000000);
+
+  char deviceTime[20] = "";
+  struct tm brokenTime;
+
+  if (wallClockAvailable && (localtime_r(&now, &brokenTime) != NULL))
+  {
+    strftime(deviceTime, sizeof deviceTime, "%d-%m-%Y %H:%M", &brokenTime);
+  }
+
+  sbAppend(sb, ",\"firmwareVersion\":");
+  sbAppendJsonString(sb, PROG_VERSION);
+  sbAppend(sb, ",\"deviceTime\":");
+  sbAppendJsonString(sb, deviceTime);
+  sbAppendFmt(sb, ",\"wallClock\":%s}", wallClockAvailable ? "true" : "false");
 }
 
 static void appendMetaJson(stringBuilder *sb, const loggerTelegramMeta *meta)
