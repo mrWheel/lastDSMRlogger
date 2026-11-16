@@ -11,6 +11,10 @@
 //-- captive portal owns port 80 during provisioning.
 //-- ==========================================================================
 
+//-- never remove or change this line,
+//-- it indicates the program version
+const char* PROG_VERSION = "v0.4.0";
+
 #include <stdio.h>
 #include <string.h>
 
