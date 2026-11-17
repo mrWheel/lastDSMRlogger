@@ -41,6 +41,7 @@
 #define LOGGER_SNAPSHOT_FIELDS_MAX 96
 
 #define LOGGER_SNAPSHOT_OBIS_MAX 16
+#define LOGGER_SNAPSHOT_NAME_MAX 24
 #define LOGGER_SNAPSHOT_VALUE_MAX 48
 #define LOGGER_SNAPSHOT_UNIT_MAX 12
 #define LOGGER_SNAPSHOT_TIMESTAMP_MAX 32
@@ -53,6 +54,11 @@
 typedef struct
 {
   char obis[LOGGER_SNAPSHOT_OBIS_MAX];
+
+  //-- Default display name of the code as published by the parser: the
+  //-- built-in name from the active profile field table.
+  char name[LOGGER_SNAPSHOT_NAME_MAX];
+
   char value[LOGGER_SNAPSHOT_VALUE_MAX];
   char unit[LOGGER_SNAPSHOT_UNIT_MAX];
   char timestamp[LOGGER_SNAPSHOT_TIMESTAMP_MAX];

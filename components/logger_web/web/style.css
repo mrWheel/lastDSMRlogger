@@ -500,6 +500,19 @@ tbody tr:last-child td
   border-bottom: none;
 }
 
+/* Decoded summary value column: measured numbers align right so the
+   digits of successive readings line up; text values and unavailable
+   readings stay left aligned. */
+td.valueNumeric
+{
+  text-align: right;
+}
+
+td.valueText
+{
+  text-align: left;
+}
+
 pre
 {
   background: var(--codeBg);

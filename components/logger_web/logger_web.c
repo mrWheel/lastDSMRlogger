@@ -1052,6 +1052,8 @@ static bool buildDetailFromRecord(const loggerTelegramRecord* record, void* user
 
     sbAppendFmt(sb, "%s{\"obis\":", (index > 0u) ? "," : "");
     sbAppendJsonString(sb, field->obis);
+    sbAppend(sb, ",\"name\":");
+    sbAppendJsonString(sb, field->name);
     sbAppend(sb, ",\"value\":");
     sbAppendJsonString(sb, field->value);
     sbAppend(sb, ",\"unit\":");

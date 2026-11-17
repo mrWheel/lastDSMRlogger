@@ -674,6 +674,7 @@ function renderDetail(detail)
     const row = document.createElement("tr");
     const cells = [
       field.obis,
+      field.name,
       // An empty value string marks an unavailable reading; a measured zero
       // keeps its own text and stays distinguishable.
       (field.value === "") ? "(unavailable)" : field.value,
@@ -682,10 +683,18 @@ function renderDetail(detail)
       (field.mbusChannel > 0) ? ("ch " + field.mbusChannel) : "",
     ];
 
-    cells.forEach((text) =>
+    cells.forEach((text, index) =>
     {
       const cell = document.createElement("td");
       cell.textContent = text;
+
+      // The value column (index 2): measured numbers align right so the
+      // digits line up, text values and unavailable readings align left.
+      if (index === 2)
+      {
+        cell.className = (field.value !== "" && !field.valueIsText) ? "valueNumeric" : "valueText";
+      }
+
       row.appendChild(cell);
     });
 
@@ -703,12 +712,18 @@ function renderDetail(detail)
     if (!readingChannels.has(channel))
     {
       const row = document.createElement("tr");
-      const cells = ["0-" + channel + ":24.2.1", "(unavailable)", "", "", "ch " + channel];
+      const cells = ["0-" + channel + ":24.2.1", "mbusRdng", "(unavailable)", "", "", "ch " + channel];
 
-      cells.forEach((text) =>
+      cells.forEach((text, index) =>
       {
         const cell = document.createElement("td");
         cell.textContent = text;
+
+        if (index === 2)
+        {
+          cell.className = "valueText";
+        }
+
         row.appendChild(cell);
       });
 

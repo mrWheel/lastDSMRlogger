@@ -584,6 +584,11 @@ static void copyFieldSnapshot(const dsmrTelegramField* field, loggerFieldSnapsho
 {
   memset(snapshot, 0, sizeof *snapshot);
   copyBounded(snapshot->obis, sizeof snapshot->obis, (field->obis != NULL) ? field->obis : "");
+
+  //-- The parser publishes the built-in default display name of the code
+  //-- (NULL when the profile table carries none for the code).
+  copyBounded(snapshot->name, sizeof snapshot->name, (field->name != NULL) ? field->name : "");
+
   copyBounded(snapshot->unit, sizeof snapshot->unit, (field->unit != NULL) ? field->unit : "");
   snapshot->mbusChannel = field->mbusChannel;
   snapshot->hasTimestamp = field->hasTimestamp;
