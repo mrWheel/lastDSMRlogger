@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-#-- Version Date: 05-11-2026 -- (dd-mm-eeyy)
+#-- Version Date: 17-11-2026 -- (dd-mm-eeyy)
 #
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ DEFAULT_PATHS = [
     ".codingRules.md",
     "createProjectStructure.py",
     "createProjectStructure.md",
+    "projectMetaData",
 ]
 
 

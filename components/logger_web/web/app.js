@@ -41,7 +41,7 @@ const VIEWS =
 [
   {id: "settings", label: "Settings", section: "viewSettings", command: "cmd=config"},
   {id: "telegrams", label: "Telegrams", section: "viewTelegrams", command: "cmd=telegrams"},
-  {id: "power", label: "Realtime", section: "viewPower", command: "cmd=power"},
+  {id: "power", label: "Phase Load", section: "viewPower", command: "cmd=power"},
 ];
 
 const el = {};
@@ -850,7 +850,7 @@ function renderPower(message)
     buildPowerRows();
   }
 
-  el.powerTelegram.textContent = "Telegram #" + message.sequence + (message.testMode ? " · test data" : "");
+  el.powerTelegram.textContent = message.testMode ? "test data" : "";
   el.powerScaleLabel.textContent = "Bar scale " + message.scale + " W · the same ladder the display uses";
   lastPowerScale = message.scale;
 

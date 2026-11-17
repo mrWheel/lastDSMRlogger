@@ -7,10 +7,12 @@
 #include "freertos/queue.h"
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
-#define TFT_EC11_RGB565(r,g,b) ((uint16_t)((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3)))
+#define TFT_EC11_RGB565(r, g, b)                                                                   \
+  ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
 #define TFT_EC11_BLACK 0x0000
 #define TFT_EC11_WHITE 0xFFFF
 #define TFT_EC11_RED 0xF800
@@ -20,41 +22,80 @@ extern "C" {
 #define TFT_EC11_MAGENTA 0xF81F
 #define TFT_EC11_YELLOW 0xFFE0
 
-typedef enum { TFT_EC11_PRESS_DOWN, TFT_EC11_PRESS_SHORT, TFT_EC11_PRESS_MEDIUM, TFT_EC11_PRESS_LONG } tft_ec11_press_t;
+  typedef enum
+  {
+    TFT_EC11_PRESS_DOWN,
+    TFT_EC11_PRESS_SHORT,
+    TFT_EC11_PRESS_MEDIUM,
+    TFT_EC11_PRESS_LONG
+  } tft_ec11_press_t;
 
-//-- Native bitmap font faces. Each face stores its own glyph bitmaps and is
-//-- drawn pixel-accurate at its own size; glyphs are never scaled or
-//-- interpolated. Cells include the 1 px inter-character gap:
-//-- SMALL  = 5x7 glyph, 6x8 cell   MEDIUM = 7x12 glyph, 8x12 cell
-//-- LARGE  = 8x16 glyph, 9x16 cell
-typedef enum { TFT_EC11_FONT_SMALL, TFT_EC11_FONT_MEDIUM, TFT_EC11_FONT_LARGE } tft_ec11_font_t;
-typedef enum { TFT_EC11_EVENT_ROTATE, TFT_EC11_EVENT_ENCODER_BUTTON, TFT_EC11_EVENT_AUX_BUTTON } tft_ec11_event_type_t;
-typedef struct { tft_ec11_event_type_t type; int32_t steps; tft_ec11_press_t press; uint32_t duration_ms; } tft_ec11_event_t;
-typedef struct { uint16_t background; uint16_t foreground; uint8_t font_scale; } tft_ec11_text_style_t;
+  //-- Native bitmap font faces. Prefer the TFT_EC11_FONT_<matrix> names, which
+  //-- are named after the character cell (the glyph bitmap is 1 px narrower
+  //-- than the cell: the extra column is the inter-character gap). Each face
+  //-- stores its own glyph bitmaps and is drawn pixel-accurate at its own
+  //-- size; glyphs are never scaled or interpolated.
+  //--   6x8    = 5x7 glyph     8x12   = 7x12 glyph    9x16   = 8x16 glyph
+  //--   13x24  = 12x24 glyph   17x32  = 16x32 glyph
+  //-- The legacy size names (and the long XLARGE/XXLARGE forms) are kept as
+  //-- aliases for the same values and must keep the original enum values for
+  //-- backwards compatibility.
+  typedef enum
+  {
+    TFT_EC11_FONT_6x8 = 0,
+    TFT_EC11_FONT_8x12 = 1,
+    TFT_EC11_FONT_9x16 = 2,
+    TFT_EC11_FONT_13x24 = 3,
+    TFT_EC11_FONT_17x32 = 4,
+    TFT_EC11_FONT_SMALL = TFT_EC11_FONT_6x8,
+    TFT_EC11_FONT_MEDIUM = TFT_EC11_FONT_8x12,
+    TFT_EC11_FONT_LARGE = TFT_EC11_FONT_9x16,
+    TFT_EC11_FONT_XLARGE = TFT_EC11_FONT_13x24,
+    TFT_EC11_FONT_XXLARGE = TFT_EC11_FONT_17x32
+  } tft_ec11_font_t;
+  typedef enum
+  {
+    TFT_EC11_EVENT_ROTATE,
+    TFT_EC11_EVENT_ENCODER_BUTTON,
+    TFT_EC11_EVENT_AUX_BUTTON
+  } tft_ec11_event_type_t;
+  typedef struct
+  {
+    tft_ec11_event_type_t type;
+    int32_t steps;
+    tft_ec11_press_t press;
+    uint32_t duration_ms;
+  } tft_ec11_event_t;
+  typedef struct
+  {
+    uint16_t background;
+    uint16_t foreground;
+    uint8_t font_scale;
+  } tft_ec11_text_style_t;
 
-esp_err_t tft_ec11_init(void);
-esp_err_t tft_ec11_deinit(void);
-esp_err_t tft_ec11_set_rotation(uint8_t rotation);
-esp_err_t tft_ec11_set_inversion(bool enabled);
-esp_err_t tft_ec11_set_backlight(bool enabled);
-uint16_t tft_ec11_width(void);
-uint16_t tft_ec11_height(void);
-void tft_ec11_set_background(uint16_t color);
-void tft_ec11_set_text_style(uint16_t foreground, uint8_t scale);
-tft_ec11_text_style_t tft_ec11_get_text_style(void);
-esp_err_t tft_ec11_clear(void);
-esp_err_t tft_ec11_refresh(const uint16_t *frame_rgb565);
-esp_err_t tft_ec11_fill_rect(int x, int y, int width, int height, uint16_t color);
-esp_err_t tft_ec11_draw_text_simple(int x, int y, const char *text);
-esp_err_t tft_ec11_draw_text_styled(int x, int y, const char *text, uint16_t background,
-									uint8_t font_scale, uint16_t foreground);
-esp_err_t tft_ec11_draw_text(int x, int y, size_t slot_chars, const char *text);
-esp_err_t tft_ec11_draw_text_font(int x, int y, const char *text, tft_ec11_font_t font,
-                                  uint16_t background, uint16_t foreground);
-esp_err_t tft_ec11_inputs_start(size_t queue_length);
-void tft_ec11_inputs_stop(void);
-QueueHandle_t tft_ec11_event_queue(void);
-bool tft_ec11_get_event(tft_ec11_event_t *event, TickType_t wait);
+  esp_err_t tft_ec11_init(void);
+  esp_err_t tft_ec11_deinit(void);
+  esp_err_t tft_ec11_set_rotation(uint8_t rotation);
+  esp_err_t tft_ec11_set_inversion(bool enabled);
+  esp_err_t tft_ec11_set_backlight(bool enabled);
+  uint16_t tft_ec11_width(void);
+  uint16_t tft_ec11_height(void);
+  void tft_ec11_set_background(uint16_t color);
+  void tft_ec11_set_text_style(uint16_t foreground, uint8_t scale);
+  tft_ec11_text_style_t tft_ec11_get_text_style(void);
+  esp_err_t tft_ec11_clear(void);
+  esp_err_t tft_ec11_refresh(const uint16_t* frame_rgb565);
+  esp_err_t tft_ec11_fill_rect(int x, int y, int width, int height, uint16_t color);
+  esp_err_t tft_ec11_draw_text_simple(int x, int y, const char* text);
+  esp_err_t tft_ec11_draw_text_styled(int x, int y, const char* text, uint16_t background,
+                                      uint8_t font_scale, uint16_t foreground);
+  esp_err_t tft_ec11_draw_text(int x, int y, size_t slot_chars, const char* text);
+  esp_err_t tft_ec11_draw_text_font(int x, int y, const char* text, tft_ec11_font_t font,
+                                    uint16_t background, uint16_t foreground);
+  esp_err_t tft_ec11_inputs_start(size_t queue_length);
+  void tft_ec11_inputs_stop(void);
+  QueueHandle_t tft_ec11_event_queue(void);
+  bool tft_ec11_get_event(tft_ec11_event_t* event, TickType_t wait);
 
 #ifdef __cplusplus
 }

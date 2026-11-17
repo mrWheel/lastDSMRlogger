@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_board.h - on-device TFT debug lines and power panel
-//-- Date: 2026-11-17 · Build: 12
+//-- Date: 2026-11-17 · Build: 13
 //--
 //-- The first release has no on-device user interface. The TFT shows debug
 //-- lines describing what the device is doing: the active browser screen
@@ -100,14 +100,16 @@ extern const uint16_t loggerPowerScales[LOGGER_POWER_SCALE_COUNT];
 uint16_t loggerBoardPickPowerScale(const loggerPowerSnapshot* snapshot);
 
 //-- Clears the screen and takes it over completely with the power panel:
-//-- a white name bar ("TELEGRAM nnn" left aligned) with a sub band below
-//-- it (meter date/time "DD-MM-YYYY HH:MM" right aligned), then a row per
-//-- phase plus Totaal, each with a header band (phase current and voltage
-//-- larger than the centred phase label), a centre-zero watt bar carrying
+//-- every screen starts with one white header row (black screen name left
+//-- aligned, meter date/time "DD-MM-YYYY HH:MM" right aligned on the
+//-- PHASE LOAD panel, the selected phase on the PER FASE screen) and ends
+//-- with a white status row carrying variable status text. The PHASE LOAD
+//-- panel shows a row per phase plus Totaal, each with a header band
+//-- (phase current left, phase label centred and voltage right, all in
+//-- the medium native face), a half-height centre-zero watt bar carrying
 //-- its integer scale labels inside the bar and whose scale follows the
 //-- largest absolute watt on the smallest of the steps
-//-- 3800/3100/2400/1700/1000/500/250/100 W, and the watt value. Panel text uses
-//-- the component's 5 by 7 font stretched to a per-text cell size. No
+//-- 3800/3100/2400/1700/1000/500/250/100 W, and the watt value. No
 //-- debug lines are drawn while the panel is active, and new telegrams
 //-- only refresh this view while an AUX view is open.
 void loggerBoardShowPower(const loggerPowerSnapshot* snapshot);
@@ -117,8 +119,9 @@ void loggerBoardShowPower(const loggerPowerSnapshot* snapshot);
 //-- --------------------------------------------------------------------------
 //-- A short AUX press from the graphics panel opens the per-phase screen
 //-- (net watts of the selected phase as a large centred number with a
-//-- smaller unit, the voltage left and the current right on one smaller
-//-- row below it and a centre-zero bar on the panel scale; the encoder
+//-- smaller unit, the current left and the voltage right on one smaller
+//-- row below it and a centre-zero bar tight under that row on the panel
+//-- scale; the encoder
 //-- cycles Fase 1 -> Fase 2 -> Fase 3 -> Totaal and back); a medium-long
 //-- press replaces the bars with the system information view. A short
 //-- press returns to the graphics panel.
