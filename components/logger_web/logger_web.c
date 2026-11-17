@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-16 · Build: 8
+//-- Date: 2026-11-17 · Build: 9
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -35,11 +35,11 @@
 #include "logger_receiver.h"
 #include "logger_settings.h"
 
-static const char *tag = "loggerWeb";
+static const char* tag = "loggerWeb";
 
 //-- The program version string is defined by the application entry
 //-- (main/app_main.c) and shown in the SPA header through the status JSON.
-extern const char *PROG_VERSION;
+extern const char* PROG_VERSION;
 
 //-- Embedded SPA assets (EMBED_TXTFILES in CMakeLists.txt).
 extern const char indexHtmlStart[] asm("_binary_index_html_start");
@@ -53,7 +53,9 @@ extern const char styleCssEnd[] asm("_binary_style_css_end");
 #define WEB_STATUS_JSON_BYTES 1024
 #define WEB_LIST_JSON_BYTES 2048
 #define WEB_CONFIG_JSON_BYTES 4096
-#define WEB_POWER_JSON_BYTES 768
+//-- The power JSON also carries the bar history of the newest 90 accepted
+//-- total watts, so it is sized for the frame plus that array.
+#define WEB_POWER_JSON_BYTES 2048
 #define WEB_DETAIL_JSON_BYTES (24u * 1024u)
 
 //-- --------------------------------------------------------------------------
@@ -134,7 +136,8 @@ static void wsClientAdd(int fd)
 
   if (!known)
   {
-    ESP_LOGI(tag, "websocket client %d %s", fd, stored ? "connected" : "rejected: client limit reached");
+    ESP_LOGI(tag, "websocket client %d %s", fd,
+             stored ? "connected" : "rejected: client limit reached");
   }
 }
 
@@ -185,7 +188,7 @@ static bool wsClientCount(void)
 
 //-- Sends one text frame to a single client from outside a request. A client
 //-- that cannot be reached is dropped from the table.
-static void wsSendToClient(int fd, const char *text)
+static void wsSendToClient(int fd, const char* text)
 {
   if ((server == NULL) || (fd < 0))
   {
@@ -201,7 +204,7 @@ static void wsSendToClient(int fd, const char *text)
   httpd_ws_frame_t frame;
   memset(&frame, 0, sizeof frame);
   frame.type = HTTPD_WS_TYPE_TEXT;
-  frame.payload = (uint8_t *)(uintptr_t)text;
+  frame.payload = (uint8_t*)(uintptr_t)text;
   frame.len = strlen(text);
 
   if (httpd_ws_send_frame_async(server, fd, &frame) != ESP_OK)
@@ -210,7 +213,7 @@ static void wsSendToClient(int fd, const char *text)
   }
 }
 
-static void wsSendToAll(const char *text)
+static void wsSendToAll(const char* text)
 {
   int targets[WS_MAX_CLIENTS];
 
@@ -226,19 +229,19 @@ static void wsSendToAll(const char *text)
   for (uint8_t index = 0u; index < WS_MAX_CLIENTS; index++)
   {
     if (targets[index] != -1)
-  {
+    {
       wsSendToClient(targets[index], text);
     }
   }
 }
 
 //-- Sends one text frame back on the request that received the command.
-static esp_err_t wsSendReply(httpd_req_t *req, const char *text)
+static esp_err_t wsSendReply(httpd_req_t* req, const char* text)
 {
   httpd_ws_frame_t frame;
   memset(&frame, 0, sizeof frame);
   frame.type = HTTPD_WS_TYPE_TEXT;
-  frame.payload = (uint8_t *)(uintptr_t)text;
+  frame.payload = (uint8_t*)(uintptr_t)text;
   frame.len = strlen(text);
   return httpd_ws_send_frame(req, &frame);
 }
@@ -249,13 +252,13 @@ static esp_err_t wsSendReply(httpd_req_t *req, const char *text)
 
 typedef struct
 {
-  char *buffer;
+  char* buffer;
   size_t capacity;
   size_t length;
   bool overflow;
 } stringBuilder;
 
-static void sbInit(stringBuilder *sb, char *buffer, size_t capacity)
+static void sbInit(stringBuilder* sb, char* buffer, size_t capacity)
 {
   sb->buffer = buffer;
   sb->capacity = capacity;
@@ -264,7 +267,7 @@ static void sbInit(stringBuilder *sb, char *buffer, size_t capacity)
   buffer[0] = '\0';
 }
 
-static void sbAppend(stringBuilder *sb, const char *text)
+static void sbAppend(stringBuilder* sb, const char* text)
 {
   if (sb->overflow || (sb->length >= sb->capacity))
   {
@@ -284,7 +287,7 @@ static void sbAppend(stringBuilder *sb, const char *text)
   sb->length += (size_t)written;
 }
 
-static void sbAppendFmt(stringBuilder *sb, const char *format, ...)
+static void sbAppendFmt(stringBuilder* sb, const char* format, ...)
 {
   if (sb->overflow || (sb->length >= sb->capacity))
   {
@@ -308,11 +311,11 @@ static void sbAppendFmt(stringBuilder *sb, const char *format, ...)
 }
 
 //-- Appends a JSON string token with quotes, escaping per RFC 8259.
-static void sbAppendJsonString(stringBuilder *sb, const char *value)
+static void sbAppendJsonString(stringBuilder* sb, const char* value)
 {
   sbAppend(sb, "\"");
 
-  for (const char *cursor = value; *cursor != '\0'; cursor++)
+  for (const char* cursor = value; *cursor != '\0'; cursor++)
   {
     char character = *cursor;
 
@@ -334,13 +337,13 @@ static void sbAppendJsonString(stringBuilder *sb, const char *value)
   sbAppend(sb, "\"");
 }
 
-static esp_err_t sendJson(httpd_req_t *req, const char *json)
+static esp_err_t sendJson(httpd_req_t* req, const char* json)
 {
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
 }
 
-static esp_err_t sendError(httpd_req_t *req, httpd_err_code_t code, const char *message)
+static esp_err_t sendError(httpd_req_t* req, httpd_err_code_t code, const char* message)
 {
   char buffer[160];
   snprintf(buffer, sizeof buffer, "{\"ok\":false,\"error\":\"%s\"}", message);
@@ -348,7 +351,8 @@ static esp_err_t sendError(httpd_req_t *req, httpd_err_code_t code, const char *
   return sendJson(req, buffer);
 }
 
-static esp_err_t sendAsset(httpd_req_t *req, const char *start, const char *end, const char *contentType)
+static esp_err_t sendAsset(httpd_req_t* req, const char* start, const char* end,
+                           const char* contentType)
 {
   //-- EMBED_TXTFILES appends a terminating NUL after the file bytes: never
   //-- send it. A trailing NUL makes browsers reject the JavaScript with a
@@ -370,7 +374,7 @@ static esp_err_t sendAsset(httpd_req_t *req, const char *start, const char *end,
 //-- Form body parsing (browser to device updates)
 //-- --------------------------------------------------------------------------
 
-static int readBody(httpd_req_t *req, char *buffer, size_t bufferSize)
+static int readBody(httpd_req_t* req, char* buffer, size_t bufferSize)
 {
   int length = httpd_req_recv(req, buffer, bufferSize - 1u);
 
@@ -383,7 +387,7 @@ static int readBody(httpd_req_t *req, char *buffer, size_t bufferSize)
   return length;
 }
 
-static bool hexDigit(char character, unsigned *out)
+static bool hexDigit(char character, unsigned* out)
 {
   if ((character >= '0') && (character <= '9'))
   {
@@ -407,7 +411,7 @@ static bool hexDigit(char character, unsigned *out)
 }
 
 //-- Decodes an application/x-www-form-urlencoded token.
-static void urlDecode(const char *source, char *out, size_t outSize)
+static void urlDecode(const char* source, char* out, size_t outSize)
 {
   size_t position = 0u;
 
@@ -418,7 +422,8 @@ static void urlDecode(const char *source, char *out, size_t outSize)
       out[position++] = ' ';
       source++;
     }
-    else if ((*source == '%') && isxdigit((unsigned char)source[1]) && isxdigit((unsigned char)source[2]))
+    else if ((*source == '%') && isxdigit((unsigned char)source[1]) &&
+             isxdigit((unsigned char)source[2]))
     {
       unsigned high = 0u;
       unsigned low = 0u;
@@ -448,18 +453,19 @@ static void urlDecode(const char *source, char *out, size_t outSize)
 
 //-- Copies and decodes the value of key from the form body. False when the
 //-- key is absent.
-static bool formGet(const char *body, const char *key, char *out, size_t outSize)
+static bool formGet(const char* body, const char* key, char* out, size_t outSize)
 {
   size_t keyLength = strlen(key);
-  const char *cursor = body;
+  const char* cursor = body;
 
   while (cursor != NULL)
   {
     if ((strncmp(cursor, key, keyLength) == 0) && (cursor[keyLength] == '='))
     {
-      const char *valueStart = cursor + keyLength + 1u;
-      const char *valueEnd = strchr(valueStart, '&');
-      size_t valueLength = (valueEnd != NULL) ? (size_t)(valueEnd - valueStart) : strlen(valueStart);
+      const char* valueStart = cursor + keyLength + 1u;
+      const char* valueEnd = strchr(valueStart, '&');
+      size_t valueLength =
+          (valueEnd != NULL) ? (size_t)(valueEnd - valueStart) : strlen(valueStart);
 
       char raw[WEB_BODY_MAX];
 
@@ -485,34 +491,40 @@ static bool formGet(const char *body, const char *key, char *out, size_t outSize
 //-- Settings JSON
 //-- --------------------------------------------------------------------------
 
-static const char *mbusTypeToString(dsmrMbusDeviceType type)
+static const char* mbusTypeToString(dsmrMbusDeviceType type)
 {
   switch (type)
   {
-    case DSMR_MBUS_DEVICE_GAS: return "gas";
-    case DSMR_MBUS_DEVICE_WATER: return "water";
-    case DSMR_MBUS_DEVICE_HEAT: return "heat";
-    case DSMR_MBUS_DEVICE_COOLING: return "cooling";
-    case DSMR_MBUS_DEVICE_ELECTRICITY: return "electricity";
-    case DSMR_MBUS_DEVICE_OTHER: return "other";
-    default: return "other";
+  case DSMR_MBUS_DEVICE_GAS:
+    return "gas";
+  case DSMR_MBUS_DEVICE_WATER:
+    return "water";
+  case DSMR_MBUS_DEVICE_HEAT:
+    return "heat";
+  case DSMR_MBUS_DEVICE_COOLING:
+    return "cooling";
+  case DSMR_MBUS_DEVICE_ELECTRICITY:
+    return "electricity";
+  case DSMR_MBUS_DEVICE_OTHER:
+    return "other";
+  default:
+    return "other";
   }
 }
 
-static bool mbusTypeFromString(const char *text, dsmrMbusDeviceType *out)
+static bool mbusTypeFromString(const char* text, dsmrMbusDeviceType* out)
 {
   struct
   {
-    const char *name;
+    const char* name;
     dsmrMbusDeviceType type;
-  } types[] =
-  {
-    {"gas", DSMR_MBUS_DEVICE_GAS},
-    {"water", DSMR_MBUS_DEVICE_WATER},
-    {"heat", DSMR_MBUS_DEVICE_HEAT},
-    {"cooling", DSMR_MBUS_DEVICE_COOLING},
-    {"electricity", DSMR_MBUS_DEVICE_ELECTRICITY},
-    {"other", DSMR_MBUS_DEVICE_OTHER},
+  } types[] = {
+      {"gas", DSMR_MBUS_DEVICE_GAS},
+      {"water", DSMR_MBUS_DEVICE_WATER},
+      {"heat", DSMR_MBUS_DEVICE_HEAT},
+      {"cooling", DSMR_MBUS_DEVICE_COOLING},
+      {"electricity", DSMR_MBUS_DEVICE_ELECTRICITY},
+      {"other", DSMR_MBUS_DEVICE_OTHER},
   };
 
   for (size_t index = 0; index < sizeof types / sizeof types[0]; index++)
@@ -527,9 +539,10 @@ static bool mbusTypeFromString(const char *text, dsmrMbusDeviceType *out)
   return false;
 }
 
-static void appendSettingsJson(stringBuilder *sb, const loggerSettingsConfig *config)
+static void appendSettingsJson(stringBuilder* sb, const loggerSettingsConfig* config)
 {
-  sbAppendFmt(sb, "{\"rxGpio\":%d,\"intervalSeconds\":%" PRIu32 ",\"country\":", config->rxGpio, config->intervalSeconds);
+  sbAppendFmt(sb, "{\"rxGpio\":%d,\"intervalSeconds\":%" PRIu32 ",\"country\":", config->rxGpio,
+              config->intervalSeconds);
   sbAppendJsonString(sb, config->countryCode);
   sbAppend(sb, ",\"profileId\":");
   sbAppendJsonString(sb, config->profileId);
@@ -581,7 +594,7 @@ static void appendSettingsJson(stringBuilder *sb, const loggerSettingsConfig *co
 //-- configuration currently stored in NVS; the receiver's active
 //-- configuration is the fallback when NVS cannot be read back, and both
 //-- presence flags are reported so the SPA can word its message correctly.
-static void appendConfigJson(stringBuilder *sb)
+static void appendConfigJson(stringBuilder* sb)
 {
   loggerSettingsConfig stored;
   bool hasStored = (loggerSettingsLoad(&stored) == ESP_OK);
@@ -589,7 +602,7 @@ static void appendConfigJson(stringBuilder *sb)
   loggerSettingsConfig active;
   bool hasActive = loggerReceiverGetActiveConfig(&active);
 
-  loggerSettingsConfig *settings;
+  loggerSettingsConfig* settings;
 
   if (hasStored)
   {
@@ -657,7 +670,8 @@ static void appendConfigJson(stringBuilder *sb)
       continue;
     }
 
-    snprintf(knownCountries[knownCountryCount], LOGGER_SETTINGS_COUNTRY_MAX, "%s", info.countryCode);
+    snprintf(knownCountries[knownCountryCount], LOGGER_SETTINGS_COUNTRY_MAX, "%s",
+             info.countryCode);
     knownCountryCount++;
 
     sbAppendFmt(sb, "%s", firstCountry ? "" : ",");
@@ -676,7 +690,7 @@ static void appendConfigJson(stringBuilder *sb)
       continue;
     }
 
-    const dsmrProfile *profile = dsmrProfileLookup(info.profileId);
+    const dsmrProfile* profile = dsmrProfileLookup(info.profileId);
 
     sbAppendFmt(sb, "%s{\"id\":", (index > 0u) ? "," : "");
     sbAppendJsonString(sb, info.profileId);
@@ -691,7 +705,8 @@ static void appendConfigJson(stringBuilder *sb)
     {
       bool firstVersion = true;
 
-      for (uint8_t versionIndex = 0; profile->acceptedVersions[versionIndex] != NULL; versionIndex++)
+      for (uint8_t versionIndex = 0; profile->acceptedVersions[versionIndex] != NULL;
+           versionIndex++)
       {
         sbAppendFmt(sb, "%s", firstVersion ? "" : ",");
         firstVersion = false;
@@ -702,14 +717,15 @@ static void appendConfigJson(stringBuilder *sb)
     sbAppend(sb, "]}");
   }
 
-  sbAppend(sb, "],\"mbusTypes\":[\"gas\",\"water\",\"heat\",\"cooling\",\"electricity\",\"other\"]}}");
+  sbAppend(sb,
+           "],\"mbusTypes\":[\"gas\",\"water\",\"heat\",\"cooling\",\"electricity\",\"other\"]}}");
 }
 
 //-- Applies and persists a complete configuration from a form-urlencoded
 //-- body. Used by the HTTP POST and by cmd=save on the WebSocket so both
 //-- paths validate and roll back identically. NULL on success, otherwise the
 //-- failure reason for the SPA.
-static const char *applySettingsFromForm(const char *body)
+static const char* applySettingsFromForm(const char* body)
 {
   char text[64];
   loggerSettingsConfig candidate;
@@ -839,8 +855,10 @@ static const char *applySettingsFromForm(const char *body)
   //-- only now, after activation and persistence both succeeded.
   loggerBoardSetRotation(candidate.displayFlipped);
 
-  ESP_LOGI(tag, "configuration applied and stored: gpio %d, profile %s, rx polarity %s, tx polarity %s, display %s", candidate.rxGpio,
-           candidate.profileId, candidate.rxInverted ? "inverted" : "normal",
+  ESP_LOGI(tag,
+           "configuration applied and stored: gpio %d, profile %s, rx polarity %s, tx polarity %s, "
+           "display %s",
+           candidate.rxGpio, candidate.profileId, candidate.rxInverted ? "inverted" : "normal",
            candidate.txInverted ? "inverted" : "normal",
            candidate.displayFlipped ? "upside down" : "normal");
   return NULL;
@@ -850,27 +868,34 @@ static const char *applySettingsFromForm(const char *body)
 //-- Status, list, detail and raw JSON builders
 //-- --------------------------------------------------------------------------
 
-static const char *stateName(loggerReceiverState state)
+static const char* stateName(loggerReceiverState state)
 {
   switch (state)
   {
-    case LOGGER_RECEIVER_AWAITING_CONFIGURATION: return "awaitingConfiguration";
-    case LOGGER_RECEIVER_AWAITING_DATA: return "awaitingData";
-    case LOGGER_RECEIVER_OK: return "ok";
-    case LOGGER_RECEIVER_STALE: return "stale";
-    case LOGGER_RECEIVER_ERROR: return "error";
-    default: return "unknown";
+  case LOGGER_RECEIVER_AWAITING_CONFIGURATION:
+    return "awaitingConfiguration";
+  case LOGGER_RECEIVER_AWAITING_DATA:
+    return "awaitingData";
+  case LOGGER_RECEIVER_OK:
+    return "ok";
+  case LOGGER_RECEIVER_STALE:
+    return "stale";
+  case LOGGER_RECEIVER_ERROR:
+    return "error";
+  default:
+    return "unknown";
   }
 }
 
-static void appendStatusJson(stringBuilder *sb, const loggerReceiverStatus *status)
+static void appendStatusJson(stringBuilder* sb, const loggerReceiverStatus* status)
 {
   sbAppend(sb, "{\"type\":\"status\",\"state\":");
   sbAppendJsonString(sb, stateName(status->state));
   sbAppendFmt(sb, ",\"receiverRunning\":%s", status->receiverRunning ? "true" : "false");
   sbAppendFmt(sb, ",\"rxGpio\":%d", status->rxGpio);
   sbAppend(sb, ",\"testMode\":");
-  sbAppend(sb, (loggerSettingsIsTestGpio(status->rxGpio) && status->receiverRunning) ? "true" : "false");
+  sbAppend(sb, (loggerSettingsIsTestGpio(status->rxGpio) && status->receiverRunning) ? "true"
+                                                                                     : "false");
   sbAppendFmt(sb, ",\"intervalSeconds\":%" PRIu32, status->intervalSeconds);
   sbAppend(sb, ",\"activeProfileId\":");
   sbAppendJsonString(sb, status->activeProfileId);
@@ -909,7 +934,7 @@ static void appendStatusJson(stringBuilder *sb, const loggerReceiverStatus *stat
   sbAppendFmt(sb, ",\"wallClock\":%s}", wallClockAvailable ? "true" : "false");
 }
 
-static void appendMetaJson(stringBuilder *sb, const loggerTelegramMeta *meta)
+static void appendMetaJson(stringBuilder* sb, const loggerTelegramMeta* meta)
 {
   sbAppendFmt(sb, "{\"sequence\":%" PRIu32, meta->sequence);
   sbAppendFmt(sb, ",\"receivedUptimeMs\":%" PRIu32, meta->receivedUptimeMs);
@@ -930,7 +955,7 @@ static void appendMetaJson(stringBuilder *sb, const loggerTelegramMeta *meta)
   sbAppend(sb, "}");
 }
 
-static void appendTelegramListJson(stringBuilder *sb)
+static void appendTelegramListJson(stringBuilder* sb)
 {
   loggerTelegramMeta list[LOGGER_HISTORY_CAPACITY];
   uint16_t count = loggerReceiverListRecords(list, LOGGER_HISTORY_CAPACITY);
@@ -950,8 +975,11 @@ static void appendTelegramListJson(stringBuilder *sb)
 //-- values of the three phases and the total of the most recently accepted
 //-- telegram — the same frame the TFT panel draws. The scale is the panel's
 //-- ladder step (loggerBoardPickPowerScale), so both presentations scale
-//-- identically. valid stays false until the first accepted telegram.
-static void appendPowerJson(stringBuilder *sb)
+//-- identically. The history array carries the newest retained total watts
+//-- (one sample per accepted telegram, oldest first) so the bar history of
+//-- the SPA follows the device, not just what one browser happened to see.
+//-- valid stays false until the first accepted telegram.
+static void appendPowerJson(stringBuilder* sb)
 {
   loggerPowerSnapshot snapshot;
   uint32_t capturedUptimeMs = 0u;
@@ -985,22 +1013,34 @@ static void appendPowerJson(stringBuilder *sb)
                 snapshot.phaseWatts[phase], snapshot.phaseAmps[phase], snapshot.phaseVolts[phase]);
   }
 
-  sbAppendFmt(sb, "],\"total\":{\"watts\":%.1f,\"amps\":%.3f,\"volts\":%.1f}",
-              snapshot.totalWatts, snapshot.totalAmps, snapshot.totalVolts);
+  sbAppendFmt(sb, "],\"total\":{\"watts\":%.1f,\"amps\":%.3f,\"volts\":%.1f}", snapshot.totalWatts,
+              snapshot.totalAmps, snapshot.totalVolts);
 
   sbAppend(sb, ",\"country\":");
   sbAppendJsonString(sb, snapshot.countryCode);
   sbAppend(sb, ",\"profileId\":");
   sbAppendJsonString(sb, snapshot.profileId);
-  sbAppendFmt(sb, ",\"intervalSeconds\":%" PRIu32 "}", status.intervalSeconds);
+  sbAppendFmt(sb, ",\"intervalSeconds\":%" PRIu32, status.intervalSeconds);
+
+  float history[LOGGER_POWER_HISTORY_CAPACITY];
+  uint16_t historyCount = loggerReceiverGetPowerHistory(history, LOGGER_POWER_HISTORY_CAPACITY);
+
+  sbAppend(sb, ",\"history\":[");
+
+  for (uint16_t index = 0u; index < historyCount; index++)
+  {
+    sbAppendFmt(sb, "%s%.1f", (index > 0u) ? "," : "", (double)history[index]);
+  }
+
+  sbAppend(sb, "]}");
 }
 
 //-- Callback of appendTelegramDetailJson: renders one retained record in
 //-- place while the receive-side lock is held. Memory only: no network and
 //-- no blocking, as required by the inspect contract.
-static bool buildDetailFromRecord(const loggerTelegramRecord *record, void *userData)
+static bool buildDetailFromRecord(const loggerTelegramRecord* record, void* userData)
 {
-  stringBuilder *sb = (stringBuilder *)userData;
+  stringBuilder* sb = (stringBuilder*)userData;
 
   sbAppend(sb, "{\"type\":\"telegram\",\"meta\":");
   appendMetaJson(sb, &record->meta);
@@ -1008,7 +1048,7 @@ static bool buildDetailFromRecord(const loggerTelegramRecord *record, void *user
 
   for (uint16_t index = 0u; index < record->meta.fieldCount; index++)
   {
-    const loggerFieldSnapshot *field = &record->fields[index];
+    const loggerFieldSnapshot* field = &record->fields[index];
 
     sbAppendFmt(sb, "%s{\"obis\":", (index > 0u) ? "," : "");
     sbAppendJsonString(sb, field->obis);
@@ -1033,7 +1073,7 @@ static bool buildDetailFromRecord(const loggerTelegramRecord *record, void *user
 //-- rendered straight from the retained slot: copying the 23 KB record to
 //-- the heap next to the JSON buffer exhausted the free heap on this build
 //-- and made every detail request fail over as "aged out".
-static bool appendTelegramDetailJson(stringBuilder *sb, uint32_t sequence)
+static bool appendTelegramDetailJson(stringBuilder* sb, uint32_t sequence)
 {
   return loggerReceiverInspectRecord(sequence, buildDetailFromRecord, sb);
 }
@@ -1042,22 +1082,22 @@ static bool appendTelegramDetailJson(stringBuilder *sb, uint32_t sequence)
 //-- SPA asset handlers
 //-- --------------------------------------------------------------------------
 
-static esp_err_t handleRoot(httpd_req_t *req)
+static esp_err_t handleRoot(httpd_req_t* req)
 {
   return sendAsset(req, indexHtmlStart, indexHtmlEnd, "text/html; charset=utf-8");
 }
 
-static esp_err_t handleAppJs(httpd_req_t *req)
+static esp_err_t handleAppJs(httpd_req_t* req)
 {
   return sendAsset(req, appJsStart, appJsEnd, "application/javascript; charset=utf-8");
 }
 
-static esp_err_t handleStyleCss(httpd_req_t *req)
+static esp_err_t handleStyleCss(httpd_req_t* req)
 {
   return sendAsset(req, styleCssStart, styleCssEnd, "text/css; charset=utf-8");
 }
 
-static esp_err_t handleFavicon(httpd_req_t *req)
+static esp_err_t handleFavicon(httpd_req_t* req)
 {
   httpd_resp_set_status(req, "204 No Content");
   return httpd_resp_send(req, NULL, 0);
@@ -1067,9 +1107,9 @@ static esp_err_t handleFavicon(httpd_req_t *req)
 //-- API handlers
 //-- --------------------------------------------------------------------------
 
-static esp_err_t handleConfigGet(httpd_req_t *req)
+static esp_err_t handleConfigGet(httpd_req_t* req)
 {
-  char *buffer = malloc(WEB_CONFIG_JSON_BYTES);
+  char* buffer = malloc(WEB_CONFIG_JSON_BYTES);
 
   if (buffer == NULL)
   {
@@ -1090,7 +1130,7 @@ static esp_err_t handleConfigGet(httpd_req_t *req)
   return result;
 }
 
-static esp_err_t handleConfigSave(httpd_req_t *req)
+static esp_err_t handleConfigSave(httpd_req_t* req)
 {
   char body[WEB_BODY_MAX];
 
@@ -1099,7 +1139,7 @@ static esp_err_t handleConfigSave(httpd_req_t *req)
     return sendError(req, 400, "cannot read body");
   }
 
-  const char *failure = applySettingsFromForm(body);
+  const char* failure = applySettingsFromForm(body);
 
   if (failure != NULL)
   {
@@ -1109,7 +1149,7 @@ static esp_err_t handleConfigSave(httpd_req_t *req)
   return sendJson(req, "{\"ok\":true}");
 }
 
-static esp_err_t handleStatusGet(httpd_req_t *req)
+static esp_err_t handleStatusGet(httpd_req_t* req)
 {
   loggerReceiverStatus status;
   loggerReceiverGetStatus(&status);
@@ -1122,7 +1162,7 @@ static esp_err_t handleStatusGet(httpd_req_t *req)
   return sendJson(req, buffer);
 }
 
-static esp_err_t handleTelegramsGet(httpd_req_t *req)
+static esp_err_t handleTelegramsGet(httpd_req_t* req)
 {
   char buffer[WEB_LIST_JSON_BYTES];
   stringBuilder sb;
@@ -1137,15 +1177,15 @@ static esp_err_t handleTelegramsGet(httpd_req_t *req)
   return sendJson(req, buffer);
 }
 
-static esp_err_t handleTelegramGet(httpd_req_t *req)
+static esp_err_t handleTelegramGet(httpd_req_t* req)
 {
   //-- The wildcard URI is either /api/telegram/<seq> or /api/telegram/<seq>/raw.
-  const char *argument = req->uri + strlen("/api/telegram/");
+  const char* argument = req->uri + strlen("/api/telegram/");
   bool rawRequest = (strstr(argument, "/raw") != NULL);
   char sequenceText[16];
   snprintf(sequenceText, sizeof sequenceText, "%s", argument);
 
-  for (char *cursor = sequenceText; *cursor != '\0'; cursor++)
+  for (char* cursor = sequenceText; *cursor != '\0'; cursor++)
   {
     if (*cursor == '/')
     {
@@ -1158,7 +1198,7 @@ static esp_err_t handleTelegramGet(httpd_req_t *req)
 
   if (rawRequest)
   {
-    loggerTelegramRecord *record = malloc(sizeof *record);
+    loggerTelegramRecord* record = malloc(sizeof *record);
 
     if (record == NULL)
     {
@@ -1177,12 +1217,13 @@ static esp_err_t handleTelegramGet(httpd_req_t *req)
     //-- Exact bytes of the accepted frame: original line endings and trailer
     //-- preserved, served as plain text so nothing is interpreted as HTML.
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
-    esp_err_t result = httpd_resp_send(req, (const char *)record->rawBytes, (int)record->meta.rawLength);
+    esp_err_t result =
+        httpd_resp_send(req, (const char*)record->rawBytes, (int)record->meta.rawLength);
     free(record);
     return result;
   }
 
-  char *json = malloc(WEB_DETAIL_JSON_BYTES);
+  char* json = malloc(WEB_DETAIL_JSON_BYTES);
 
   if (json == NULL)
   {
@@ -1208,11 +1249,19 @@ static esp_err_t handleTelegramGet(httpd_req_t *req)
   return result;
 }
 
-static esp_err_t handlePowerGet(httpd_req_t *req)
+static esp_err_t handlePowerGet(httpd_req_t* req)
 {
-  char buffer[WEB_POWER_JSON_BYTES];
+  //-- The frame plus its 90-sample history is sized for the heap: the httpd
+  //-- task stack stays free of the large buffer, as on the other JSON paths.
+  char* buffer = malloc(WEB_POWER_JSON_BYTES);
+
+  if (buffer == NULL)
+  {
+    return sendError(req, 500, "out of memory");
+  }
+
   stringBuilder sb;
-  sbInit(&sb, buffer, sizeof buffer);
+  sbInit(&sb, buffer, WEB_POWER_JSON_BYTES);
   appendPowerJson(&sb);
 
   if (sb.overflow)
@@ -1220,10 +1269,12 @@ static esp_err_t handlePowerGet(httpd_req_t *req)
     ESP_LOGE(tag, "power json overflow");
   }
 
-  return sendJson(req, buffer);
+  esp_err_t result = sendJson(req, buffer);
+  free(buffer);
+  return result;
 }
 
-static esp_err_t handleViewReport(httpd_req_t *req)
+static esp_err_t handleViewReport(httpd_req_t* req)
 {
   char body[WEB_BODY_MAX];
 
@@ -1250,7 +1301,7 @@ static esp_err_t handleViewReport(httpd_req_t *req)
 //-- Answers one form-urlencoded command frame received on /ws. Responses are
 //-- JSON text frames, except cmd=raw which sends a JSON header frame followed
 //-- by a binary frame carrying the exact accepted bytes.
-static void wsHandleCommand(httpd_req_t *req, const char *body)
+static void wsHandleCommand(httpd_req_t* req, const char* body)
 {
   char command[16];
 
@@ -1262,7 +1313,7 @@ static void wsHandleCommand(httpd_req_t *req, const char *body)
 
   if (strcmp(command, "config") == 0)
   {
-    char *buffer = malloc(WEB_CONFIG_JSON_BYTES);
+    char* buffer = malloc(WEB_CONFIG_JSON_BYTES);
 
     if (buffer == NULL)
     {
@@ -1293,21 +1344,30 @@ static void wsHandleCommand(httpd_req_t *req, const char *body)
 
   if (strcmp(command, "power") == 0)
   {
-    char buffer[WEB_POWER_JSON_BYTES];
+    char* buffer = malloc(WEB_POWER_JSON_BYTES);
+
+    if (buffer == NULL)
+    {
+      wsSendReply(req, "{\"type\":\"error\",\"request\":\"power\",\"error\":\"out of memory\"}");
+      return;
+    }
+
     stringBuilder sb;
-    sbInit(&sb, buffer, sizeof buffer);
+    sbInit(&sb, buffer, WEB_POWER_JSON_BYTES);
     appendPowerJson(&sb);
     wsSendReply(req, buffer);
+    free(buffer);
     return;
   }
 
   if (strcmp(command, "telegrams") == 0)
   {
-    char *buffer = malloc(WEB_LIST_JSON_BYTES);
+    char* buffer = malloc(WEB_LIST_JSON_BYTES);
 
     if (buffer == NULL)
     {
-      wsSendReply(req, "{\"type\":\"error\",\"request\":\"telegrams\",\"error\":\"out of memory\"}");
+      wsSendReply(req,
+                  "{\"type\":\"error\",\"request\":\"telegrams\",\"error\":\"out of memory\"}");
       return;
     }
 
@@ -1334,7 +1394,7 @@ static void wsHandleCommand(httpd_req_t *req, const char *body)
 
     if (rawRequest)
     {
-      loggerTelegramRecord *record = malloc(sizeof *record);
+      loggerTelegramRecord* record = malloc(sizeof *record);
 
       if (record == NULL)
       {
@@ -1345,7 +1405,8 @@ static void wsHandleCommand(httpd_req_t *req, const char *body)
       if (!loggerReceiverGetRecord(sequence, record))
       {
         free(record);
-        wsSendReply(req, "{\"type\":\"error\",\"request\":\"raw\",\"seq\":0,\"error\":\"aged out\"}");
+        wsSendReply(req,
+                    "{\"type\":\"error\",\"request\":\"raw\",\"seq\":0,\"error\":\"aged out\"}");
         return;
       }
 
@@ -1367,7 +1428,7 @@ static void wsHandleCommand(httpd_req_t *req, const char *body)
       return;
     }
 
-    char *json = malloc(WEB_DETAIL_JSON_BYTES);
+    char* json = malloc(WEB_DETAIL_JSON_BYTES);
 
     if (json == NULL)
     {
@@ -1392,7 +1453,7 @@ static void wsHandleCommand(httpd_req_t *req, const char *body)
 
   if (strcmp(command, "save") == 0)
   {
-    const char *failure = applySettingsFromForm(body);
+    const char* failure = applySettingsFromForm(body);
 
     if (failure != NULL)
     {
@@ -1406,7 +1467,7 @@ static void wsHandleCommand(httpd_req_t *req, const char *body)
 
     //-- A successful save shows the active configuration: send the fresh
     //-- config snapshot right away.
-    char *buffer = malloc(WEB_CONFIG_JSON_BYTES);
+    char* buffer = malloc(WEB_CONFIG_JSON_BYTES);
 
     if (buffer != NULL)
     {
@@ -1435,11 +1496,12 @@ static void wsHandleCommand(httpd_req_t *req, const char *body)
   }
 
   char reply[96];
-  snprintf(reply, sizeof reply, "{\"type\":\"error\",\"request\":\"%s\",\"error\":\"unknown command\"}", command);
+  snprintf(reply, sizeof reply,
+           "{\"type\":\"error\",\"request\":\"%s\",\"error\":\"unknown command\"}", command);
   wsSendReply(req, reply);
 }
 
-static esp_err_t handleWebSocket(httpd_req_t *req)
+static esp_err_t handleWebSocket(httpd_req_t* req)
 {
   //-- ESP-IDF 6.0 answers the handshake inside httpd (httpd_uri.c returns
   //-- without calling the handler), so this handler is only ever entered for
@@ -1480,11 +1542,11 @@ static esp_err_t handleWebSocket(httpd_req_t *req)
     //-- would desynchronise the next frame read.
     if (frame.len > 0u)
     {
-      char *payload = malloc(frame.len + 1u);
+      char* payload = malloc(frame.len + 1u);
 
       if (payload != NULL)
       {
-        frame.payload = (uint8_t *)payload;
+        frame.payload = (uint8_t*)payload;
         pong = httpd_ws_recv_frame(req, &frame, frame.len);
         free(payload);
       }
@@ -1507,11 +1569,11 @@ static esp_err_t handleWebSocket(httpd_req_t *req)
     //-- stays aligned in the socket stream.
     if (frame.len > 0u)
     {
-      char *payload = malloc(frame.len + 1u);
+      char* payload = malloc(frame.len + 1u);
 
       if (payload != NULL)
       {
-        frame.payload = (uint8_t *)payload;
+        frame.payload = (uint8_t*)payload;
         esp_err_t drained = httpd_ws_recv_frame(req, &frame, frame.len);
         free(payload);
         return drained;
@@ -1527,7 +1589,7 @@ static esp_err_t handleWebSocket(httpd_req_t *req)
     return ESP_OK;
   }
 
-  char *body = calloc(1u, frame.len + 1u);
+  char* body = calloc(1u, frame.len + 1u);
 
   if (body == NULL)
   {
@@ -1535,7 +1597,7 @@ static esp_err_t handleWebSocket(httpd_req_t *req)
     return ESP_ERR_NO_MEM;
   }
 
-  frame.payload = (uint8_t *)body;
+  frame.payload = (uint8_t*)body;
   result = httpd_ws_recv_frame(req, &frame, frame.len);
 
   if (result == ESP_OK)
@@ -1550,7 +1612,7 @@ static esp_err_t handleWebSocket(httpd_req_t *req)
 //-- Pushes status every second and the telegram list when a new telegram was
 //-- accepted. Runs in its own task: a slow or stalled client can only stall
 //-- this task, never the receive task or the parser.
-static void wsPushTaskLoop(void *argument)
+static void wsPushTaskLoop(void* argument)
 {
   (void)argument;
 
@@ -1578,7 +1640,7 @@ static void wsPushTaskLoop(void *argument)
 
     if (status.acceptedCount != wsPushedAcceptedCount)
     {
-      char *list = malloc(WEB_LIST_JSON_BYTES);
+      char* list = malloc(WEB_LIST_JSON_BYTES);
 
       if (list != NULL)
       {
@@ -1604,9 +1666,10 @@ static void wsPushTaskLoop(void *argument)
     loggerPowerSnapshot power;
     uint32_t powerUptimeMs = 0u;
 
-    if (loggerReceiverGetPowerSnapshot(&power, &powerUptimeMs) && (power.sequence != wsPushedPowerSequence))
+    if (loggerReceiverGetPowerSnapshot(&power, &powerUptimeMs) &&
+        (power.sequence != wsPushedPowerSequence))
     {
-      char *powerJson = malloc(WEB_POWER_JSON_BYTES);
+      char* powerJson = malloc(WEB_POWER_JSON_BYTES);
 
       if (powerJson != NULL)
       {
@@ -1630,7 +1693,8 @@ static void wsPushTaskLoop(void *argument)
 //-- Server lifecycle
 //-- --------------------------------------------------------------------------
 
-static esp_err_t registerUri(httpd_handle_t handle, const char *uri, httpd_method_t method, bool isWebSocket, esp_err_t (*handler)(httpd_req_t *))
+static esp_err_t registerUri(httpd_handle_t handle, const char* uri, httpd_method_t method,
+                             bool isWebSocket, esp_err_t (*handler)(httpd_req_t*))
 {
   httpd_uri_t uriHandler;
   memset(&uriHandler, 0, sizeof uriHandler);
@@ -1696,7 +1760,8 @@ esp_err_t loggerWebStart(void)
 
   if (wsPushTask == NULL)
   {
-    BaseType_t created = xTaskCreate(wsPushTaskLoop, "wsPush", WS_PUSH_TASK_STACK_BYTES, NULL, WS_PUSH_TASK_PRIORITY, &wsPushTask);
+    BaseType_t created = xTaskCreate(wsPushTaskLoop, "wsPush", WS_PUSH_TASK_STACK_BYTES, NULL,
+                                     WS_PUSH_TASK_PRIORITY, &wsPushTask);
 
     if (created != pdPASS)
     {

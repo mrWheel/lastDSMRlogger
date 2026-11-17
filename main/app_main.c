@@ -13,7 +13,7 @@
 
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
-const char* PROG_VERSION = "v0.4.5";
+const char* PROG_VERSION = "v0.4.6";
 
 #include <stdio.h>
 #include <string.h>
@@ -35,7 +35,7 @@ const char* PROG_VERSION = "v0.4.5";
 #include "nvs_flash.h"
 #include "wifi_provisioner.h"
 
-static const char *tag = "appMain";
+static const char* tag = "appMain";
 
 //-- The provisioner's start path blocks while it retries saved credentials,
 //-- so it runs in a task of its own and never delays P1 reception.
@@ -53,7 +53,7 @@ static volatile bool wifiEverConnected = false;
 
 static volatile bool sntpStarted = false;
 
-static void onSntpSynced(struct timeval *tv)
+static void onSntpSynced(struct timeval* tv)
 {
   (void)tv;
   ESP_LOGI(tag, "clock synchronised via %s", SNTP_SERVER);
@@ -82,11 +82,11 @@ static void onWifiConnected(void)
 
   wifi_config_t stationConfig;
   memset(&stationConfig, 0, sizeof stationConfig);
-  const char *ssid = "?";
+  const char* ssid = "?";
 
   if (esp_wifi_get_config(WIFI_IF_STA, &stationConfig) == ESP_OK)
   {
-    ssid = (const char *)stationConfig.sta.ssid;
+    ssid = (const char*)stationConfig.sta.ssid;
   }
 
   esp_netif_ip_info_t ipInfo;
@@ -110,7 +110,7 @@ static void onWifiPortalStart(void)
   ESP_LOGI(tag, "captive portal open: connect to the setup AP and visit http://192.168.4.1/");
 }
 
-static void wifiTask(void *argument)
+static void wifiTask(void* argument)
 {
   (void)argument;
 
@@ -194,7 +194,8 @@ void app_main(void)
     ESP_LOGI(tag, "no valid stored settings, awaiting configuration");
   }
 
-  BaseType_t created = xTaskCreate(wifiTask, "wifiProvision", WIFI_TASK_STACK_BYTES, NULL, WIFI_TASK_PRIORITY, NULL);
+  BaseType_t created =
+      xTaskCreate(wifiTask, "wifiProvision", WIFI_TASK_STACK_BYTES, NULL, WIFI_TASK_PRIORITY, NULL);
 
   if (created != pdPASS)
   {

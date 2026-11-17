@@ -122,15 +122,16 @@
     </section>
 
     <section id="viewPower" class="card" hidden>
-      <h2>Realtime power</h2>
-      <div id="powerState" class="message"></div>
       <!-- Replica of the TFT power panel: a centre-zero bar per phase and
-           for the total on the same 500..3800 W ladder, plus a sparkline of
-           the total power history. Rows are built by app.js. -->
+           for the total on the same 100..3800 W ladder with the measured
+           watt value centred above each bar, plus a vertical-bar history
+           of the total power across the last 90 accepted measurements kept
+           by the device. The blue name bar prints RealtimePower left and
+           the telegram counter right. Rows are built by app.js. -->
       <div id="powerPanel" hidden>
         <div class="powerTitle">
+          <span class="powerName">RealtimePower</span>
           <span id="powerTelegram" class="powerSeq"></span>
-          <span id="powerMeterTime"></span>
         </div>
         <div id="powerRows"></div>
         <div id="powerScaleLabel" class="powerScaleLabel"></div>

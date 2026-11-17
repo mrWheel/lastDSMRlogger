@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.c - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-16 · Build: 16
+//-- Date: 2026-11-17 · Build: 17
 //--
 //-- The parserDSMR adapter task owns the parser instance while it runs. The
 //-- event callback copies the complete accepted frame and the decoded fields
@@ -45,7 +45,7 @@
 #include "logger_testdata.h"
 #include "nvs.h"
 
-static const char *tag = "loggerReceiver";
+static const char* tag = "loggerReceiver";
 
 //-- The P1 port of the smart meter always uses UART0: RX on GPIO44 (the
 //-- stored rxGpio of a live configuration) and TX on GPIO43. The console
@@ -116,7 +116,7 @@ typedef struct
   loggerSettingsConfig activeConfig;
 
   dsmrParser parser;
-  uint8_t *workspace;
+  uint8_t* workspace;
   size_t workspaceSize;
   dsmrUart uart;
 
@@ -127,7 +127,7 @@ typedef struct
   //-- Retained history, allocated at init from PSRAM when the module has
   //-- it: the slots are only ever touched by task code, so they do not
   //-- belong on the small internal heap (see allocTelegramBuffer).
-  loggerTelegramRecord *records;
+  loggerTelegramRecord* records;
 
   bool hasLastAccepted;
   uint32_t lastAcceptedUptimeMs;
@@ -138,6 +138,14 @@ typedef struct
   loggerPowerSnapshot lastPower;
   uint32_t lastPowerUptimeMs;
   bool hasLastPower;
+
+  //-- Total watts of the newest accepted telegrams for the SPA realtime bar
+  //-- history: one sample per accepted telegram in a ring, oldest first when
+  //-- read back. Stored under the same mutex as the last power frame, so a
+  //-- reader never mixes two telegram cadences.
+  float powerHistory[LOGGER_POWER_HISTORY_CAPACITY];
+  uint16_t powerHistoryCount;
+  uint16_t powerHistoryNext;
 
   //-- True while a burst was selected and waits for the forwarding task.
   //-- The burst sends the exact bytes from the dedicated forward buffer
@@ -203,13 +211,13 @@ static TaskHandle_t counterTaskHandle = NULL;
 
 //-- Telegram buffer, raw frame copy, field array, M-Bus and label copies are
 //-- all carved from this workspace by the parser.
-static uint8_t *parserWorkspace;
+static uint8_t* parserWorkspace;
 
 //-- Staging record filled by the parser event callback. The parser refuses
 //-- reentrant calls, so exactly one receive task ever writes this buffer.
 //-- Both buffers are allocated by loggerReceiverInit from PSRAM when the
 //-- module carries it (see allocTelegramBuffer).
-static loggerTelegramRecord *stagingRecord;
+static loggerTelegramRecord* stagingRecord;
 
 //-- Copy of the frame selected for the next UART0 TX burst. The receive
 //-- task fills it under the mutex for every forwarded telegram: accepted
@@ -218,17 +226,17 @@ static loggerTelegramRecord *stagingRecord;
 //-- (the only buffer the wire writes read from), so a frame never has to
 //-- stay pinned in the staging record or the history while its copy goes
 //-- out, and staging the next frame cannot mix bytes into a running burst.
-static uint8_t *forwardFrameBuffer;
-static uint8_t *forwardBurstBuffer;
+static uint8_t* forwardFrameBuffer;
+static uint8_t* forwardBurstBuffer;
 
 //-- Carves one of the big telegram buffers (parser workspace, staging
 //-- record, retained history, forward frame), preferring PSRAM: they are
 //-- only touched by
 //-- task code, never by an ISR or a DMA descriptor. The internal fallback
 //-- keeps the logger alive on a module without external RAM.
-static void *allocTelegramBuffer(size_t size)
+static void* allocTelegramBuffer(size_t size)
 {
-  void *buffer = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+  void* buffer = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
 
   if (buffer == NULL)
   {
@@ -238,7 +246,7 @@ static void *allocTelegramBuffer(size_t size)
   return buffer;
 }
 
-static void copyBounded(char *dst, size_t dstSize, const char *src)
+static void copyBounded(char* dst, size_t dstSize, const char* src)
 {
   size_t length = strlen(src);
 
@@ -257,7 +265,7 @@ static uint32_t uptimeMs(void)
 }
 
 //-- Appends a diagnostic note to a record, separated by semicolons.
-static void appendNote(char *notes, size_t notesSize, const char *note)
+static void appendNote(char* notes, size_t notesSize, const char* note)
 {
   size_t length = strlen(notes);
 
@@ -275,7 +283,7 @@ static void appendNote(char *notes, size_t notesSize, const char *note)
 
 //-- True when the snapshot holds the published device type field of the
 //-- given M-Bus channel (0-n:24.1.0).
-static bool channelHasPublishedType(const loggerTelegramRecord *record, uint8_t channel)
+static bool channelHasPublishedType(const loggerTelegramRecord* record, uint8_t channel)
 {
   char obis[LOGGER_SNAPSHOT_OBIS_MAX];
   snprintf(obis, sizeof obis, "0-%u:24.1.0", (unsigned)channel);
@@ -292,7 +300,7 @@ static bool channelHasPublishedType(const loggerTelegramRecord *record, uint8_t 
 }
 
 //-- True when the snapshot holds any field of the given M-Bus channel.
-static bool channelPresent(const loggerTelegramRecord *record, uint8_t channel)
+static bool channelPresent(const loggerTelegramRecord* record, uint8_t channel)
 {
   for (uint16_t index = 0u; index < record->meta.fieldCount; index++)
   {
@@ -306,7 +314,7 @@ static bool channelPresent(const loggerTelegramRecord *record, uint8_t channel)
 }
 
 //-- True when the text is exactly "HH:MM:SS".
-static bool isHmsText(const char *text)
+static bool isHmsText(const char* text)
 {
   return isdigit((unsigned char)text[0]) && isdigit((unsigned char)text[1]) && (text[2] == ':') &&
          isdigit((unsigned char)text[3]) && isdigit((unsigned char)text[4]) && (text[5] == ':') &&
@@ -318,13 +326,13 @@ static bool isHmsText(const char *text)
 //-- The parser timestamp of the field is preferred; a plain digit value is
 //-- parsed as fallback. The text stays empty when the frame has no usable
 //-- timestamp.
-static void extractMeterTimeText(loggerTelegramRecord *record)
+static void extractMeterTimeText(loggerTelegramRecord* record)
 {
   record->meta.meterTimeText[0] = '\0';
 
   for (uint16_t index = 0u; index < record->meta.fieldCount; index++)
   {
-    const loggerFieldSnapshot *field = &record->fields[index];
+    const loggerFieldSnapshot* field = &record->fields[index];
 
     if (strcmp(field->obis, "0-0:1.0.0") != 0)
     {
@@ -333,7 +341,7 @@ static void extractMeterTimeText(loggerTelegramRecord *record)
 
     if (field->hasTimestamp)
     {
-      const char *timePart = strchr(field->timestamp, 'T');
+      const char* timePart = strchr(field->timestamp, 'T');
 
       if ((timePart != NULL) && isHmsText(timePart + 1))
       {
@@ -375,11 +383,11 @@ static void extractMeterTimeText(loggerTelegramRecord *record)
 
 //-- Copies the first numeric value published for the given OBIS code. An
 //-- unavailable reading (empty value) and a text field count as absent.
-static bool findNumericField(const loggerTelegramRecord *record, const char *obis, float *outValue)
+static bool findNumericField(const loggerTelegramRecord* record, const char* obis, float* outValue)
 {
   for (uint16_t index = 0u; index < record->meta.fieldCount; index++)
   {
-    const loggerFieldSnapshot *field = &record->fields[index];
+    const loggerFieldSnapshot* field = &record->fields[index];
 
     if ((strcmp(field->obis, obis) == 0) && (field->value[0] != '\0') && !field->valueIsText)
     {
@@ -394,13 +402,13 @@ static bool findNumericField(const loggerTelegramRecord *record, const char *obi
 //-- The power panel title shows the meter date and time of OBIS 0-0:1.0.0
 //-- as "DD-MM-YYYY HH:MM" (no seconds): the parser timestamp is preferred,
 //-- a plain YYMMDDHHMMSSW digit value is the fallback. Empty when unusable.
-static void extractPanelMeterTime(const loggerTelegramRecord *record, char *out, size_t outSize)
+static void extractPanelMeterTime(const loggerTelegramRecord* record, char* out, size_t outSize)
 {
   out[0] = '\0';
 
   for (uint16_t index = 0u; index < record->meta.fieldCount; index++)
   {
-    const loggerFieldSnapshot *field = &record->fields[index];
+    const loggerFieldSnapshot* field = &record->fields[index];
 
     if (strcmp(field->obis, "0-0:1.0.0") != 0)
     {
@@ -409,14 +417,15 @@ static void extractPanelMeterTime(const loggerTelegramRecord *record, char *out,
 
     if (field->hasTimestamp)
     {
-      const char *timePart = strchr(field->timestamp, 'T');
+      const char* timePart = strchr(field->timestamp, 'T');
 
-      if ((timePart != NULL) && ((size_t)(timePart - field->timestamp) == 10u) && isHmsText(timePart + 1))
+      if ((timePart != NULL) && ((size_t)(timePart - field->timestamp) == 10u) &&
+          isHmsText(timePart + 1))
       {
-        snprintf(out, outSize, "%c%c-%c%c-%c%c%c%c %c%c:%c%c",
-                 field->timestamp[8], field->timestamp[9], field->timestamp[5], field->timestamp[6],
-                 field->timestamp[0], field->timestamp[1], field->timestamp[2], field->timestamp[3],
-                 timePart[1], timePart[2], timePart[4], timePart[5]);
+        snprintf(out, outSize, "%c%c-%c%c-%c%c%c%c %c%c:%c%c", field->timestamp[8],
+                 field->timestamp[9], field->timestamp[5], field->timestamp[6], field->timestamp[0],
+                 field->timestamp[1], field->timestamp[2], field->timestamp[3], timePart[1],
+                 timePart[2], timePart[4], timePart[5]);
       }
 
       return;
@@ -437,10 +446,9 @@ static void extractPanelMeterTime(const loggerTelegramRecord *record, char *out,
 
       if (allDigits)
       {
-        snprintf(out, outSize, "%c%c-%c%c-20%c%c %c%c:%c%c",
-                 field->value[4], field->value[5], field->value[2], field->value[3],
-                 field->value[0], field->value[1], field->value[6], field->value[7],
-                 field->value[8], field->value[9]);
+        snprintf(out, outSize, "%c%c-%c%c-20%c%c %c%c:%c%c", field->value[4], field->value[5],
+                 field->value[2], field->value[3], field->value[0], field->value[1],
+                 field->value[6], field->value[7], field->value[8], field->value[9]);
       }
     }
 
@@ -458,12 +466,13 @@ static void extractPanelMeterTime(const loggerTelegramRecord *record, char *out,
 //-- voltage; the published unsigned current is the fallback magnitude. The
 //-- totals use the published total delivered/returned readings, with the
 //-- phase sum as fallback.
-static void extractPowerSnapshot(const loggerTelegramRecord *record, bool testData, uint32_t sequence, loggerPowerSnapshot *snapshot)
+static void extractPowerSnapshot(const loggerTelegramRecord* record, bool testData,
+                                 uint32_t sequence, loggerPowerSnapshot* snapshot)
 {
-  static const char *const deliveredObis[3] = {"1-0:21.7.0", "1-0:41.7.0", "1-0:61.7.0"};
-  static const char *const returnedObis[3] = {"1-0:22.7.0", "1-0:42.7.0", "1-0:62.7.0"};
-  static const char *const ampObis[3] = {"1-0:31.7.0", "1-0:51.7.0", "1-0:71.7.0"};
-  static const char *const voltObis[3] = {"1-0:32.7.0", "1-0:52.7.0", "1-0:72.7.0"};
+  static const char* const deliveredObis[3] = {"1-0:21.7.0", "1-0:41.7.0", "1-0:61.7.0"};
+  static const char* const returnedObis[3] = {"1-0:22.7.0", "1-0:42.7.0", "1-0:62.7.0"};
+  static const char* const ampObis[3] = {"1-0:31.7.0", "1-0:51.7.0", "1-0:71.7.0"};
+  static const char* const voltObis[3] = {"1-0:32.7.0", "1-0:52.7.0", "1-0:72.7.0"};
 
   memset(snapshot, 0, sizeof *snapshot);
   snapshot->testData = testData;
@@ -528,7 +537,8 @@ static void extractPowerSnapshot(const loggerTelegramRecord *record, bool testDa
   }
 
   snapshot->totalVolts = (voltCount > 0u) ? (voltSum / (float)voltCount) : 0.0f;
-  snapshot->totalAmps = (snapshot->totalVolts > 0.0f) ? (snapshot->totalWatts / snapshot->totalVolts) : 0.0f;
+  snapshot->totalAmps =
+      (snapshot->totalVolts > 0.0f) ? (snapshot->totalWatts / snapshot->totalVolts) : 0.0f;
 
   extractPanelMeterTime(record, snapshot->meterTime, sizeof snapshot->meterTime);
 }
@@ -538,7 +548,7 @@ static void extractPowerSnapshot(const loggerTelegramRecord *record, bool testDa
 //-- --------------------------------------------------------------------------
 
 //-- Formats a parser timestamp as supplied by the parser.
-static void formatTimestamp(const dsmrTimestamp *timestamp, char *out, size_t outSize)
+static void formatTimestamp(const dsmrTimestamp* timestamp, char* out, size_t outSize)
 {
   if (!timestamp->valid)
   {
@@ -546,9 +556,10 @@ static void formatTimestamp(const dsmrTimestamp *timestamp, char *out, size_t ou
     return;
   }
 
-  int written = snprintf(out, outSize, "%04u-%02u-%02uT%02u:%02u:%02u",
-                         (unsigned)timestamp->year, (unsigned)timestamp->month, (unsigned)timestamp->day,
-                         (unsigned)timestamp->hour, (unsigned)timestamp->minute, (unsigned)timestamp->second);
+  int written =
+      snprintf(out, outSize, "%04u-%02u-%02uT%02u:%02u:%02u", (unsigned)timestamp->year,
+               (unsigned)timestamp->month, (unsigned)timestamp->day, (unsigned)timestamp->hour,
+               (unsigned)timestamp->minute, (unsigned)timestamp->second);
 
   if ((written < 0) || ((size_t)written >= outSize))
   {
@@ -558,16 +569,18 @@ static void formatTimestamp(const dsmrTimestamp *timestamp, char *out, size_t ou
   if (timestamp->hasOffset)
   {
     int sign = (timestamp->offsetMinutes < 0) ? '-' : '+';
-    int absolute = (timestamp->offsetMinutes < 0) ? (-timestamp->offsetMinutes) : timestamp->offsetMinutes;
+    int absolute =
+        (timestamp->offsetMinutes < 0) ? (-timestamp->offsetMinutes) : timestamp->offsetMinutes;
 
-    snprintf(out + written, outSize - (size_t)written, "%c%02d:%02d", sign, absolute / 60, absolute % 60);
+    snprintf(out + written, outSize - (size_t)written, "%c%02d:%02d", sign, absolute / 60,
+             absolute % 60);
   }
 }
 
 //-- Copies one decoded field into the snapshot. Values are formatted without
 //-- locale dependence, so a measured zero and an unavailable reading remain
 //-- distinguishable: the value string of an unavailable reading is empty.
-static void copyFieldSnapshot(const dsmrTelegramField *field, loggerFieldSnapshot *snapshot)
+static void copyFieldSnapshot(const dsmrTelegramField* field, loggerFieldSnapshot* snapshot)
 {
   memset(snapshot, 0, sizeof *snapshot);
   copyBounded(snapshot->obis, sizeof snapshot->obis, (field->obis != NULL) ? field->obis : "");
@@ -583,40 +596,41 @@ static void copyFieldSnapshot(const dsmrTelegramField *field, loggerFieldSnapsho
 
   switch (field->value.kind)
   {
-    case DSMR_VALUE_TEXT:
-    {
-      snapshot->valueIsText = true;
-      copyBounded(snapshot->value, sizeof snapshot->value, (field->value.text != NULL) ? field->value.text : "");
-      break;
-    }
+  case DSMR_VALUE_TEXT:
+  {
+    snapshot->valueIsText = true;
+    copyBounded(snapshot->value, sizeof snapshot->value,
+                (field->value.text != NULL) ? field->value.text : "");
+    break;
+  }
 
-    case DSMR_VALUE_NUMBER:
-    {
-      if (dsmrFormatValue(&field->value, snapshot->value, sizeof snapshot->value) < 0)
-      {
-        snapshot->value[0] = '\0';
-      }
-
-      break;
-    }
-
-    case DSMR_VALUE_ABSENT:
-    default:
+  case DSMR_VALUE_NUMBER:
+  {
+    if (dsmrFormatValue(&field->value, snapshot->value, sizeof snapshot->value) < 0)
     {
       snapshot->value[0] = '\0';
-      break;
     }
+
+    break;
+  }
+
+  case DSMR_VALUE_ABSENT:
+  default:
+  {
+    snapshot->value[0] = '\0';
+    break;
+  }
   }
 }
 
-static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event, void *userData)
+static void onParserEvent(const dsmrParser* parser, const dsmrParserEvent* event, void* userData)
 {
   (void)parser;
-  LoggerReceiver *self = (LoggerReceiver *)userData;
+  LoggerReceiver* self = (LoggerReceiver*)userData;
 
   if (event->type == DSMR_EVENT_TELEGRAM)
   {
-    const dsmrTelegramResult *result = event->result;
+    const dsmrTelegramResult* result = event->result;
 
     //-- Only one telegram is processed per configured interval: a complete
     //-- candidate arriving sooner than the interval after the last accepted
@@ -625,22 +639,25 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     //-- frame; the record is built first so the skip line can show the same
     //-- meter time, size, CRC verdict and profile as an accepted one.
     xSemaphoreTake(self->mutex, portMAX_DELAY);
-    bool tooEarly = self->hasLastAccepted &&
-                    ((uint32_t)(result->receiveTimeMs - self->lastAcceptedUptimeMs) <
-                     (self->activeConfig.intervalSeconds * 1000u));
+    bool tooEarly =
+        self->hasLastAccepted && ((uint32_t)(result->receiveTimeMs - self->lastAcceptedUptimeMs) <
+                                  (self->activeConfig.intervalSeconds * 1000u));
     xSemaphoreGive(self->mutex);
 
     memset(stagingRecord, 0, sizeof *stagingRecord);
     stagingRecord->meta.receivedUptimeMs = result->receiveTimeMs;
     stagingRecord->meta.crcVerified = (result->crcStatus == DSMR_CRC_STATUS_VERIFIED);
-    copyBounded(stagingRecord->meta.profileId, sizeof *stagingRecord->meta.profileId, (result->profileId != NULL) ? result->profileId : "");
-    copyBounded(stagingRecord->meta.reportedVersion, sizeof *stagingRecord->meta.reportedVersion, (result->reportedVersion != NULL) ? result->reportedVersion : "");
+    copyBounded(stagingRecord->meta.profileId, sizeof *stagingRecord->meta.profileId,
+                (result->profileId != NULL) ? result->profileId : "");
+    copyBounded(stagingRecord->meta.reportedVersion, sizeof *stagingRecord->meta.reportedVersion,
+                (result->reportedVersion != NULL) ? result->reportedVersion : "");
 
     //-- The exact accepted frame: header, body, trailer bytes and every
     //-- original line ending, preserved by the parser before decoding.
     if ((result->rawBytes != NULL) && (result->rawLength > 0u))
     {
-      size_t rawLength = (result->rawLength > DSMR_MAX_TELEGRAM_BYTES) ? DSMR_MAX_TELEGRAM_BYTES : result->rawLength;
+      size_t rawLength = (result->rawLength > DSMR_MAX_TELEGRAM_BYTES) ? DSMR_MAX_TELEGRAM_BYTES
+                                                                       : result->rawLength;
       memcpy(stagingRecord->rawBytes, result->rawBytes, rawLength);
       stagingRecord->meta.rawLength = (uint16_t)rawLength;
     }
@@ -668,7 +685,8 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
       //-- processing: the log line carries the word skip where the accepted
       //-- line shows the telegram number.
       ESP_LOGI(tag, "correct telegram skip: meter %s, %u bytes, %s, profile %s",
-               (stagingRecord->meta.meterTimeText[0] != '\0') ? stagingRecord->meta.meterTimeText : "--:--:--",
+               (stagingRecord->meta.meterTimeText[0] != '\0') ? stagingRecord->meta.meterTimeText
+                                                              : "--:--:--",
                (unsigned)stagingRecord->meta.rawLength,
                stagingRecord->meta.crcVerified ? "crc ok" : "no crc",
                stagingRecord->meta.profileId);
@@ -712,7 +730,8 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
 
     for (uint8_t channel = DSMR_MBUS_CHANNEL_MIN; channel <= DSMR_MBUS_CHANNEL_MAX; channel++)
     {
-      if (self->hasActiveConfig && (self->activeConfig.mbusMode[channel] == LOGGER_MBUS_MODE_DISABLED))
+      if (self->hasActiveConfig &&
+          (self->activeConfig.mbusMode[channel] == LOGGER_MBUS_MODE_DISABLED))
       {
         disabledMask |= (uint8_t)(1u << channel);
       }
@@ -725,10 +744,12 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     //-- published type itself from the decoded fields.
     for (uint8_t channel = DSMR_MBUS_CHANNEL_MIN; channel <= DSMR_MBUS_CHANNEL_MAX; channel++)
     {
-      if (channelPresent(stagingRecord, channel) && !channelHasPublishedType(stagingRecord, channel))
+      if (channelPresent(stagingRecord, channel) &&
+          !channelHasPublishedType(stagingRecord, channel))
       {
         char note[48];
-        snprintf(note, sizeof note, "missing published device type on channel %u", (unsigned)channel);
+        snprintf(note, sizeof note, "missing published device type on channel %u",
+                 (unsigned)channel);
         appendNote(stagingRecord->meta.notes, sizeof *stagingRecord->meta.notes, note);
       }
     }
@@ -797,8 +818,10 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
 
     if (haveShownConfig)
     {
-      snprintf(powerSnapshot.countryCode, sizeof powerSnapshot.countryCode, "%s", shownConfig.countryCode);
-      snprintf(powerSnapshot.profileId, sizeof powerSnapshot.profileId, "%s", shownConfig.profileId);
+      snprintf(powerSnapshot.countryCode, sizeof powerSnapshot.countryCode, "%s",
+               shownConfig.countryCode);
+      snprintf(powerSnapshot.profileId, sizeof powerSnapshot.profileId, "%s",
+               shownConfig.profileId);
       powerSnapshot.rxInverted = shownConfig.rxInverted;
     }
 
@@ -810,20 +833,33 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     self->lastPower = powerSnapshot;
     self->lastPowerUptimeMs = result->receiveTimeMs;
     self->hasLastPower = true;
+
+    //-- One bar history sample per accepted telegram: the ring keeps the
+    //-- newest totals for the SPA realtime view across reloads and view
+    //-- switches, independent of what any browser is watching.
+    self->powerHistory[self->powerHistoryNext] = powerSnapshot.totalWatts;
+    self->powerHistoryNext =
+        (uint16_t)((self->powerHistoryNext + 1u) % LOGGER_POWER_HISTORY_CAPACITY);
+
+    if (self->powerHistoryCount < LOGGER_POWER_HISTORY_CAPACITY)
+    {
+      self->powerHistoryCount++;
+    }
+
     xSemaphoreGive(self->mutex);
 
     //-- One console line per accepted telegram: sequence, meter time from
     //-- OBIS 0-0:1.0.0, size, CRC verdict and active profile.
     ESP_LOGI(tag, "accepted telegram #%" PRIu32 ": meter %s, %u bytes, %s, profile %s",
              stagingRecord->meta.sequence,
-             (stagingRecord->meta.meterTimeText[0] != '\0') ? stagingRecord->meta.meterTimeText : "--:--:--",
+             (stagingRecord->meta.meterTimeText[0] != '\0') ? stagingRecord->meta.meterTimeText
+                                                            : "--:--:--",
              (unsigned)stagingRecord->meta.rawLength,
-             stagingRecord->meta.crcVerified ? "crc ok" : "no crc",
-             stagingRecord->meta.profileId);
+             stagingRecord->meta.crcVerified ? "crc ok" : "no crc", stagingRecord->meta.profileId);
   }
   else if (event->type == DSMR_EVENT_DIAGNOSTIC)
   {
-    const dsmrDiagnostic *diagnostic = event->diagnostic;
+    const dsmrDiagnostic* diagnostic = event->diagnostic;
     bool counterPersistDue = false;
 
     xSemaphoreTake(self->mutex, portMAX_DELAY);
@@ -845,12 +881,15 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
       //-- telegram of the frame it belongs to: annotate that record.
       if (self->slotUsed[self->writeIndex])
       {
-        appendNote(self->records[self->writeIndex].meta.notes, sizeof self->records[self->writeIndex].meta.notes, "M-Bus device type mismatch");
+        appendNote(self->records[self->writeIndex].meta.notes,
+                   sizeof self->records[self->writeIndex].meta.notes, "M-Bus device type mismatch");
       }
     }
 
-    copyBounded(self->lastDiagReason, sizeof self->lastDiagReason, dsmrDiagReasonToString(diagnostic->reason));
-    copyBounded(self->lastDiagObis, sizeof self->lastDiagObis, (diagnostic->obis != NULL) ? diagnostic->obis : "");
+    copyBounded(self->lastDiagReason, sizeof self->lastDiagReason,
+                dsmrDiagReasonToString(diagnostic->reason));
+    copyBounded(self->lastDiagObis, sizeof self->lastDiagObis,
+                (diagnostic->obis != NULL) ? diagnostic->obis : "");
 
     //-- Diagnostics reach the console with their reason (and OBIS when the
     //-- parser names the offending line); totals stay visible in the web
@@ -908,8 +947,8 @@ static TaskHandle_t testTaskHandle;
 
 typedef struct
 {
-  LoggerReceiver *self;
-  const dsmrProfile *profile;
+  LoggerReceiver* self;
+  const dsmrProfile* profile;
   uint32_t periodMs;
 
   //-- Per-run stop flag: the stopper clears it and the task observes it
@@ -928,7 +967,7 @@ typedef struct
 //-- and leave two tasks feeding the same parser concurrently.
 static TestTaskArguments testArgumentsPool[2];
 static uint8_t testArgumentsNext;
-static TestTaskArguments *testArgumentsActive;
+static TestTaskArguments* testArgumentsActive;
 
 //-- The frame builder lives in logger_testdata.c so it can also be checked
 //-- on the host against the real parser; randomness comes from the ESP
@@ -938,11 +977,11 @@ static uint32_t testRandomLimit(uint32_t limit)
   return esp_random() % limit;
 }
 
-static void testGeneratorTask(void *argument)
+static void testGeneratorTask(void* argument)
 {
-  TestTaskArguments *arguments = (TestTaskArguments *)argument;
-  LoggerReceiver *self = arguments->self;
-  const dsmrProfile *profile = arguments->profile;
+  TestTaskArguments* arguments = (TestTaskArguments*)argument;
+  LoggerReceiver* self = arguments->self;
+  const dsmrProfile* profile = arguments->profile;
 
   //-- Test data is produced at the configured read interval so the test
   //-- behaves exactly like a meter answering once per interval. Clamped
@@ -1009,7 +1048,8 @@ static void testGeneratorTask(void *argument)
 
       if (!discardForBurst)
       {
-        dsmrParserFeed(&self->parser, (const uint8_t *)arguments->telegram, length, uptimeMs(), onParserEvent, self);
+        dsmrParserFeed(&self->parser, (const uint8_t*)arguments->telegram, length, uptimeMs(),
+                       onParserEvent, self);
         self->generatorFeeding = false;
       }
     }
@@ -1021,7 +1061,7 @@ static void testGeneratorTask(void *argument)
 
 static void stopTestGenerator(void);
 
-static esp_err_t startTestGenerator(LoggerReceiver *self, const loggerSettingsConfig *config)
+static esp_err_t startTestGenerator(LoggerReceiver* self, const loggerSettingsConfig* config)
 {
   //-- Defensive: a generator must never be started while one still runs.
   if (testTaskHandle != NULL)
@@ -1029,7 +1069,7 @@ static esp_err_t startTestGenerator(LoggerReceiver *self, const loggerSettingsCo
     stopTestGenerator();
   }
 
-  TestTaskArguments *arguments = &testArgumentsPool[testArgumentsNext];
+  TestTaskArguments* arguments = &testArgumentsPool[testArgumentsNext];
 
   //-- Consume this block for the coming run; the next run takes the other,
   //-- so the block of a still-finishing zombie is never handed out again.
@@ -1112,7 +1152,7 @@ static uint32_t forwardIdleMask(bool rxInverted)
 //-- Identical consecutive masks skip the hardware update; the tracked mask
 //-- becomes unknown whenever a driver is installed or deleted, because a
 //-- fresh driver starts with the inversion cleared.
-static void applyForwardMask(LoggerReceiver *self, uint32_t mask)
+static void applyForwardMask(LoggerReceiver* self, uint32_t mask)
 {
   if (!uart_is_driver_installed(LOGGER_P1_UART_PORT))
   {
@@ -1140,28 +1180,31 @@ static void applyForwardMask(LoggerReceiver *self, uint32_t mask)
 //-- configuration. Test mode keeps this driver installed across bursts (it
 //-- opens no receive UART); the live path installs it after the adapter
 //-- stopped and deletes it again when the burst has been written.
-static void ensureForwardTxDriver(LoggerReceiver *self, bool rxInverted, uint16_t frameLength)
+static void ensureForwardTxDriver(LoggerReceiver* self, bool rxInverted, uint16_t frameLength)
 {
   if (uart_is_driver_installed(LOGGER_P1_UART_PORT))
   {
     return;
   }
 
-  const dsmrProfile *profile = self->parser.profile;
+  const dsmrProfile* profile = self->parser.profile;
 
   uart_config_t uartConfig;
   memset(&uartConfig, 0, sizeof uartConfig);
   uartConfig.baud_rate = (profile != NULL) ? (int)profile->uartBaudRate : 115200;
-  uartConfig.data_bits = ((profile != NULL) && (profile->uartDataBits == 7)) ? UART_DATA_7_BITS : UART_DATA_8_BITS;
-  uartConfig.parity = ((profile == NULL) || (profile->uartParity == 0)) ? UART_PARITY_DISABLE
-                    : ((profile->uartParity == 1) ? UART_PARITY_ODD : UART_PARITY_EVEN);
-  uartConfig.stop_bits = ((profile != NULL) && (profile->uartStopBits == 2)) ? UART_STOP_BITS_2 : UART_STOP_BITS_1;
+  uartConfig.data_bits =
+      ((profile != NULL) && (profile->uartDataBits == 7)) ? UART_DATA_7_BITS : UART_DATA_8_BITS;
+  uartConfig.parity = ((profile == NULL) || (profile->uartParity == 0))
+                          ? UART_PARITY_DISABLE
+                          : ((profile->uartParity == 1) ? UART_PARITY_ODD : UART_PARITY_EVEN);
+  uartConfig.stop_bits =
+      ((profile != NULL) && (profile->uartStopBits == 2)) ? UART_STOP_BITS_2 : UART_STOP_BITS_1;
   uartConfig.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
   uartConfig.source_clk = UART_SCLK_DEFAULT;
 
-  esp_err_t result = uart_driver_install(LOGGER_P1_UART_PORT, LOGGER_FORWARD_RX_BUFFER_BYTES,
-                                         (int)frameLength + LOGGER_FORWARD_TX_SLACK_BYTES,
-                                         0, NULL, 0);
+  esp_err_t result =
+      uart_driver_install(LOGGER_P1_UART_PORT, LOGGER_FORWARD_RX_BUFFER_BYTES,
+                          (int)frameLength + LOGGER_FORWARD_TX_SLACK_BYTES, 0, NULL, 0);
 
   if (result == ESP_OK)
   {
@@ -1182,7 +1225,8 @@ static void ensureForwardTxDriver(LoggerReceiver *self, bool rxInverted, uint16_
     self->appliedInverseMask = -1;
     xSemaphoreGive(self->mutex);
 
-    ESP_LOGW(tag, "UART0 TX driver could not be installed: %s (burst skipped)", esp_err_to_name(result));
+    ESP_LOGW(tag, "UART0 TX driver could not be installed: %s (burst skipped)",
+             esp_err_to_name(result));
 
     if (uart_is_driver_installed(LOGGER_P1_UART_PORT))
     {
@@ -1199,7 +1243,7 @@ static void ensureForwardTxDriver(LoggerReceiver *self, bool rxInverted, uint16_
   applyForwardMask(self, forwardIdleMask(rxInverted));
 }
 
-static void releaseForwardTxDriver(LoggerReceiver *self)
+static void releaseForwardTxDriver(LoggerReceiver* self)
 {
   xSemaphoreTake(self->mutex, portMAX_DELAY);
   bool owned = self->ownsTxDriver;
@@ -1215,7 +1259,7 @@ static void releaseForwardTxDriver(LoggerReceiver *self)
 
 //-- Marks the UART0 line-inverse mask as unknown after the driver was
 //-- deleted from under the burst task (the adapter deletes it on stop).
-static void forgetForwardMask(LoggerReceiver *self)
+static void forgetForwardMask(LoggerReceiver* self)
 {
   xSemaphoreTake(self->mutex, portMAX_DELAY);
   self->appliedInverseMask = -1;
@@ -1226,7 +1270,7 @@ static void forgetForwardMask(LoggerReceiver *self)
 //-- brings TX to its idle polarity. The adapter itself only applies the RX
 //-- inverse, so the tracked mask starts from what it sets and TX is aligned
 //-- here: TX idles at the polarity selected by the P1 Rx polarity setting.
-static esp_err_t startLiveAdapter(LoggerReceiver *self, const loggerSettingsConfig *config)
+static esp_err_t startLiveAdapter(LoggerReceiver* self, const loggerSettingsConfig* config)
 {
   dsmrUartConfig uartConfig;
   memset(&uartConfig, 0, sizeof uartConfig);
@@ -1246,13 +1290,13 @@ static esp_err_t startLiveAdapter(LoggerReceiver *self, const loggerSettingsConf
   uartConfig.invertRx = config->rxInverted;
 
   ESP_LOGI(tag, "P1 RX on UART0 gpio %d, polarity %s, tx idles at %s", config->rxGpio,
-           config->rxInverted ? "inverted" : "normal",
-           config->rxInverted ? "inverted" : "normal");
+           config->rxInverted ? "inverted" : "normal", config->rxInverted ? "inverted" : "normal");
 
   esp_err_t result = dsmrUartStart(&self->uart, &self->parser, &uartConfig, onParserEvent, self);
 
   xSemaphoreTake(self->mutex, portMAX_DELAY);
-  self->appliedInverseMask = (result != ESP_OK) ? -1 : (config->rxInverted ? (int)UART_SIGNAL_RXD_INV : 0);
+  self->appliedInverseMask =
+      (result != ESP_OK) ? -1 : (config->rxInverted ? (int)UART_SIGNAL_RXD_INV : 0);
   xSemaphoreGive(self->mutex);
 
   if (result == ESP_OK)
@@ -1269,7 +1313,7 @@ static esp_err_t startLiveAdapter(LoggerReceiver *self, const loggerSettingsConf
 
 //-- Waits until the test generator is not inside dsmrParserFeed(): the
 //-- burst must not touch the parser state from two tasks at once.
-static void forwardJoinTestFeed(LoggerReceiver *self)
+static void forwardJoinTestFeed(LoggerReceiver* self)
 {
   uint32_t waitedMs = 0u;
 
@@ -1286,7 +1330,8 @@ static void forwardJoinTestFeed(LoggerReceiver *self)
 //-- callback. The parser's own start-of-telegram detection then re-arms, so
 //-- reception resumes cleanly even when the meter is already partway
 //-- through a telegram: the overlapping frame is skipped whole.
-static void forwardDiscardCallback(const dsmrParser *parser, const dsmrParserEvent *event, void *userData)
+static void forwardDiscardCallback(const dsmrParser* parser, const dsmrParserEvent* event,
+                                   void* userData)
 {
   (void)parser;
   (void)event;
@@ -1297,12 +1342,12 @@ static void forwardDiscardCallback(const dsmrParser *parser, const dsmrParserEve
 //-- transmitting on the wire. The payload points into the forwarding task's
 //-- private burst copy, which stays untouched until the burst ends.
 //-- Returns false on a partial write or timeout.
-static bool forwardCopy(LoggerReceiver *self, const uint8_t *payload, uint16_t length,
+static bool forwardCopy(LoggerReceiver* self, const uint8_t* payload, uint16_t length,
                         bool rxInverted, bool txInverted)
 {
   applyForwardMask(self, forwardBurstMask(rxInverted, txInverted));
 
-  int written = uart_write_bytes(LOGGER_P1_UART_PORT, (const char *)payload, length);
+  int written = uart_write_bytes(LOGGER_P1_UART_PORT, (const char*)payload, length);
 
   if (written != (int)length)
   {
@@ -1310,7 +1355,8 @@ static bool forwardCopy(LoggerReceiver *self, const uint8_t *payload, uint16_t l
     return false;
   }
 
-  esp_err_t result = uart_wait_tx_done(LOGGER_P1_UART_PORT, pdMS_TO_TICKS(LOGGER_FORWARD_TX_WAIT_MS));
+  esp_err_t result =
+      uart_wait_tx_done(LOGGER_P1_UART_PORT, pdMS_TO_TICKS(LOGGER_FORWARD_TX_WAIT_MS));
 
   if (result != ESP_OK)
   {
@@ -1329,9 +1375,9 @@ static bool forwardCopy(LoggerReceiver *self, const uint8_t *payload, uint16_t l
 //-- copy of the current telegram keeps one polarity. The console never
 //-- touches UART0 (it runs on USB-Serial-JTAG), so logging during a burst
 //-- is safe. Blocking writes run in this task only, never in reception.
-static void forwardTaskLoop(void *argument)
+static void forwardTaskLoop(void* argument)
 {
-  LoggerReceiver *self = (LoggerReceiver *)argument;
+  LoggerReceiver* self = (LoggerReceiver*)argument;
 
   for (;;)
   {
@@ -1342,7 +1388,7 @@ static void forwardTaskLoop(void *argument)
 
     xSemaphoreTake(self->mutex, portMAX_DELAY);
     uint16_t length = 0u;
-    const uint8_t *payload = NULL;
+    const uint8_t* payload = NULL;
 
     if (self->forwardPending && (forwardBurstBuffer != NULL) && (forwardFrameBuffer != NULL) &&
         (self->forwardFrameLength > 0u))
@@ -1427,8 +1473,8 @@ static void forwardTaskLoop(void *argument)
       if (resumed != ESP_OK)
       {
         xSemaphoreTake(self->mutex, portMAX_DELAY);
-        snprintf(self->lastError, sizeof self->lastError, "receiver could not resume after forwarding: %s",
-                 esp_err_to_name(resumed));
+        snprintf(self->lastError, sizeof self->lastError,
+                 "receiver could not resume after forwarding: %s", esp_err_to_name(resumed));
         self->receiverRunning = false;
         xSemaphoreGive(self->mutex);
         ESP_LOGE(tag, "%s", self->lastError);
@@ -1457,7 +1503,8 @@ static void forwardTaskLoop(void *argument)
 //-- value has changed since the last persist so an idle or unconfigured
 //-- meter does not wear the flash for nothing. Both keys share one commit,
 //-- so the stored pair always belongs to the same moment.
-static void persistCounters(LoggerReceiver *self, uint32_t *lastPersistedAccepted, uint32_t *lastPersistedRejected)
+static void persistCounters(LoggerReceiver* self, uint32_t* lastPersistedAccepted,
+                            uint32_t* lastPersistedRejected)
 {
   xSemaphoreTake(self->mutex, portMAX_DELAY);
   uint32_t accepted = self->acceptedCount;
@@ -1500,16 +1547,17 @@ static void persistCounters(LoggerReceiver *self, uint32_t *lastPersistedAccepte
 
   *lastPersistedAccepted = accepted;
   *lastPersistedRejected = rejected;
-  ESP_LOGI(tag, "telegram counters persisted: %" PRIu32 " accepted, %" PRIu32 " rejected", accepted, rejected);
+  ESP_LOGI(tag, "telegram counters persisted: %" PRIu32 " accepted, %" PRIu32 " rejected", accepted,
+           rejected);
 }
 
 //-- Blocks until the receive task signals a new block of accepted telegrams
 //-- and then persists both counters. The task never touches the parser or
 //-- the receiver control state and only reads the counters under the data
 //-- mutex, so it needs no join path.
-static void telegramCounterTaskLoop(void *argument)
+static void telegramCounterTaskLoop(void* argument)
 {
-  LoggerReceiver *self = (LoggerReceiver *)argument;
+  LoggerReceiver* self = (LoggerReceiver*)argument;
   uint32_t lastPersistedAccepted = self->acceptedCount;
   uint32_t lastPersistedRejected = self->rejectedCount;
 
@@ -1524,7 +1572,7 @@ static void telegramCounterTaskLoop(void *argument)
 //-- Receiver start / stop (callers hold the mutex)
 //-- --------------------------------------------------------------------------
 
-static esp_err_t startLocked(LoggerReceiver *self, const loggerSettingsConfig *config)
+static esp_err_t startLocked(LoggerReceiver* self, const loggerSettingsConfig* config)
 {
   dsmrParserConfig parserConfig;
   memset(&parserConfig, 0, sizeof parserConfig);
@@ -1541,12 +1589,14 @@ static esp_err_t startLocked(LoggerReceiver *self, const loggerSettingsConfig *c
 
   //-- The parser initializes before any bytes are consumed, so a restarted
   //-- receiver cannot consume data for a half applied profile.
-  dsmrParserStatus status = dsmrParserInit(&self->parser, &parserConfig, self->workspace, self->workspaceSize);
+  dsmrParserStatus status =
+      dsmrParserInit(&self->parser, &parserConfig, self->workspace, self->workspaceSize);
 
   if (status != DSMR_OK)
   {
     xSemaphoreTake(self->mutex, portMAX_DELAY);
-    snprintf(self->lastError, sizeof self->lastError, "parser init failed: %s", dsmrStatusToString(status));
+    snprintf(self->lastError, sizeof self->lastError, "parser init failed: %s",
+             dsmrStatusToString(status));
     ESP_LOGE(tag, "%s", self->lastError);
     xSemaphoreGive(self->mutex);
     return ESP_FAIL;
@@ -1579,7 +1629,8 @@ static esp_err_t startLocked(LoggerReceiver *self, const loggerSettingsConfig *c
 
   if (result != ESP_OK)
   {
-    snprintf(self->lastError, sizeof self->lastError, "receiver start failed on GPIO %d: %s", config->rxGpio, esp_err_to_name(result));
+    snprintf(self->lastError, sizeof self->lastError, "receiver start failed on GPIO %d: %s",
+             config->rxGpio, esp_err_to_name(result));
   }
   else
   {
@@ -1605,7 +1656,7 @@ static esp_err_t startLocked(LoggerReceiver *self, const loggerSettingsConfig *c
 
 //-- Stops and joins the receive task. Never called with the data mutex held:
 //-- the callback of the task being joined takes that mutex.
-static void stopJoined(LoggerReceiver *self)
+static void stopJoined(LoggerReceiver* self)
 {
   if (!self->receiverRunning)
   {
@@ -1644,7 +1695,7 @@ esp_err_t loggerReceiverInit(void)
   //-- the driver tag and drop that warning and info noise from the console.
   esp_log_level_set("uart", ESP_LOG_ERROR);
 
-  LoggerReceiver *self = &instance;
+  LoggerReceiver* self = &instance;
   memset(self, 0, sizeof *self);
 
   self->mutex = xSemaphoreCreateMutex();
@@ -1660,10 +1711,11 @@ esp_err_t loggerReceiverInit(void)
   //-- workspace further down) are carved here, preferring PSRAM: they keep
   //-- more than a hundred kilobytes of frame storage off the small internal
   //-- heap that the radios, task stacks and drivers need.
-  stagingRecord = (loggerTelegramRecord *)allocTelegramBuffer(sizeof *stagingRecord);
-  self->records = (loggerTelegramRecord *)allocTelegramBuffer(sizeof(*self->records) * LOGGER_HISTORY_CAPACITY);
-  forwardFrameBuffer = (uint8_t *)allocTelegramBuffer(DSMR_MAX_TELEGRAM_BYTES);
-  forwardBurstBuffer = (uint8_t *)allocTelegramBuffer(DSMR_MAX_TELEGRAM_BYTES);
+  stagingRecord = (loggerTelegramRecord*)allocTelegramBuffer(sizeof *stagingRecord);
+  self->records =
+      (loggerTelegramRecord*)allocTelegramBuffer(sizeof(*self->records) * LOGGER_HISTORY_CAPACITY);
+  forwardFrameBuffer = (uint8_t*)allocTelegramBuffer(DSMR_MAX_TELEGRAM_BYTES);
+  forwardBurstBuffer = (uint8_t*)allocTelegramBuffer(DSMR_MAX_TELEGRAM_BYTES);
 
   if ((stagingRecord == NULL) || (self->records == NULL) || (forwardFrameBuffer == NULL) ||
       (forwardBurstBuffer == NULL))
@@ -1722,14 +1774,16 @@ esp_err_t loggerReceiverInit(void)
   }
   else
   {
-    ESP_LOGI(tag, "UART0 TX forwarding ready: every read telegram schedules a burst, each burst sends the frame once at the configured TX polarity with reception suspended, bursts queue behind each other");
+    ESP_LOGI(tag, "UART0 TX forwarding ready: every read telegram schedules a burst, each burst "
+                  "sends the frame once at the configured TX polarity with reception suspended, "
+                  "bursts queue behind each other");
   }
 
   //-- The counter task persists both running totals whenever either counter
   //-- completes another block of 25, so the totals survive a reset or power
   //-- cycle.
-  if (xTaskCreate(telegramCounterTaskLoop, "p1Counter", LOGGER_TELEGRAM_COUNTER_TASK_STACK_BYTES, self,
-                  LOGGER_TELEGRAM_COUNTER_TASK_PRIORITY, &counterTaskHandle) != pdPASS)
+  if (xTaskCreate(telegramCounterTaskLoop, "p1Counter", LOGGER_TELEGRAM_COUNTER_TASK_STACK_BYTES,
+                  self, LOGGER_TELEGRAM_COUNTER_TASK_PRIORITY, &counterTaskHandle) != pdPASS)
   {
     counterTaskHandle = NULL;
     ESP_LOGW(tag, "telegram counter task could not be created: counter persistence disabled");
@@ -1748,7 +1802,7 @@ esp_err_t loggerReceiverInit(void)
     return ESP_ERR_INVALID_SIZE;
   }
 
-  parserWorkspace = (uint8_t *)allocTelegramBuffer(DSMR_DEFAULT_WORKSPACE_BYTES);
+  parserWorkspace = (uint8_t*)allocTelegramBuffer(DSMR_DEFAULT_WORKSPACE_BYTES);
 
   if (parserWorkspace == NULL)
   {
@@ -1761,9 +1815,9 @@ esp_err_t loggerReceiverInit(void)
   return ESP_OK;
 }
 
-esp_err_t loggerReceiverStart(const loggerSettingsConfig *config)
+esp_err_t loggerReceiverStart(const loggerSettingsConfig* config)
 {
-  LoggerReceiver *self = &instance;
+  LoggerReceiver* self = &instance;
 
   if (!self->initialized || (config == NULL))
   {
@@ -1787,9 +1841,9 @@ esp_err_t loggerReceiverStart(const loggerSettingsConfig *config)
   return result;
 }
 
-esp_err_t loggerReceiverApplyConfig(const loggerSettingsConfig *config)
+esp_err_t loggerReceiverApplyConfig(const loggerSettingsConfig* config)
 {
-  LoggerReceiver *self = &instance;
+  LoggerReceiver* self = &instance;
 
   if (!self->initialized)
   {
@@ -1826,7 +1880,8 @@ esp_err_t loggerReceiverApplyConfig(const loggerSettingsConfig *config)
       if (restore != ESP_OK)
       {
         xSemaphoreTake(self->mutex, portMAX_DELAY);
-        snprintf(self->lastError, sizeof self->lastError, "restore of previous configuration failed: %s", esp_err_to_name(restore));
+        snprintf(self->lastError, sizeof self->lastError,
+                 "restore of previous configuration failed: %s", esp_err_to_name(restore));
         ESP_LOGE(tag, "%s", self->lastError);
         xSemaphoreGive(self->mutex);
       }
@@ -1849,9 +1904,9 @@ esp_err_t loggerReceiverApplyConfig(const loggerSettingsConfig *config)
   return ESP_OK;
 }
 
-void loggerReceiverGetStatus(loggerReceiverStatus *status)
+void loggerReceiverGetStatus(loggerReceiverStatus* status)
 {
-  LoggerReceiver *self = &instance;
+  LoggerReceiver* self = &instance;
 
   if (status == NULL)
   {
@@ -1873,7 +1928,8 @@ void loggerReceiverGetStatus(loggerReceiverStatus *status)
   {
     status->rxGpio = self->activeConfig.rxGpio;
     status->intervalSeconds = self->activeConfig.intervalSeconds;
-    copyBounded(status->activeProfileId, sizeof status->activeProfileId, self->activeConfig.profileId);
+    copyBounded(status->activeProfileId, sizeof status->activeProfileId,
+                self->activeConfig.profileId);
   }
 
   //-- A telegram is accepted at most once per read interval, so staleness
@@ -1895,7 +1951,8 @@ void loggerReceiverGetStatus(loggerReceiverStatus *status)
 
   if (!self->receiverRunning)
   {
-    status->state = (self->lastError[0] != '\0') ? LOGGER_RECEIVER_ERROR : LOGGER_RECEIVER_AWAITING_CONFIGURATION;
+    status->state = (self->lastError[0] != '\0') ? LOGGER_RECEIVER_ERROR
+                                                 : LOGGER_RECEIVER_AWAITING_CONFIGURATION;
   }
   else if (!self->hasLastAccepted)
   {
@@ -1905,15 +1962,16 @@ void loggerReceiverGetStatus(loggerReceiverStatus *status)
   {
     status->hasLastAccepted = true;
     status->lastAcceptedAgeMs = (uint32_t)(status->uptimeMs - self->lastAcceptedUptimeMs);
-    status->state = (status->lastAcceptedAgeMs > staleAfterMs) ? LOGGER_RECEIVER_STALE : LOGGER_RECEIVER_OK;
+    status->state =
+        (status->lastAcceptedAgeMs > staleAfterMs) ? LOGGER_RECEIVER_STALE : LOGGER_RECEIVER_OK;
   }
 
   xSemaphoreGive(self->mutex);
 }
 
-bool loggerReceiverGetPowerSnapshot(loggerPowerSnapshot *snapshot, uint32_t *capturedUptimeMs)
+bool loggerReceiverGetPowerSnapshot(loggerPowerSnapshot* snapshot, uint32_t* capturedUptimeMs)
 {
-  LoggerReceiver *self = &instance;
+  LoggerReceiver* self = &instance;
 
   if ((snapshot == NULL) || (capturedUptimeMs == NULL))
   {
@@ -1933,9 +1991,41 @@ bool loggerReceiverGetPowerSnapshot(loggerPowerSnapshot *snapshot, uint32_t *cap
   return found;
 }
 
-bool loggerReceiverGetActiveConfig(loggerSettingsConfig *config)
+uint16_t loggerReceiverGetPowerHistory(float* outWatts, uint16_t maxSamples)
 {
-  LoggerReceiver *self = &instance;
+  LoggerReceiver* self = &instance;
+
+  if ((outWatts == NULL) || (maxSamples == 0u))
+  {
+    return 0u;
+  }
+
+  xSemaphoreTake(self->mutex, portMAX_DELAY);
+
+  uint16_t count = self->powerHistoryCount;
+
+  if (count > maxSamples)
+  {
+    //-- Fewer samples asked than retained: give the newest ones.
+    count = maxSamples;
+  }
+
+  //-- The ring's next write slot sits just past the oldest retained sample.
+  uint16_t start = (uint16_t)((self->powerHistoryNext + LOGGER_POWER_HISTORY_CAPACITY - count) %
+                              LOGGER_POWER_HISTORY_CAPACITY);
+
+  for (uint16_t index = 0u; index < count; index++)
+  {
+    outWatts[index] = self->powerHistory[(start + index) % LOGGER_POWER_HISTORY_CAPACITY];
+  }
+
+  xSemaphoreGive(self->mutex);
+  return count;
+}
+
+bool loggerReceiverGetActiveConfig(loggerSettingsConfig* config)
+{
+  LoggerReceiver* self = &instance;
 
   if (config == NULL)
   {
@@ -1954,9 +2044,9 @@ bool loggerReceiverGetActiveConfig(loggerSettingsConfig *config)
   return found;
 }
 
-uint16_t loggerReceiverListRecords(loggerTelegramMeta *outRecords, uint16_t maxRecords)
+uint16_t loggerReceiverListRecords(loggerTelegramMeta* outRecords, uint16_t maxRecords)
 {
-  LoggerReceiver *self = &instance;
+  LoggerReceiver* self = &instance;
 
   if ((outRecords == NULL) || (maxRecords == 0u))
   {
@@ -1969,7 +2059,8 @@ uint16_t loggerReceiverListRecords(loggerTelegramMeta *outRecords, uint16_t maxR
   //-- Newest first.
   for (uint16_t offset = 0u; (offset < LOGGER_HISTORY_CAPACITY) && (written < maxRecords); offset++)
   {
-    uint8_t slot = (uint8_t)((self->writeIndex + LOGGER_HISTORY_CAPACITY - offset) % LOGGER_HISTORY_CAPACITY);
+    uint8_t slot =
+        (uint8_t)((self->writeIndex + LOGGER_HISTORY_CAPACITY - offset) % LOGGER_HISTORY_CAPACITY);
 
     if (!self->slotUsed[slot])
     {
@@ -1984,9 +2075,12 @@ uint16_t loggerReceiverListRecords(loggerTelegramMeta *outRecords, uint16_t maxR
   return written;
 }
 
-bool loggerReceiverInspectRecord(uint32_t sequence, bool (*inspect)(const loggerTelegramRecord *record, void *userData), void *userData)
+bool loggerReceiverInspectRecord(uint32_t sequence,
+                                 bool (*inspect)(const loggerTelegramRecord* record,
+                                                 void* userData),
+                                 void* userData)
 {
-  LoggerReceiver *self = &instance;
+  LoggerReceiver* self = &instance;
 
   if (inspect == NULL)
   {
@@ -2009,9 +2103,9 @@ bool loggerReceiverInspectRecord(uint32_t sequence, bool (*inspect)(const logger
   return found;
 }
 
-bool loggerReceiverGetRecord(uint32_t sequence, loggerTelegramRecord *outRecord)
+bool loggerReceiverGetRecord(uint32_t sequence, loggerTelegramRecord* outRecord)
 {
-  LoggerReceiver *self = &instance;
+  LoggerReceiver* self = &instance;
 
   if (outRecord == NULL)
   {

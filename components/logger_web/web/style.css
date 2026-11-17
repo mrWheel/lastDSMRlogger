@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-16 · Build: 10 */
+   Date: 2026-11-17 · Build: 12 */
 
 :root
 {
@@ -536,7 +536,7 @@ footer
   margin-top: 4px;
 }
 
-/* Telegram caption row: the panel name bar translated to the web. */
+/* Name bar of the realtime view: view name left, telegram counter right. */
 .powerTitle
 {
   display: flex;
@@ -552,18 +552,20 @@ footer
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 2px 8px rgba(0, 0, 0, 0.18);
 }
 
-.powerSeq
+.powerName
 {
   font-weight: 700;
   font-size: 0.95rem;
   letter-spacing: 0.02em;
 }
 
-#powerMeterTime
+.powerSeq
 {
   font-family: var(--mono);
-  font-size: 0.8rem;
-  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  font-size: 0.95rem;
+  letter-spacing: 0.02em;
 }
 
 .powerRow
@@ -692,10 +694,11 @@ footer
   right: 6px;
 }
 
+/* The measured watt value sits centred above its bar. */
 .powerWatt
 {
-  margin-top: 4px;
-  text-align: right;
+  margin: 0 0 6px;
+  text-align: center;
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
   font-size: 1.05rem;

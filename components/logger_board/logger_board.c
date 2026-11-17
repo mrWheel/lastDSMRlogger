@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_board.c - on-device TFT debug lines and power panel
-//-- Date: 2026-11-16 · Build: 10
+//-- Date: 2026-11-17 · Build: 12
 //--
 //-- Everything is drawn through the documented API of the esp32_s3_piggyback
 //-- component: tft_ec11_init once, then filled rectangles and fixed-width
@@ -17,8 +17,10 @@
 //-- band, a centre-zero signed watt
 //-- bar (consumption red, feed-in green) with its integer scale labels
 //-- inside the bar and the watt value.
-//-- From the graphics panel a short AUX press opens the power text screen
-//-- (delivered and returned watts of the phase the encoder selects) and a
+//-- From the graphics panel a short AUX press opens the per-phase screen
+//-- (net watts as a large centred number with a smaller unit, the phase
+//-- voltage left and current right below it and a centre-zero bar on the
+//-- panel scale, for the phase the encoder selects) and a
 //-- medium-long press swaps the bars for the system information view; a
 //-- short press returns to the graphics panel.
 //-- ==========================================================================
@@ -36,7 +38,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-static const char *tag = "loggerBoard";
+static const char* tag = "loggerBoard";
 
 //-- Scale 2 gives a 12 by 16 pixel cell: 25 characters fit on the 320 pixel
 //-- wide panel with a small left margin.
@@ -90,10 +92,12 @@ static const char *tag = "loggerBoard";
 #define FONT_DATA TFT_EC11_FONT_LARGE
 
 //-- Bar scale ladder: the smallest step that fits the largest absolute
-//-- watt of the frame; frames above 3800 W stay on the 3800 W step.
+//-- watt of the frame; frames above 3800 W stay on the 3800 W step and
+//-- frames below 100 W stay on the 100 W step.
 //-- Published for the SPA realtime view so its bars scale identically to
 //-- the panel (logger_board.h).
-const uint16_t loggerPowerScales[LOGGER_POWER_SCALE_COUNT] = {500u, 1000u, 1700u, 2400u, 3100u, 3800u};
+const uint16_t loggerPowerScales[LOGGER_POWER_SCALE_COUNT] = {100u,  250u,  500u,  1000u,
+                                                              1700u, 2400u, 3100u, 3800u};
 
 //-- Panel colours (RGB565).
 #define PANEL_HEADER_COLOR TFT_EC11_RGB565(43, 60, 94)
@@ -138,9 +142,9 @@ typedef struct
 
 static LoggerBoard board;
 
-static const char *const phaseLabels[PANEL_ROWS] = {"Fase 1", "Fase 2", "Fase 3", "Totaal"};
+static const char* const phaseLabels[PANEL_ROWS] = {"Fase 1", "Fase 2", "Fase 3", "Totaal"};
 
-static void drawLine(uint8_t row, const char *label, const char *value)
+static void drawLine(uint8_t row, const char* label, const char* value)
 {
   char line[BOARD_CHARS_PER_LINE + 1];
   snprintf(line, sizeof line, "%s%s", label, value);
@@ -180,7 +184,7 @@ static uint16_t signedValueColor(float value)
 //-- Smallest ladder step that fits the largest absolute watt, so the bar
 //-- scale follows the size of the consumption and feed-in of the frame.
 //-- Also answers the scale for the SPA realtime view (logger_board.h).
-uint16_t loggerBoardPickPowerScale(const loggerPowerSnapshot *snapshot)
+uint16_t loggerBoardPickPowerScale(const loggerPowerSnapshot* snapshot)
 {
   float maxAbs = 0.0f;
   const float values[PANEL_ROWS] = {snapshot->phaseWatts[0], snapshot->phaseWatts[1],
@@ -240,12 +244,14 @@ static int fontCellHeight(tft_ec11_font_t font)
   return 8;
 }
 
-static void drawLeftText(int y, const char *text, tft_ec11_font_t font, uint16_t background, uint16_t foreground)
+static void drawLeftText(int y, const char* text, tft_ec11_font_t font, uint16_t background,
+                         uint16_t foreground)
 {
   tft_ec11_draw_text_font(PANEL_EDGE_MARGIN, y, text, font, background, foreground);
 }
 
-static void drawCenteredText(int y, int panelWidth, const char *text, tft_ec11_font_t font, uint16_t background, uint16_t foreground)
+static void drawCenteredText(int y, int panelWidth, const char* text, tft_ec11_font_t font,
+                             uint16_t background, uint16_t foreground)
 {
   int x = (panelWidth - (int)strlen(text) * fontAdvance(font)) / 2;
 
@@ -257,7 +263,8 @@ static void drawCenteredText(int y, int panelWidth, const char *text, tft_ec11_f
   tft_ec11_draw_text_font(x, y, text, font, background, foreground);
 }
 
-static void drawRightAlignedText(int y, int panelWidth, const char *text, int rightMargin, tft_ec11_font_t font, uint16_t background, uint16_t foreground)
+static void drawRightAlignedText(int y, int panelWidth, const char* text, int rightMargin,
+                                 tft_ec11_font_t font, uint16_t background, uint16_t foreground)
 {
   int x = panelWidth - (int)strlen(text) * fontAdvance(font) - rightMargin;
 
@@ -272,11 +279,12 @@ static void drawRightAlignedText(int y, int panelWidth, const char *text, int ri
 //-- Every screen starts with a white title line (screen name left and an
 //-- optional right aligned text such as the panel meter date/time) and a
 //-- sub band below it carrying optional right aligned text.
-static void drawScreenTitle(int panelWidth, const char *name, const char *topRightText, const char *rightText)
+static void drawScreenTitle(int panelWidth, const char* name, const char* topRightText,
+                            const char* rightText)
 {
   tft_ec11_fill_rect(0, 0, panelWidth, PANEL_NAME_H, TFT_EC11_WHITE);
-  tft_ec11_draw_text_font(PANEL_EDGE_MARGIN, (PANEL_NAME_H - fontCellHeight(FONT_TITLE)) / 2,
-                          name, FONT_TITLE, TFT_EC11_WHITE, TFT_EC11_BLACK);
+  tft_ec11_draw_text_font(PANEL_EDGE_MARGIN, (PANEL_NAME_H - fontCellHeight(FONT_TITLE)) / 2, name,
+                          FONT_TITLE, TFT_EC11_WHITE, TFT_EC11_BLACK);
 
   if ((topRightText != NULL) && (topRightText[0] != '\0'))
   {
@@ -288,8 +296,9 @@ static void drawScreenTitle(int panelWidth, const char *name, const char *topRig
 
   if ((rightText != NULL) && (rightText[0] != '\0'))
   {
-    drawRightAlignedText(PANEL_NAME_H + (PANEL_SUB_H - fontCellHeight(FONT_STAMP)) / 2, panelWidth, rightText,
-                         PANEL_EDGE_MARGIN, FONT_STAMP, PANEL_HEADER_COLOR, TFT_EC11_WHITE);
+    drawRightAlignedText(PANEL_NAME_H + (PANEL_SUB_H - fontCellHeight(FONT_STAMP)) / 2, panelWidth,
+                         rightText, PANEL_EDGE_MARGIN, FONT_STAMP, PANEL_HEADER_COLOR,
+                         TFT_EC11_WHITE);
   }
 }
 
@@ -322,18 +331,22 @@ static void drawBar(int y, int panelWidth, float watts, uint16_t scale)
   //-- Scale labels as integers inside the bar so they sit in contrast on
   //-- the bar background and the coloured fill.
   snprintf(label, sizeof label, "-%" PRIu16, scale);
-  tft_ec11_draw_text_font(2, y + (PANEL_BAR_H - fontCellHeight(FONT_VALUE)) / 2, label, FONT_VALUE, PANEL_BAR_BG, PANEL_TICK_COLOR);
+  tft_ec11_draw_text_font(2, y + (PANEL_BAR_H - fontCellHeight(FONT_VALUE)) / 2, label, FONT_VALUE,
+                          PANEL_BAR_BG, PANEL_TICK_COLOR);
 
   snprintf(label, sizeof label, "%" PRIu16, scale);
-  drawRightAlignedText(y + (PANEL_BAR_H - fontCellHeight(FONT_VALUE)) / 2, panelWidth, label, 2, FONT_VALUE, PANEL_BAR_BG, PANEL_TICK_COLOR);
+  drawRightAlignedText(y + (PANEL_BAR_H - fontCellHeight(FONT_VALUE)) / 2, panelWidth, label, 2,
+                       FONT_VALUE, PANEL_BAR_BG, PANEL_TICK_COLOR);
 
-  drawCenteredText(y + (PANEL_BAR_H - fontCellHeight(FONT_VALUE)) / 2, panelWidth, "0", FONT_VALUE, PANEL_BAR_BG, PANEL_TICK_COLOR);
+  drawCenteredText(y + (PANEL_BAR_H - fontCellHeight(FONT_VALUE)) / 2, panelWidth, "0", FONT_VALUE,
+                   PANEL_BAR_BG, PANEL_TICK_COLOR);
 
   //-- The centre tick stays on top so the zero label never covers it.
   tft_ec11_fill_rect(mid - 1, y, 2, PANEL_BAR_H, PANEL_TICK_COLOR);
 }
 
-static void drawPowerRow(int index, float watts, float amps, float volts, int y, int panelWidth, int rowHeight, uint16_t scale)
+static void drawPowerRow(int index, float watts, float amps, float volts, int y, int panelWidth,
+                         int rowHeight, uint16_t scale)
 {
   char text[24];
   int labelTextY = y + (PANEL_HEADER_H - fontCellHeight(FONT_LABEL)) / 2;
@@ -347,10 +360,12 @@ static void drawPowerRow(int index, float watts, float amps, float volts, int y,
   snprintf(text, sizeof text, "%.1fA", (double)amps);
   drawLeftText(valueTextY, text, FONT_VALUE, PANEL_HEADER_COLOR, TFT_EC11_WHITE);
 
-  drawCenteredText(labelTextY, panelWidth, phaseLabels[index], FONT_LABEL, PANEL_HEADER_COLOR, TFT_EC11_WHITE);
+  drawCenteredText(labelTextY, panelWidth, phaseLabels[index], FONT_LABEL, PANEL_HEADER_COLOR,
+                   TFT_EC11_WHITE);
 
   snprintf(text, sizeof text, "%.1fV", (double)volts);
-  drawRightAlignedText(valueTextY, panelWidth, text, PANEL_EDGE_MARGIN, FONT_VALUE, PANEL_HEADER_COLOR, TFT_EC11_WHITE);
+  drawRightAlignedText(valueTextY, panelWidth, text, PANEL_EDGE_MARGIN, FONT_VALUE,
+                       PANEL_HEADER_COLOR, TFT_EC11_WHITE);
 
   drawBar(y + PANEL_BAR_Y, panelWidth, watts, scale);
 
@@ -363,7 +378,7 @@ static void drawPowerRow(int index, float watts, float amps, float volts, int y,
 
 static void drawPanel(void)
 {
-  const loggerPowerSnapshot *snapshot = &board.panel;
+  const loggerPowerSnapshot* snapshot = &board.panel;
   uint16_t scale = loggerBoardPickPowerScale(snapshot);
   int width = (int)tft_ec11_width();
   int height = (int)tft_ec11_height();
@@ -390,32 +405,76 @@ static void drawPanel(void)
 static void drawBottomHint(int panelWidth, int panelHeight)
 {
   tft_ec11_fill_rect(0, panelHeight - PANEL_HINT_H, panelWidth, PANEL_HINT_H, TFT_EC11_WHITE);
-  tft_ec11_draw_text_font(PANEL_EDGE_MARGIN, panelHeight - PANEL_HINT_H + (PANEL_HINT_H - fontCellHeight(FONT_STAMP)) / 2,
+  tft_ec11_draw_text_font(PANEL_EDGE_MARGIN,
+                          panelHeight - PANEL_HINT_H +
+                              (PANEL_HINT_H - fontCellHeight(FONT_STAMP)) / 2,
                           "AUX: Terug", FONT_STAMP, TFT_EC11_WHITE, TFT_EC11_BLACK);
 }
 
-//-- AUX power text screen: delivered and returned watts of the phase the
-//-- encoder selected (0-2 Fase 1-3, 3 Totaal).
+//-- AUX per-phase screen for the phase the encoder selected (0-2 Fase 1-3,
+//-- 3 Totaal): the net watts as a large centred number with a smaller unit
+//-- next to it, the voltage left and the current right on one smaller row
+//-- below it, and a centre-zero bar on the same ladder step the graphics
+//-- panel picked for this frame.
 static void drawPowerTextView(void)
 {
-  const loggerPowerSnapshot *snapshot = &board.panel;
+  const loggerPowerSnapshot* snapshot = &board.panel;
   int width = (int)tft_ec11_width();
   int height = (int)tft_ec11_height();
   uint8_t index = board.powerIndex;
-  float delivered = (index < 3u) ? snapshot->phaseDeliveredWatts[index] : snapshot->totalDeliveredWatts;
-  float returned = (index < 3u) ? snapshot->phaseReturnedWatts[index] : snapshot->totalReturnedWatts;
-  char text[32];
+  float watts = (index < 3u) ? snapshot->phaseWatts[index] : snapshot->totalWatts;
+  float amps = (index < 3u) ? snapshot->phaseAmps[index] : snapshot->totalAmps;
+  float volts = (index < 3u) ? snapshot->phaseVolts[index] : snapshot->totalVolts;
+  uint16_t scale = loggerBoardPickPowerScale(snapshot);
+  char digits[16];
+  char text[16];
+  int unitGap = 3;
+  int valueHeight = fontCellHeight(FONT_DATA);
+  int infoHeight = fontCellHeight(FONT_INFO);
 
   drawScreenTitle(width, "PER FASE", "", phaseLabels[index]);
-  tft_ec11_fill_rect(0, PANEL_TITLE_H, width, height - PANEL_TITLE_H - PANEL_HINT_H, TFT_EC11_BLACK);
+  tft_ec11_fill_rect(0, PANEL_TITLE_H, width, height - PANEL_TITLE_H - PANEL_HINT_H,
+                     TFT_EC11_BLACK);
 
-  drawLeftText(PANEL_TITLE_H + 16, "Geleverd vermogen", FONT_INFO, TFT_EC11_BLACK, TFT_EC11_WHITE);
-  snprintf(text, sizeof text, "%.1f W", (double)delivered);
-  drawCenteredText(PANEL_TITLE_H + 44, width, text, FONT_DATA, TFT_EC11_BLACK, PANEL_CONSUME_COLOR);
+  snprintf(digits, sizeof digits, "%.1f", (double)watts);
 
-  drawLeftText(PANEL_TITLE_H + 86, "Opgewekte vermogen", FONT_INFO, TFT_EC11_BLACK, TFT_EC11_WHITE);
-  snprintf(text, sizeof text, "%.1f W", (double)returned);
-  drawCenteredText(PANEL_TITLE_H + 114, width, text, FONT_DATA, TFT_EC11_BLACK, PANEL_PRODUCE_COLOR);
+  //-- Value row, volts/amperes row and bar form one block that is centred
+  //-- vertically in the free body area between title and hint bar.
+  int contentHeight = valueHeight + 12 + infoHeight + 16 + PANEL_BAR_H;
+  int bodyHeight = height - PANEL_TITLE_H - PANEL_HINT_H;
+  int y = PANEL_TITLE_H + (bodyHeight - contentHeight) / 2;
+
+  if (y < PANEL_TITLE_H)
+  {
+    y = PANEL_TITLE_H;
+  }
+
+  //-- Number and unit share one centred group so the unit hugs the digits
+  //-- instead of sitting at the screen centre; the smaller unit aligns to
+  //-- the bottom of the large digits.
+  int digitsWidth = (int)strlen(digits) * fontAdvance(FONT_DATA);
+  int groupWidth = digitsWidth + unitGap + fontAdvance(FONT_INFO);
+  int x = (width - groupWidth) / 2;
+
+  if (x < 0)
+  {
+    x = 0;
+  }
+
+  tft_ec11_draw_text_font(x, y, digits, FONT_DATA, TFT_EC11_BLACK, signedValueColor(watts));
+  tft_ec11_draw_text_font(x + digitsWidth + unitGap, y + valueHeight - infoHeight, "W", FONT_INFO,
+                          TFT_EC11_BLACK, signedValueColor(watts));
+  y += valueHeight + 12;
+
+  snprintf(text, sizeof text, "%.1f V", (double)volts);
+  drawLeftText(y, text, FONT_INFO, TFT_EC11_BLACK, TFT_EC11_WHITE);
+
+  snprintf(text, sizeof text, "%.1f A", (double)amps);
+  drawRightAlignedText(y, width, text, PANEL_EDGE_MARGIN, FONT_INFO, TFT_EC11_BLACK,
+                       TFT_EC11_WHITE);
+  y += infoHeight + 16;
+
+  drawBar(y, width, watts, scale);
 
   drawBottomHint(width, height);
 }
@@ -423,7 +482,7 @@ static void drawPowerTextView(void)
 //-- AUX medium-press view: reception counters, network and configuration.
 static void drawSystemView(void)
 {
-  const loggerPowerSnapshot *snapshot = &board.panel;
+  const loggerPowerSnapshot* snapshot = &board.panel;
   int width = (int)tft_ec11_width();
   int height = (int)tft_ec11_height();
   char line[64];
@@ -431,7 +490,8 @@ static void drawSystemView(void)
   const int pitch = 16;
 
   drawScreenTitle(width, "SYSTEMINFO", "", "");
-  tft_ec11_fill_rect(0, PANEL_TITLE_H, width, height - PANEL_TITLE_H - PANEL_HINT_H, TFT_EC11_BLACK);
+  tft_ec11_fill_rect(0, PANEL_TITLE_H, width, height - PANEL_TITLE_H - PANEL_HINT_H,
+                     TFT_EC11_BLACK);
 
   snprintf(line, sizeof line, "Goedgekeurde telegrammen : %" PRIu32, snapshot->acceptedCount);
   drawLeftText(y, line, FONT_LABEL, TFT_EC11_BLACK, TFT_EC11_WHITE);
@@ -505,7 +565,7 @@ static void refreshAll(void)
 //-- power text screen, a medium-long press swaps the bars for the system
 //-- view (a short press returns), and the encoder cycles the phase shown on
 //-- the text screen. Events only act once the panel has taken over.
-static void handleBoardEvent(const tft_ec11_event_t *event)
+static void handleBoardEvent(const tft_ec11_event_t* event)
 {
   if (!board.panelActive)
   {
@@ -544,9 +604,11 @@ static void handleBoardEvent(const tft_ec11_event_t *event)
     return;
   }
 
-  if ((event->type == TFT_EC11_EVENT_ROTATE) && (board.mode == BOARD_MODE_POWER_TEXT) && (event->steps != 0))
+  if ((event->type == TFT_EC11_EVENT_ROTATE) && (board.mode == BOARD_MODE_POWER_TEXT) &&
+      (event->steps != 0))
   {
-    int wrapped = (((int)board.powerIndex + (int)event->steps) % PANEL_ROWS + PANEL_ROWS) % PANEL_ROWS;
+    int wrapped =
+        (((int)board.powerIndex + (int)event->steps) % PANEL_ROWS + PANEL_ROWS) % PANEL_ROWS;
 
     xSemaphoreTake(board.mutex, portMAX_DELAY);
     board.powerIndex = (uint8_t)wrapped;
@@ -555,7 +617,7 @@ static void handleBoardEvent(const tft_ec11_event_t *event)
   }
 }
 
-static void boardInputsTask(void *arg)
+static void boardInputsTask(void* arg)
 {
   tft_ec11_event_t event;
   (void)arg;
@@ -569,7 +631,7 @@ static void boardInputsTask(void *arg)
   }
 }
 
-static void update(char *field, size_t fieldSize, const char *value)
+static void update(char* field, size_t fieldSize, const char* value)
 {
   if (!board.available)
   {
@@ -604,7 +666,8 @@ esp_err_t loggerBoardInit(void)
   if (result != ESP_OK)
   {
     //-- No panel: the logger stays fully functional without debug lines.
-    ESP_LOGW(tag, "display init failed: %s, continuing without debug lines", esp_err_to_name(result));
+    ESP_LOGW(tag, "display init failed: %s, continuing without debug lines",
+             esp_err_to_name(result));
     return result;
   }
 
@@ -659,12 +722,12 @@ void loggerBoardSetRotation(bool upsideDown)
   ESP_LOGI(tag, "display orientation: %s", upsideDown ? "upside down" : "normal");
 }
 
-void loggerBoardShowScreen(const char *screen)
+void loggerBoardShowScreen(const char* screen)
 {
   update(board.screen, sizeof board.screen, screen);
 }
 
-void loggerBoardShowParserVersion(const char *version)
+void loggerBoardShowParserVersion(const char* version)
 {
   update(board.parserVersion, sizeof board.parserVersion, version);
 }
@@ -676,7 +739,7 @@ void loggerBoardNoteTelegram(uint32_t sequence)
   update(board.p1Note, sizeof board.p1Note, note);
 }
 
-void loggerBoardWifiPortal(const char *url)
+void loggerBoardWifiPortal(const char* url)
 {
   update(board.wifiStatus, sizeof board.wifiStatus, "portal open");
 
@@ -685,7 +748,7 @@ void loggerBoardWifiPortal(const char *url)
   update(board.wifiIp, sizeof board.wifiIp, ipLine);
 }
 
-void loggerBoardWifiConnected(const char *ssid, const char *ip)
+void loggerBoardWifiConnected(const char* ssid, const char* ip)
 {
   char status[BOARD_TEXT_MAX];
   snprintf(status, sizeof status, "joined %s", (ssid != NULL) ? ssid : "?");
@@ -702,7 +765,7 @@ void loggerBoardWifiConnected(const char *ssid, const char *ip)
   xSemaphoreGive(board.mutex);
 }
 
-void loggerBoardShowPower(const loggerPowerSnapshot *snapshot)
+void loggerBoardShowPower(const loggerPowerSnapshot* snapshot)
 {
   if (!board.available || (snapshot == NULL))
   {

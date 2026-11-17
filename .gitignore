@@ -21,6 +21,7 @@ sdkconfig.old
 
 # PlatformIO output, if used locally
 .pio/
+.pio.nosync/
 
 # Other
 .claude/

@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-16 · Build: 10
+// Date: 2026-11-17 · Build: 13
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -60,7 +60,7 @@ function bindElements()
                "selCountry", "selProfile", "selMbus1", "selMbus2", "selMbus3", "selMbus4",
                "saveSettings", "telegramState", "showTelegram", "telegramLog",
                "telegramDetail", "recordMeta", "recordNotes", "summaryTable", "rawView", "footerInfo",
-               "powerState", "powerPanel", "powerTelegram", "powerMeterTime", "powerRows",
+               "powerPanel", "powerTelegram", "powerRows",
                "powerScaleLabel", "powerSpark",
                "viewSettings", "viewTelegrams", "viewPower"];
 
@@ -725,9 +725,11 @@ function renderDetail(detail)
 
 // Replica of the TFT power panel: one centre-zero bar per phase plus Totaal
 // on the same ladder the display uses (the device sends the picked scale,
-// so both present the same numbers). Consumption grows red to the left of
-// centre, feed-in green to the right. Below the bars a sparkline follows the
-// total power across the retained samples of this page visit.
+// so both present the same numbers), with the measured watt value above
+// each bar. Consumption grows red to the left of centre, feed-in green to
+// the right. Below the bars a vertical-bar history follows the total power
+// across the last 90 accepted measurements kept by the device: one
+// centre-zero bar per accepted telegram on hairline scale division lines.
 const POWER_ROWS =
 [
   {label: "Fase 1"},
@@ -736,8 +738,9 @@ const POWER_ROWS =
   {label: "Totaal"},
 ];
 
-// The newest retained total samples for the sparkline (one per accepted
-// telegram, oldest first).
+// The device keeps and sends the newest 90 accepted total watts for the
+// bar history (one sample per accepted telegram, oldest first); this cap
+// also guards the local fallback of older firmware without the array.
 const POWER_HISTORY_MAX = 90;
 
 const powerRowRefs = [];
@@ -811,18 +814,13 @@ function buildPowerRows()
     value.className = "powerWatt";
 
     rowDiv.appendChild(head);
-    rowDiv.appendChild(track);
     rowDiv.appendChild(value);
+    rowDiv.appendChild(track);
     el.powerRows.appendChild(rowDiv);
 
     powerRowRefs.push({label: label, ampsChip: ampsChip, voltsChip: voltsChip, consumeFill: consumeFill,
                        produceFill: produceFill, tickLeft: tickLeft, tickRight: tickRight, value: value});
   });
-}
-
-function setPowerState(message)
-{
-  el.powerState.textContent = message;
 }
 
 function formatWatt(watts)
@@ -842,7 +840,6 @@ function renderPower(message)
   if (!message.valid)
   {
     el.powerPanel.hidden = true;
-    setPowerState("No accepted telegram yet: the realtime diagram awaits the first frame.");
     return;
   }
 
@@ -854,7 +851,6 @@ function renderPower(message)
   }
 
   el.powerTelegram.textContent = "Telegram #" + message.sequence + (message.testMode ? " · test data" : "");
-  el.powerMeterTime.textContent = message.meterTime || "meter time unavailable";
   el.powerScaleLabel.textContent = "Bar scale " + message.scale + " W · the same ladder the display uses";
   lastPowerScale = message.scale;
 
@@ -883,9 +879,19 @@ function renderPower(message)
     row.voltsChip.classList.toggle("dim", volts <= 0);
   });
 
-  // One sample per newly accepted telegram: the device pushes the frame the
-  // moment a telegram arrives, so the history grows at the read cadence.
-  if (message.sequence !== state.powerLastSeq)
+  // The device keeps the last 90 accepted total watts and sends them with
+  // every frame, oldest first: the history then always shows the last 90
+  // accepted measurements, across reloads, reconnects and view switches.
+  // Without the array (older firmware) fall back to sampling the pushed
+  // frames locally: one sample per newly accepted telegram.
+  if (Array.isArray(message.history))
+  {
+    state.powerHistory = message.history.slice(-POWER_HISTORY_MAX).map((total) =>
+    {
+      return {total: total};
+    });
+  }
+  else if (message.sequence !== state.powerLastSeq)
   {
     state.powerLastSeq = message.sequence;
     state.powerHistory.push({seq: message.sequence, total: message.total.watts});
@@ -897,10 +903,6 @@ function renderPower(message)
   }
 
   drawPowerSpark(message.scale);
-
-  const updated = new Date().toLocaleTimeString("en-GB");
-  setPowerState("Live · every " + (message.intervalSeconds || "?") + " s read · updated " + updated +
-                (message.meterTime ? " · meter " + message.meterTime : ""));
 }
 
 function cssVar(name, fallback)
@@ -941,13 +943,14 @@ function drawPowerSpark(scale)
   const zeroColor = cssVar("--hairline", "rgba(60, 60, 67, 0.29)");
   const secondaryColor = cssVar("--secondary", "#6e6e73");
 
-  // Half-scale gridlines above and below the zero line, plus the zero line.
-  [scale / 2, scale].forEach((level) =>
+  // Very thin scale division lines every quarter of the ladder step, above
+  // and below the zero line; the zero line itself stays a touch stronger.
+  ctx.lineWidth = 0.5;
+
+  [0.25, 0.5, 0.75, 1].forEach((fraction) =>
   {
-    const offset = (level / scale) * halfSpan;
+    const offset = fraction * halfSpan;
     ctx.strokeStyle = gridColor;
-    ctx.lineWidth = 1;
-    ctx.setLineDash([3, 4]);
     ctx.beginPath();
     ctx.moveTo(0, mid - offset);
     ctx.lineTo(cssWidth, mid - offset);
@@ -956,7 +959,6 @@ function drawPowerSpark(scale)
     ctx.stroke();
   });
 
-  ctx.setLineDash([]);
   ctx.strokeStyle = zeroColor;
   ctx.beginPath();
   ctx.moveTo(0, mid);
@@ -977,7 +979,10 @@ function drawPowerSpark(scale)
     return;
   }
 
-  const step = (samples.length > 1) ? (cssWidth / (samples.length - 1)) : 0;
+  // One slot per retained sample so the bars keep a steady pitch as the
+  // history fills up; the bar stays inside its slot.
+  const slot = cssWidth / samples.length;
+  const barWidth = Math.max(1, Math.min(10, Math.floor(slot * 0.65)));
 
   function yOf(total)
   {
@@ -985,42 +990,30 @@ function drawPowerSpark(scale)
     return mid - (clamped / scale) * halfSpan;
   }
 
-  function xOf(index)
+  function centreOf(index)
   {
-    return (samples.length > 1) ? (index * step) : (cssWidth / 2);
+    return (samples.length === 1) ? (cssWidth / 2) : ((index + 0.5) * slot);
   }
 
-  // Filled area between the curve and the zero line, tinted by sign:
-  // consumption below, feed-in above.
-  for (let index = 0; index < samples.length - 1; index++)
+  // Centre-zero bars: consumption hangs red below the zero line, feed-in
+  // grows green above it, with a brighter cap at the value end so even the
+  // thinnest bars stay readable.
+  samples.forEach((sample, index) =>
   {
-    const avg = (samples[index].total + samples[index + 1].total) / 2;
-    ctx.fillStyle = (avg < 0) ? "rgba(255, 59, 48, 0.16)" : "rgba(52, 199, 89, 0.16)";
-    ctx.beginPath();
-    ctx.moveTo(xOf(index), mid);
-    ctx.lineTo(xOf(index), yOf(samples[index].total));
-    ctx.lineTo(xOf(index + 1), yOf(samples[index + 1].total));
-    ctx.lineTo(xOf(index + 1), mid);
-    ctx.closePath();
-    ctx.fill();
-  }
+    const produce = sample.total >= 0;
+    const barHeight = Math.max(1, Math.abs(yOf(sample.total) - mid));
+    const x = centreOf(index) - barWidth / 2;
 
-  ctx.lineWidth = 2;
-  ctx.lineJoin = "round";
+    ctx.fillStyle = produce ? "rgba(52, 199, 89, 0.7)" : "rgba(255, 59, 48, 0.7)";
+    ctx.fillRect(x, produce ? (mid - barHeight) : mid, barWidth, barHeight);
 
-  for (let index = 0; index < samples.length - 1; index++)
-  {
-    const avg = (samples[index].total + samples[index + 1].total) / 2;
-    ctx.strokeStyle = (avg < 0) ? consumeColor : produceColor;
-    ctx.beginPath();
-    ctx.moveTo(xOf(index), yOf(samples[index].total));
-    ctx.lineTo(xOf(index + 1), yOf(samples[index + 1].total));
-    ctx.stroke();
-  }
+    ctx.fillStyle = produce ? produceColor : consumeColor;
+    ctx.fillRect(x, produce ? (mid - barHeight) : (mid + barHeight - 1), barWidth, 1);
+  });
 
-  // The latest reading as a glowing dot at the right edge.
+  // The latest reading as a glowing dot above the newest bar.
   const last = samples[samples.length - 1];
-  const lastX = xOf(samples.length - 1);
+  const lastX = centreOf(samples.length - 1);
   const lastY = yOf(last.total);
   const lastColor = (last.total < 0) ? consumeColor : produceColor;
 
@@ -1137,7 +1130,7 @@ function boot()
     fillProfiles(el.selCountry.value, null);
   });
 
-  // The sparkline is drawn to the container width: redraw on resize while
+  // The bar history is drawn to the container width: redraw on resize while
   // the realtime view is open (before the first frame there is no scale to
   // draw with, so the last known one is guarded inside).
   window.addEventListener("resize", () =>

@@ -1,7 +1,7 @@
 # lastDSMRlogger
 
-Buildnumber: 16
-Last update-date: 2026-11-16
+Buildnumber: 19
+Last update-date: 2026-11-17
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -184,14 +184,20 @@ the device.
   omitted; a channel without a reading shows `(unavailable)` while a
   measured zero stays visible) and the raw frame shown as plain text with
   original line endings and trailer.
-- **Realtime**: a web replica of the on-device power panel. One
-  centre-zero bar per phase plus **Totaal** — consumption red to the left
-  of centre, feed-in green to the right — on the very same scale ladder
-  the display uses (500/1000/1700/2400/3100/3800 W, the device picks the
-  step and sends it), each row carrying its current and voltage chips and
-  its signed watt value with animated fills. Below the bars a sparkline
-  follows the total power across the last 90 accepted telegrams of the
-  page visit, with a half-scale gridline and zero line. The view refreshes
+- **Realtime**: a web replica of the on-device power panel, opening with a
+  blue name bar that prints **RealtimePower** left aligned and the
+  telegram counter right aligned. One centre-zero bar per phase plus
+  **Totaal** — consumption red to the left of centre, feed-in green to the
+  right — on the very same scale ladder the display uses
+  (100/250/500/1000/1700/2400/3100/3800 W, the device picks the step and
+  sends it), each row carrying its current and voltage chips and its
+  signed watt value centred above the bar with animated fills. Below
+  the bars a vertical-bar history follows the total power across the last
+  90 accepted measurements kept by the device (one sample per accepted
+  telegram, so the history survives page reloads, reconnects and view
+  switches): one centre-zero bar per telegram with a brighter cap at the
+  value end, drawn over very thin scale division lines every quarter step
+  and a zero line. The view refreshes
   at least every five seconds, and every read interval when the interval
   is shorter: the device pushes the newest power frame the moment a
   telegram is accepted and the SPA polls `cmd=power` on its own timer as
@@ -218,14 +224,17 @@ power bars, the net power is *returned minus delivered*: consumption reads
 negative and is drawn **red** to the left of centre, feed-in reads positive
 and is drawn **green** to the right. The bar scale adapts to the size of
 the largest absolute watt of the frame: the smallest step of
-3800 → 3100 → 2400 → 1700 → 1000 → 500 W that fits it (a frame above
+3800 → 3100 → 2400 → 1700 → 1000 → 500 → 250 → 100 W that fits it (a frame above
 3800 W fills the bar at the 3800 W step). The panel layout adapts to the
 orientation reported by the board component (320×240 or 240×320).
 
 The board inputs are driven through the component's event queue (AUX button
-and encoder). A **short AUX press** from the power panel opens a text
-screen showing *Geleverd vermogen* and *Opgewekte vermogen* of the selected
-object; the **encoder** cycles Fase 1 → Fase 2 → Fase 3 → Totaal (and back
+and encoder). A **short AUX press** from the power panel opens the
+per-phase screen: the net watts of the selected object as a large centred
+number with a smaller `W` unit next to it, the voltage left and the
+current right in smaller digits on one row below it, and a centre-zero
+watt bar on the same ladder step the graphics panel picked; the **encoder**
+cycles Fase 1 → Fase 2 → Fase 3 → Totaal (and back
 when turning the other way). A **medium-long AUX press** replaces the bars
 with a system information view: accepted and rejected telegram counts, IP
 address, SSID, uptime, country/protocol and the P1 RX polarity (normal or
@@ -252,7 +261,7 @@ and the web status strip stay complete regardless.
 |GET    |`/api/telegrams`            |Metadata of retained records (incl. `meterTimeText` from OBIS `0-0:1.0.0`), newest first |
 |GET    |`/api/telegram/<seq>`       |Decoded detail of one record                                  |
 |GET    |`/api/telegram/<seq>/raw`   |Exact accepted frame bytes as `text/plain`                    |
-|GET    |`/api/power`                |Realtime power frame of the newest accepted telegram (phases and total watts/amps/volts, meter time, scale ladder step) |
+|GET    |`/api/power`                |Realtime power frame of the newest accepted telegram (phases and total watts/amps/volts, meter time, scale ladder step, history of the newest 90 accepted total watts) |
 |POST   |`/api/view`                 |Reports the active browser screen name to the device display  |
 
 ### Test data mode
@@ -365,8 +374,9 @@ effect on UART reception.
    interval is read into the Telegrams view; console and reception operate
    together. The TFT switches to the power panel with the first accepted
    telegram and shows the phase and total watt bars with the meter
-   date/time. A short AUX press opens the delivered/returned power text
-   screen (the encoder cycles Fase 1 → Fase 2 → Fase 3 → Totaal), a
+   date/time. A short AUX press opens the per-phase power screen with the
+   large centred watts, the volts/amperes row and the centre-zero bar (the
+   encoder cycles Fase 1 → Fase 2 → Fase 3 → Totaal), a
    medium-long AUX press shows the system information view, and a short
    press returns to the bars.
 4. Power-cycle the device: the configuration survives and reception restarts.
