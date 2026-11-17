@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_board.c - on-device TFT debug lines and power panel
-//-- Date: 2026-11-16 · Build: 9
+//-- Date: 2026-11-16 · Build: 10
 //--
 //-- Everything is drawn through the documented API of the esp32_s3_piggyback
 //-- component: tft_ec11_init once, then filled rectangles and fixed-width
@@ -91,7 +91,9 @@ static const char *tag = "loggerBoard";
 
 //-- Bar scale ladder: the smallest step that fits the largest absolute
 //-- watt of the frame; frames above 3800 W stay on the 3800 W step.
-static const uint16_t powerScales[] = {500u, 1000u, 1700u, 2400u, 3100u, 3800u};
+//-- Published for the SPA realtime view so its bars scale identically to
+//-- the panel (logger_board.h).
+const uint16_t loggerPowerScales[LOGGER_POWER_SCALE_COUNT] = {500u, 1000u, 1700u, 2400u, 3100u, 3800u};
 
 //-- Panel colours (RGB565).
 #define PANEL_HEADER_COLOR TFT_EC11_RGB565(43, 60, 94)
@@ -177,7 +179,8 @@ static uint16_t signedValueColor(float value)
 
 //-- Smallest ladder step that fits the largest absolute watt, so the bar
 //-- scale follows the size of the consumption and feed-in of the frame.
-static uint16_t pickPowerScale(const loggerPowerSnapshot *snapshot)
+//-- Also answers the scale for the SPA realtime view (logger_board.h).
+uint16_t loggerBoardPickPowerScale(const loggerPowerSnapshot *snapshot)
 {
   float maxAbs = 0.0f;
   const float values[PANEL_ROWS] = {snapshot->phaseWatts[0], snapshot->phaseWatts[1],
@@ -193,15 +196,15 @@ static uint16_t pickPowerScale(const loggerPowerSnapshot *snapshot)
     }
   }
 
-  for (size_t step = 0u; step < sizeof powerScales / sizeof powerScales[0]; step++)
+  for (size_t step = 0u; step < LOGGER_POWER_SCALE_COUNT; step++)
   {
-    if (maxAbs <= (float)powerScales[step])
+    if (maxAbs <= (float)loggerPowerScales[step])
     {
-      return powerScales[step];
+      return loggerPowerScales[step];
     }
   }
 
-  return powerScales[(sizeof powerScales / sizeof powerScales[0]) - 1u];
+  return loggerPowerScales[LOGGER_POWER_SCALE_COUNT - 1u];
 }
 
 //-- Cell metrics of the documented native faces: the advance carries the
@@ -361,7 +364,7 @@ static void drawPowerRow(int index, float watts, float amps, float volts, int y,
 static void drawPanel(void)
 {
   const loggerPowerSnapshot *snapshot = &board.panel;
-  uint16_t scale = pickPowerScale(snapshot);
+  uint16_t scale = loggerBoardPickPowerScale(snapshot);
   int width = (int)tft_ec11_width();
   int height = (int)tft_ec11_height();
   int rowHeight = (height - PANEL_TITLE_H) / PANEL_ROWS;

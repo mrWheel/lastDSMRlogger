@@ -1,14 +1,15 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-16 · Build: 9
+// Date: 2026-11-16 · Build: 10
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
 // needs one registry entry plus a matching section in index.html and a
 // command on the device. The Telegrams view opens first.
 // All dynamic data travels over one WebSocket at /ws: the
-// device pushes status and the telegram list, the browser sends
-// form-urlencoded commands (cmd=config, cmd=save, cmd=telegram, cmd=raw,
-// cmd=view, cmd=telegrams). Raw telegram bytes arrive as a binary frame
+// device pushes status, the telegram list and the realtime power frame, the
+// browser sends form-urlencoded commands (cmd=config, cmd=save,
+// cmd=telegram, cmd=raw, cmd=view, cmd=telegrams, cmd=power). Raw telegram
+// bytes arrive as a binary frame
 // behind their JSON header. Every rendering path uses textContent so
 // telegram text is never interpreted as HTML. The active screen name is
 // reported to the device so the on-device debug lines show what the browser
@@ -27,6 +28,9 @@ const state =
   pendingRawSeq: null,
   ws: null,
   wsReady: false,
+  lastStatus: null,
+  powerLastSeq: null,
+  powerHistory: [],
 };
 
 // One entry per feature view: the tab bar and the view switching are driven
@@ -37,6 +41,7 @@ const VIEWS =
 [
   {id: "settings", label: "Settings", section: "viewSettings", command: "cmd=config"},
   {id: "telegrams", label: "Telegrams", section: "viewTelegrams", command: "cmd=telegrams"},
+  {id: "power", label: "Realtime", section: "viewPower", command: "cmd=power"},
 ];
 
 const el = {};
@@ -55,7 +60,9 @@ function bindElements()
                "selCountry", "selProfile", "selMbus1", "selMbus2", "selMbus3", "selMbus4",
                "saveSettings", "telegramState", "showTelegram", "telegramLog",
                "telegramDetail", "recordMeta", "recordNotes", "summaryTable", "rawView", "footerInfo",
-               "viewSettings", "viewTelegrams"];
+               "powerState", "powerPanel", "powerTelegram", "powerMeterTime", "powerRows",
+               "powerScaleLabel", "powerSpark",
+               "viewSettings", "viewTelegrams", "viewPower"];
 
   ids.forEach((id) =>
   {
@@ -114,6 +121,7 @@ function wsConnect()
     state.wsReady = true;
     el.statusStrip.textContent = "Connected to the logger.";
     requestCurrentView();
+    updatePowerPolling();
   };
 
   socket.onclose = () =>
@@ -176,6 +184,10 @@ function handleTextMessage(message)
 
     case "telegram":
       renderDetail(message);
+      break;
+
+    case "power":
+      renderPower(message);
       break;
 
     case "raw":
@@ -248,6 +260,9 @@ const STATE_LABELS =
 
 function renderStatus(status)
 {
+  // The realtime view sizes its poll cadence from the active read interval.
+  state.lastStatus = status;
+
   let text = "State: " + (STATE_LABELS[status.state] || status.state);
 
   if (status.activeProfileId)
@@ -705,6 +720,348 @@ function renderDetail(detail)
 }
 
 //-- --------------------------------------------------------------------------
+//-- Realtime power view
+//-- --------------------------------------------------------------------------
+
+// Replica of the TFT power panel: one centre-zero bar per phase plus Totaal
+// on the same ladder the display uses (the device sends the picked scale,
+// so both present the same numbers). Consumption grows red to the left of
+// centre, feed-in green to the right. Below the bars a sparkline follows the
+// total power across the retained samples of this page visit.
+const POWER_ROWS =
+[
+  {label: "Fase 1"},
+  {label: "Fase 2"},
+  {label: "Fase 3"},
+  {label: "Totaal"},
+];
+
+// The newest retained total samples for the sparkline (one per accepted
+// telegram, oldest first).
+const POWER_HISTORY_MAX = 90;
+
+const powerRowRefs = [];
+let powerTimer = null;
+
+// Scale ladder step of the newest power frame: kept for redraws (resizes)
+// that happen without a fresh message.
+let lastPowerScale = 500;
+
+function buildPowerRows()
+{
+  el.powerRows.textContent = "";
+  powerRowRefs.length = 0;
+
+  POWER_ROWS.forEach((row) =>
+  {
+    const rowDiv = document.createElement("div");
+    rowDiv.className = "powerRow";
+
+    const head = document.createElement("div");
+    head.className = "powerRowHead";
+
+    const label = document.createElement("span");
+    label.className = "powerPhaseLabel";
+    label.textContent = row.label;
+
+    const chips = document.createElement("span");
+    chips.className = "powerChips";
+
+    const ampsChip = document.createElement("span");
+    ampsChip.className = "chip";
+
+    const voltsChip = document.createElement("span");
+    voltsChip.className = "chip";
+
+    chips.appendChild(ampsChip);
+    chips.appendChild(voltsChip);
+    head.appendChild(label);
+    head.appendChild(chips);
+
+    const track = document.createElement("div");
+    track.className = "powerBarTrack";
+
+    const consumeFill = document.createElement("div");
+    consumeFill.className = "powerBarFill consume";
+
+    const produceFill = document.createElement("div");
+    produceFill.className = "powerBarFill produce";
+
+    const zeroLine = document.createElement("div");
+    zeroLine.className = "powerBarZero";
+
+    const tickLeft = document.createElement("span");
+    tickLeft.className = "powerTick left";
+
+    const tickMid = document.createElement("span");
+    tickMid.className = "powerTick mid";
+    tickMid.textContent = "0";
+
+    const tickRight = document.createElement("span");
+    tickRight.className = "powerTick right";
+
+    track.appendChild(consumeFill);
+    track.appendChild(produceFill);
+    track.appendChild(zeroLine);
+    track.appendChild(tickLeft);
+    track.appendChild(tickMid);
+    track.appendChild(tickRight);
+
+    const value = document.createElement("div");
+    value.className = "powerWatt";
+
+    rowDiv.appendChild(head);
+    rowDiv.appendChild(track);
+    rowDiv.appendChild(value);
+    el.powerRows.appendChild(rowDiv);
+
+    powerRowRefs.push({label: label, ampsChip: ampsChip, voltsChip: voltsChip, consumeFill: consumeFill,
+                       produceFill: produceFill, tickLeft: tickLeft, tickRight: tickRight, value: value});
+  });
+}
+
+function setPowerState(message)
+{
+  el.powerState.textContent = message;
+}
+
+function formatWatt(watts)
+{
+  const rounded = Math.round(watts);
+  const sign = (rounded < 0) ? "-" : ((rounded > 0) ? "+" : "");
+  return sign + Math.abs(rounded).toLocaleString("en-GB") + " W";
+}
+
+function renderPower(message)
+{
+  if (state.screen !== "power")
+  {
+    return;
+  }
+
+  if (!message.valid)
+  {
+    el.powerPanel.hidden = true;
+    setPowerState("No accepted telegram yet: the realtime diagram awaits the first frame.");
+    return;
+  }
+
+  el.powerPanel.hidden = false;
+
+  if (powerRowRefs.length === 0)
+  {
+    buildPowerRows();
+  }
+
+  el.powerTelegram.textContent = "Telegram #" + message.sequence + (message.testMode ? " · test data" : "");
+  el.powerMeterTime.textContent = message.meterTime || "meter time unavailable";
+  el.powerScaleLabel.textContent = "Bar scale " + message.scale + " W · the same ladder the display uses";
+  lastPowerScale = message.scale;
+
+  const values = [message.phases[0], message.phases[1], message.phases[2], message.total];
+
+  values.forEach((entry, index) =>
+  {
+    const row = powerRowRefs[index];
+    const watts = (typeof entry.watts === "number") ? entry.watts : 0;
+    const fraction = Math.min(1, Math.abs(watts) / message.scale);
+
+    row.consumeFill.style.width = (watts < 0) ? (fraction * 50).toFixed(2) + "%" : "0%";
+    row.produceFill.style.width = (watts > 0) ? (fraction * 50).toFixed(2) + "%" : "0%";
+
+    row.tickLeft.textContent = "-" + message.scale;
+    row.tickRight.textContent = String(message.scale);
+
+    row.value.textContent = formatWatt(watts);
+    row.value.classList.toggle("consume", watts < 0);
+    row.value.classList.toggle("produce", watts > 0);
+
+    const amps = (typeof entry.amps === "number") ? entry.amps : 0;
+    const volts = (typeof entry.volts === "number") ? entry.volts : 0;
+    row.ampsChip.textContent = (amps >= 0 ? "" : "-") + Math.abs(amps).toFixed(2) + " A";
+    row.voltsChip.textContent = volts.toFixed(1) + " V";
+    row.voltsChip.classList.toggle("dim", volts <= 0);
+  });
+
+  // One sample per newly accepted telegram: the device pushes the frame the
+  // moment a telegram arrives, so the history grows at the read cadence.
+  if (message.sequence !== state.powerLastSeq)
+  {
+    state.powerLastSeq = message.sequence;
+    state.powerHistory.push({seq: message.sequence, total: message.total.watts});
+
+    while (state.powerHistory.length > POWER_HISTORY_MAX)
+    {
+      state.powerHistory.shift();
+    }
+  }
+
+  drawPowerSpark(message.scale);
+
+  const updated = new Date().toLocaleTimeString("en-GB");
+  setPowerState("Live · every " + (message.intervalSeconds || "?") + " s read · updated " + updated +
+                (message.meterTime ? " · meter " + message.meterTime : ""));
+}
+
+function cssVar(name, fallback)
+{
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return value || fallback;
+}
+
+function drawPowerSpark(scale)
+{
+  const canvas = el.powerSpark;
+
+  if (canvas === null)
+  {
+    return;
+  }
+
+  const wrap = canvas.parentElement;
+  const cssWidth = Math.max(240, wrap.clientWidth);
+  const cssHeight = 130;
+  const dpr = window.devicePixelRatio || 1;
+
+  canvas.width = Math.round(cssWidth * dpr);
+  canvas.height = Math.round(cssHeight * dpr);
+  canvas.style.width = cssWidth + "px";
+  canvas.style.height = cssHeight + "px";
+
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+  const mid = cssHeight / 2;
+  const padY = 10;
+  const halfSpan = mid - padY;
+  const consumeColor = "#ff3b30";
+  const produceColor = "#34c759";
+  const gridColor = cssVar("--separator", "rgba(60, 60, 67, 0.12)");
+  const zeroColor = cssVar("--hairline", "rgba(60, 60, 67, 0.29)");
+  const secondaryColor = cssVar("--secondary", "#6e6e73");
+
+  // Half-scale gridlines above and below the zero line, plus the zero line.
+  [scale / 2, scale].forEach((level) =>
+  {
+    const offset = (level / scale) * halfSpan;
+    ctx.strokeStyle = gridColor;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 4]);
+    ctx.beginPath();
+    ctx.moveTo(0, mid - offset);
+    ctx.lineTo(cssWidth, mid - offset);
+    ctx.moveTo(0, mid + offset);
+    ctx.lineTo(cssWidth, mid + offset);
+    ctx.stroke();
+  });
+
+  ctx.setLineDash([]);
+  ctx.strokeStyle = zeroColor;
+  ctx.beginPath();
+  ctx.moveTo(0, mid);
+  ctx.lineTo(cssWidth, mid);
+  ctx.stroke();
+
+  ctx.font = "10px " + cssVar("--mono", "monospace");
+  ctx.fillStyle = secondaryColor;
+  ctx.textBaseline = "top";
+  ctx.fillText("+" + scale + " W", 4, padY - 8 < 0 ? 0 : padY - 8);
+  ctx.textBaseline = "bottom";
+  ctx.fillText("-" + scale + " W", 4, cssHeight);
+
+  const samples = state.powerHistory;
+
+  if (samples.length === 0)
+  {
+    return;
+  }
+
+  const step = (samples.length > 1) ? (cssWidth / (samples.length - 1)) : 0;
+
+  function yOf(total)
+  {
+    const clamped = Math.max(-scale, Math.min(scale, total));
+    return mid - (clamped / scale) * halfSpan;
+  }
+
+  function xOf(index)
+  {
+    return (samples.length > 1) ? (index * step) : (cssWidth / 2);
+  }
+
+  // Filled area between the curve and the zero line, tinted by sign:
+  // consumption below, feed-in above.
+  for (let index = 0; index < samples.length - 1; index++)
+  {
+    const avg = (samples[index].total + samples[index + 1].total) / 2;
+    ctx.fillStyle = (avg < 0) ? "rgba(255, 59, 48, 0.16)" : "rgba(52, 199, 89, 0.16)";
+    ctx.beginPath();
+    ctx.moveTo(xOf(index), mid);
+    ctx.lineTo(xOf(index), yOf(samples[index].total));
+    ctx.lineTo(xOf(index + 1), yOf(samples[index + 1].total));
+    ctx.lineTo(xOf(index + 1), mid);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  ctx.lineWidth = 2;
+  ctx.lineJoin = "round";
+
+  for (let index = 0; index < samples.length - 1; index++)
+  {
+    const avg = (samples[index].total + samples[index + 1].total) / 2;
+    ctx.strokeStyle = (avg < 0) ? consumeColor : produceColor;
+    ctx.beginPath();
+    ctx.moveTo(xOf(index), yOf(samples[index].total));
+    ctx.lineTo(xOf(index + 1), yOf(samples[index + 1].total));
+    ctx.stroke();
+  }
+
+  // The latest reading as a glowing dot at the right edge.
+  const last = samples[samples.length - 1];
+  const lastX = xOf(samples.length - 1);
+  const lastY = yOf(last.total);
+  const lastColor = (last.total < 0) ? consumeColor : produceColor;
+
+  ctx.beginPath();
+  ctx.arc(lastX, lastY, 6, 0, Math.PI * 2);
+  ctx.fillStyle = (last.total < 0) ? "rgba(255, 59, 48, 0.25)" : "rgba(52, 199, 89, 0.25)";
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(lastX, lastY, 3, 0, Math.PI * 2);
+  ctx.fillStyle = lastColor;
+  ctx.fill();
+}
+
+function powerPollDelayMs()
+{
+  const intervalSeconds = (state.lastStatus && state.lastStatus.intervalSeconds) ? state.lastStatus.intervalSeconds : 5;
+  const delay = Math.min(5000, intervalSeconds * 1000);
+  return Math.max(1000, delay);
+}
+
+// The realtime view refreshes at least every five seconds; with a shorter
+// read interval it follows that cadence instead. Device pushes on every
+// accepted telegram keep the bars fresh in between.
+function updatePowerPolling()
+{
+  clearTimeout(powerTimer);
+  powerTimer = null;
+
+  if (state.screen !== "power")
+  {
+    return;
+  }
+
+  powerTimer = setTimeout(() =>
+  {
+    wsSend("cmd=power");
+    updatePowerPolling();
+  }, powerPollDelayMs());
+}
+
+//-- --------------------------------------------------------------------------
 //-- View switching and boot
 //-- --------------------------------------------------------------------------
 
@@ -747,6 +1104,7 @@ function showScreen(name)
 
   wsSend(view.command);
   reportActiveScreen();
+  updatePowerPolling();
 }
 
 function boot()
@@ -777,6 +1135,17 @@ function boot()
   el.selCountry.addEventListener("change", () =>
   {
     fillProfiles(el.selCountry.value, null);
+  });
+
+  // The sparkline is drawn to the container width: redraw on resize while
+  // the realtime view is open (before the first frame there is no scale to
+  // draw with, so the last known one is guarded inside).
+  window.addEventListener("resize", () =>
+  {
+    if (state.screen === "power")
+    {
+      drawPowerSpark(lastPowerScale);
+    }
   });
 
   wsConnect();

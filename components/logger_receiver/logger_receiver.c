@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.c - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-16 · Build: 15
+//-- Date: 2026-11-16 · Build: 16
 //--
 //-- The parserDSMR adapter task owns the parser instance while it runs. The
 //-- event callback copies the complete accepted frame and the decoded fields
@@ -131,6 +131,13 @@ typedef struct
 
   bool hasLastAccepted;
   uint32_t lastAcceptedUptimeMs;
+
+  //-- Power frame of the most recently accepted telegram: the same frame the
+  //-- TFT panel shows, kept for the SPA realtime view. Stored under the
+  //-- mutex when the accepted path hands it to the board as well.
+  loggerPowerSnapshot lastPower;
+  uint32_t lastPowerUptimeMs;
+  bool hasLastPower;
 
   //-- True while a burst was selected and waits for the forwarding task.
   //-- The burst sends the exact bytes from the dedicated forward buffer
@@ -796,6 +803,14 @@ static void onParserEvent(const dsmrParser *parser, const dsmrParserEvent *event
     }
 
     loggerBoardShowPower(&powerSnapshot);
+
+    //-- The SPA realtime view reads the very same frame through
+    //-- loggerReceiverGetPowerSnapshot: keep a copy under the mutex.
+    xSemaphoreTake(self->mutex, portMAX_DELAY);
+    self->lastPower = powerSnapshot;
+    self->lastPowerUptimeMs = result->receiveTimeMs;
+    self->hasLastPower = true;
+    xSemaphoreGive(self->mutex);
 
     //-- One console line per accepted telegram: sequence, meter time from
     //-- OBIS 0-0:1.0.0, size, CRC verdict and active profile.
@@ -1894,6 +1909,28 @@ void loggerReceiverGetStatus(loggerReceiverStatus *status)
   }
 
   xSemaphoreGive(self->mutex);
+}
+
+bool loggerReceiverGetPowerSnapshot(loggerPowerSnapshot *snapshot, uint32_t *capturedUptimeMs)
+{
+  LoggerReceiver *self = &instance;
+
+  if ((snapshot == NULL) || (capturedUptimeMs == NULL))
+  {
+    return false;
+  }
+
+  xSemaphoreTake(self->mutex, portMAX_DELAY);
+  bool found = self->hasLastPower;
+
+  if (found)
+  {
+    *snapshot = self->lastPower;
+    *capturedUptimeMs = self->lastPowerUptimeMs;
+  }
+
+  xSemaphoreGive(self->mutex);
+  return found;
 }
 
 bool loggerReceiverGetActiveConfig(loggerSettingsConfig *config)

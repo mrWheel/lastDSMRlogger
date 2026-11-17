@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_board.h - on-device TFT debug lines and power panel
-//-- Date: 2026-11-16 · Build: 9
+//-- Date: 2026-11-16 · Build: 10
 //--
 //-- The first release has no on-device user interface. The TFT shows debug
 //-- lines describing what the device is doing: the active browser screen
@@ -87,6 +87,17 @@ typedef struct
   bool rxInverted;
   uint32_t uptimeSeconds;
 } loggerPowerSnapshot;
+
+//-- Watt scale ladder shared by the panel bars and the SPA realtime view:
+//-- the smallest step that fits the largest absolute watt of a frame is
+//-- picked, so both presentations scale identically. Frames above the
+//-- largest step stay on that step.
+#define LOGGER_POWER_SCALE_COUNT 6u
+extern const uint16_t loggerPowerScales[LOGGER_POWER_SCALE_COUNT];
+
+//-- Smallest ladder step that fits the largest absolute watt of the frame
+//-- (the three phases and the total). Falls back to the largest step.
+uint16_t loggerBoardPickPowerScale(const loggerPowerSnapshot *snapshot);
 
 //-- Clears the screen and takes it over completely with the power panel:
 //-- a white name bar ("TELEGRAM nnn" left aligned) with a sub band below

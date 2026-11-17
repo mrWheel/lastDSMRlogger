@@ -1,12 +1,13 @@
 # lastDSMRlogger
 
-Buildnumber: 15
+Buildnumber: 16
 Last update-date: 2026-11-16
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
-shows recent telegrams in a single-page web application with two views:
-Settings and Telegrams. Configuration is stored in NVS and survives a power
+shows recent telegrams in a single-page web application with three views:
+Settings, Telegrams and Realtime (a web replica of the on-device power
+panel). Configuration is stored in NVS and survives a power
 cycle; the recent telegram history lives in RAM.
 
 ## 1. Project layout
@@ -183,6 +184,18 @@ the device.
   omitted; a channel without a reading shows `(unavailable)` while a
   measured zero stays visible) and the raw frame shown as plain text with
   original line endings and trailer.
+- **Realtime**: a web replica of the on-device power panel. One
+  centre-zero bar per phase plus **Totaal** — consumption red to the left
+  of centre, feed-in green to the right — on the very same scale ladder
+  the display uses (500/1000/1700/2400/3100/3800 W, the device picks the
+  step and sends it), each row carrying its current and voltage chips and
+  its signed watt value with animated fills. Below the bars a sparkline
+  follows the total power across the last 90 accepted telegrams of the
+  page visit, with a half-scale gridline and zero line. The view refreshes
+  at least every five seconds, and every read interval when the interval
+  is shorter: the device pushes the newest power frame the moment a
+  telegram is accepted and the SPA polls `cmd=power` on its own timer as
+  well. `GET /api/power` serves the same JSON without WebSocket support.
 
 On-device TFT debug lines show the active browser screen, the last accepted
 telegram, and the Wi-Fi portal/connected state. With the first accepted
@@ -232,13 +245,14 @@ and the web status strip stay complete regardless.
 
 |Method |Path                        |Purpose                                                       |
 |-------|----------------------------|--------------------------------------------------------------|
-|WS     |`/ws`                       |SPA transport: status/telegram pushes + `cmd=config\|save\|status\|telegrams\|telegram\|raw\|view`, raw bytes as binary frame |
+|WS     |`/ws`                       |SPA transport: status/telegram/power pushes + `cmd=config\|save\|status\|telegrams\|telegram\|raw\|power\|view`, raw bytes as binary frame |
 |GET    |`/api/config`               |NVS settings + active state + valid choices (data sources, interval bounds, countries, profiles) |
 |POST   |`/api/config`               |Save form-urlencoded settings incl. `rxGpio`, `rxInverted` (0/1) and `interval` (interval clamped to 2..600; one atomic operation) |
 |GET    |`/api/status`               |Reception state, counters, last diagnostic, uptime            |
 |GET    |`/api/telegrams`            |Metadata of retained records (incl. `meterTimeText` from OBIS `0-0:1.0.0`), newest first |
 |GET    |`/api/telegram/<seq>`       |Decoded detail of one record                                  |
 |GET    |`/api/telegram/<seq>/raw`   |Exact accepted frame bytes as `text/plain`                    |
+|GET    |`/api/power`                |Realtime power frame of the newest accepted telegram (phases and total watts/amps/volts, meter time, scale ladder step) |
 |POST   |`/api/view`                 |Reports the active browser screen name to the device display  |
 
 ### Test data mode

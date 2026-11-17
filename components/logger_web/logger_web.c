@@ -1,11 +1,12 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-16 · Build: 7
+//-- Date: 2026-11-16 · Build: 8
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
-//-- pushes status and telegram-list JSON and answers form-urlencoded commands
-//-- (cmd=config, cmd=save, cmd=telegrams, cmd=telegram, cmd=raw, cmd=view);
+//-- pushes status, telegram-list and realtime-power JSON and answers
+//-- form-urlencoded commands (cmd=config, cmd=save, cmd=telegrams,
+//-- cmd=telegram, cmd=raw, cmd=power, cmd=view);
 //-- raw telegram bytes travel as a binary frame behind their JSON header so
 //-- no client ever interprets telegram text as HTML. Browser to device
 //-- messages stay form-urlencoded so no third-party JSON parser is required
@@ -52,6 +53,7 @@ extern const char styleCssEnd[] asm("_binary_style_css_end");
 #define WEB_STATUS_JSON_BYTES 1024
 #define WEB_LIST_JSON_BYTES 2048
 #define WEB_CONFIG_JSON_BYTES 4096
+#define WEB_POWER_JSON_BYTES 768
 #define WEB_DETAIL_JSON_BYTES (24u * 1024u)
 
 //-- --------------------------------------------------------------------------
@@ -70,6 +72,7 @@ static int wsFds[WS_MAX_CLIENTS];
 static SemaphoreHandle_t wsMutex;
 static TaskHandle_t wsPushTask;
 static uint32_t wsPushedAcceptedCount;
+static uint32_t wsPushedPowerSequence;
 
 static void wsClientsInit(void)
 {
@@ -943,6 +946,55 @@ static void appendTelegramListJson(stringBuilder *sb)
   sbAppend(sb, "]}");
 }
 
+//-- Power frame for the SPA realtime view: the signed watt, ampere and volt
+//-- values of the three phases and the total of the most recently accepted
+//-- telegram — the same frame the TFT panel draws. The scale is the panel's
+//-- ladder step (loggerBoardPickPowerScale), so both presentations scale
+//-- identically. valid stays false until the first accepted telegram.
+static void appendPowerJson(stringBuilder *sb)
+{
+  loggerPowerSnapshot snapshot;
+  uint32_t capturedUptimeMs = 0u;
+  bool valid = loggerReceiverGetPowerSnapshot(&snapshot, &capturedUptimeMs);
+
+  sbAppend(sb, "{\"type\":\"power\",\"valid\":");
+  sbAppend(sb, valid ? "true" : "false");
+
+  if (!valid)
+  {
+    sbAppend(sb, "}");
+    return;
+  }
+
+  loggerReceiverStatus status;
+  loggerReceiverGetStatus(&status);
+
+  sbAppendFmt(sb, ",\"sequence\":%" PRIu32, snapshot.sequence);
+  sbAppendFmt(sb, ",\"capturedUptimeMs\":%" PRIu32, capturedUptimeMs);
+  sbAppendFmt(sb, ",\"ageMs\":%" PRIu32, (uint32_t)(status.uptimeMs - capturedUptimeMs));
+  sbAppendFmt(sb, ",\"testMode\":%s", snapshot.testData ? "true" : "false");
+  sbAppend(sb, ",\"meterTime\":");
+  sbAppendJsonString(sb, snapshot.meterTime);
+  sbAppendFmt(sb, ",\"scale\":%" PRIu16, loggerBoardPickPowerScale(&snapshot));
+
+  sbAppend(sb, ",\"phases\":[");
+
+  for (uint8_t phase = 0u; phase < 3u; phase++)
+  {
+    sbAppendFmt(sb, "%s{\"watts\":%.1f,\"amps\":%.3f,\"volts\":%.1f}", (phase > 0u) ? "," : "",
+                snapshot.phaseWatts[phase], snapshot.phaseAmps[phase], snapshot.phaseVolts[phase]);
+  }
+
+  sbAppendFmt(sb, "],\"total\":{\"watts\":%.1f,\"amps\":%.3f,\"volts\":%.1f}",
+              snapshot.totalWatts, snapshot.totalAmps, snapshot.totalVolts);
+
+  sbAppend(sb, ",\"country\":");
+  sbAppendJsonString(sb, snapshot.countryCode);
+  sbAppend(sb, ",\"profileId\":");
+  sbAppendJsonString(sb, snapshot.profileId);
+  sbAppendFmt(sb, ",\"intervalSeconds\":%" PRIu32 "}", status.intervalSeconds);
+}
+
 //-- Callback of appendTelegramDetailJson: renders one retained record in
 //-- place while the receive-side lock is held. Memory only: no network and
 //-- no blocking, as required by the inspect contract.
@@ -1156,6 +1208,21 @@ static esp_err_t handleTelegramGet(httpd_req_t *req)
   return result;
 }
 
+static esp_err_t handlePowerGet(httpd_req_t *req)
+{
+  char buffer[WEB_POWER_JSON_BYTES];
+  stringBuilder sb;
+  sbInit(&sb, buffer, sizeof buffer);
+  appendPowerJson(&sb);
+
+  if (sb.overflow)
+  {
+    ESP_LOGE(tag, "power json overflow");
+  }
+
+  return sendJson(req, buffer);
+}
+
 static esp_err_t handleViewReport(httpd_req_t *req)
 {
   char body[WEB_BODY_MAX];
@@ -1220,6 +1287,16 @@ static void wsHandleCommand(httpd_req_t *req, const char *body)
     stringBuilder sb;
     sbInit(&sb, buffer, sizeof buffer);
     appendStatusJson(&sb, &status);
+    wsSendReply(req, buffer);
+    return;
+  }
+
+  if (strcmp(command, "power") == 0)
+  {
+    char buffer[WEB_POWER_JSON_BYTES];
+    stringBuilder sb;
+    sbInit(&sb, buffer, sizeof buffer);
+    appendPowerJson(&sb);
     wsSendReply(req, buffer);
     return;
   }
@@ -1519,6 +1596,33 @@ static void wsPushTaskLoop(void *argument)
 
       wsPushedAcceptedCount = status.acceptedCount;
     }
+
+    //-- Realtime power: push the panel frame of the newest accepted telegram
+    //-- so the SPA diagram refreshes the moment a telegram arrives — every
+    //-- interval when the interval is short, while the SPA's own timer keeps
+    //-- it at least every five seconds regardless.
+    loggerPowerSnapshot power;
+    uint32_t powerUptimeMs = 0u;
+
+    if (loggerReceiverGetPowerSnapshot(&power, &powerUptimeMs) && (power.sequence != wsPushedPowerSequence))
+    {
+      char *powerJson = malloc(WEB_POWER_JSON_BYTES);
+
+      if (powerJson != NULL)
+      {
+        stringBuilder powerSb;
+        sbInit(&powerSb, powerJson, WEB_POWER_JSON_BYTES);
+        appendPowerJson(&powerSb);
+
+        if (!powerSb.overflow)
+        {
+          wsSendToAll(powerJson);
+          wsPushedPowerSequence = power.sequence;
+        }
+
+        free(powerJson);
+      }
+    }
   }
 }
 
@@ -1553,7 +1657,7 @@ esp_err_t loggerWebStart(void)
   }
 
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.max_uri_handlers = 12;
+  config.max_uri_handlers = 16;
 
   //-- WebSocket command handling builds the telegram detail JSON (nested
   //-- string builders plus vsnprintf) on the httpd task stack: the 4 KB
@@ -1575,6 +1679,7 @@ esp_err_t loggerWebStart(void)
 
   wsClientsInit();
   wsPushedAcceptedCount = 0u;
+  wsPushedPowerSequence = 0u;
 
   registerUri(server, "/", HTTP_GET, false, handleRoot);
   registerUri(server, "/app.js", HTTP_GET, false, handleAppJs);
@@ -1585,6 +1690,7 @@ esp_err_t loggerWebStart(void)
   registerUri(server, "/api/status", HTTP_GET, false, handleStatusGet);
   registerUri(server, "/api/telegrams", HTTP_GET, false, handleTelegramsGet);
   registerUri(server, "/api/telegram/*", HTTP_GET, false, handleTelegramGet);
+  registerUri(server, "/api/power", HTTP_GET, false, handlePowerGet);
   registerUri(server, "/api/view", HTTP_POST, false, handleViewReport);
   registerUri(server, "/ws", HTTP_GET, true, handleWebSocket);
 

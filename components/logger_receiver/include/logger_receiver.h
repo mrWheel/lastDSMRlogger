@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.h - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-15 · Build: 3
+//-- Date: 2026-11-16 · Build: 4
 //--
 //-- One receive task owns the receiver and parser state: the parserDSMR UART
 //-- adapter task feeds the parser and the event callback copies everything the
@@ -21,6 +21,7 @@
 
 #include "dsmr_parser.h"
 #include "esp_err.h"
+#include "logger_board.h"
 #include "logger_settings.h"
 
 //-- --------------------------------------------------------------------------
@@ -174,6 +175,12 @@ void loggerReceiverGetStatus(loggerReceiverStatus *status);
 //-- Copies the configuration the receiver is currently running with. False
 //-- when no configuration has been activated yet.
 bool loggerReceiverGetActiveConfig(loggerSettingsConfig *config);
+
+//-- Copies the power frame of the most recently accepted telegram (the same
+//-- frame the TFT panel shows) together with the uptime at which it was
+//-- captured. False when no telegram has been accepted yet, in which case
+//-- the outputs are untouched. Safe from any task.
+bool loggerReceiverGetPowerSnapshot(loggerPowerSnapshot *snapshot, uint32_t *capturedUptimeMs);
 
 //-- Copies metadata of the retained records, newest first. Returns the
 //-- number of records written.
