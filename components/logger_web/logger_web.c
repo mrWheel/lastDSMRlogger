@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-17 · Build: 9
+//-- Date: 2026-11-17 · Build: 10
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -54,8 +54,9 @@ extern const char styleCssEnd[] asm("_binary_style_css_end");
 #define WEB_LIST_JSON_BYTES 2048
 #define WEB_CONFIG_JSON_BYTES 4096
 //-- The power JSON also carries the bar history of the newest 90 accepted
-//-- total watts, so it is sized for the frame plus that array.
-#define WEB_POWER_JSON_BYTES 2048
+//-- samples (watts plus their "HH:MM:SS" time text), so it is sized for the
+//-- frame plus that array with headroom.
+#define WEB_POWER_JSON_BYTES 6144
 #define WEB_DETAIL_JSON_BYTES (24u * 1024u)
 
 //-- --------------------------------------------------------------------------
@@ -975,10 +976,12 @@ static void appendTelegramListJson(stringBuilder* sb)
 //-- values of the three phases and the total of the most recently accepted
 //-- telegram — the same frame the TFT panel draws. The scale is the panel's
 //-- ladder step (loggerBoardPickPowerScale), so both presentations scale
-//-- identically. The history array carries the newest retained total watts
-//-- (one sample per accepted telegram, oldest first) so the bar history of
-//-- the SPA follows the device, not just what one browser happened to see.
-//-- valid stays false until the first accepted telegram.
+//-- identically. The history array carries the newest retained samples (one
+//-- per accepted telegram, oldest first): each sample is an object with its
+//-- total watts and the "HH:MM:SS" time it belongs to, so the bar history of
+//-- the SPA follows the device, not just what one browser happened to see,
+//-- and a hovered bar can show its time and power. valid stays false until
+//-- the first accepted telegram.
 static void appendPowerJson(stringBuilder* sb)
 {
   loggerPowerSnapshot snapshot;
@@ -1022,14 +1025,26 @@ static void appendPowerJson(stringBuilder* sb)
   sbAppendJsonString(sb, snapshot.profileId);
   sbAppendFmt(sb, ",\"intervalSeconds\":%" PRIu32, status.intervalSeconds);
 
-  float history[LOGGER_POWER_HISTORY_CAPACITY];
-  uint16_t historyCount = loggerReceiverGetPowerHistory(history, LOGGER_POWER_HISTORY_CAPACITY);
-
   sbAppend(sb, ",\"history\":[");
 
-  for (uint16_t index = 0u; index < historyCount; index++)
+  //-- The sample array is heap-allocated: appendPowerJson runs on the small
+  //-- wsPush task stack too, where 90 samples do not fit. Out of memory
+  //-- simply sends an empty history.
+  loggerPowerHistorySample* history = malloc(sizeof *history * LOGGER_POWER_HISTORY_CAPACITY);
+
+  if (history != NULL)
   {
-    sbAppendFmt(sb, "%s%.1f", (index > 0u) ? "," : "", (double)history[index]);
+    uint16_t historyCount = loggerReceiverGetPowerHistory(history, LOGGER_POWER_HISTORY_CAPACITY);
+
+    for (uint16_t index = 0u; index < historyCount; index++)
+    {
+      sbAppendFmt(sb, "%s{\"watts\":%.1f,\"time\":", (index > 0u) ? "," : "",
+                  (double)history[index].watts);
+      sbAppendJsonString(sb, history[index].timeText);
+      sbAppend(sb, "}");
+    }
+
+    free(history);
   }
 
   sbAppend(sb, "]}");

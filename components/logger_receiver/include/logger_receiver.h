@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.h - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-17 · Build: 5
+//-- Date: 2026-11-17 · Build: 6
 //--
 //-- One receive task owns the receiver and parser state: the parserDSMR UART
 //-- adapter task feeds the parser and the event callback copies everything the
@@ -33,8 +33,19 @@
 #define LOGGER_HISTORY_CAPACITY 4
 
 //-- Total watts retained for the SPA realtime bar history: one sample per
-//-- accepted telegram, oldest first when read back.
+//-- accepted telegram, oldest first when read back. Each sample carries the
+//-- time it belongs to as "HH:MM:SS" so the SPA can label a hovered bar.
 #define LOGGER_POWER_HISTORY_CAPACITY 90u
+#define LOGGER_POWER_HISTORY_TIME_MAX 12
+
+typedef struct
+{
+  float watts;
+
+  //-- "HH:MM:SS": the meter time of OBIS 0-0:1.0.0, or the device wall clock
+  //-- when the frame published none. Empty when neither source is available.
+  char timeText[LOGGER_POWER_HISTORY_TIME_MAX];
+} loggerPowerHistorySample;
 
 //-- Field snapshot bound per record. Telegrams with more published fields
 //-- keep their complete raw view; the decoded summary truncates at this cap.
@@ -195,11 +206,12 @@ bool loggerReceiverGetActiveConfig(loggerSettingsConfig* config);
 //-- the outputs are untouched. Safe from any task.
 bool loggerReceiverGetPowerSnapshot(loggerPowerSnapshot* snapshot, uint32_t* capturedUptimeMs);
 
-//-- Copies the newest retained total watts (one sample per accepted
-//-- telegram, oldest first) into outWatts, at most maxSamples of them: when
-//-- fewer are asked than retained, the newest ones are copied. Returns the
-//-- number of samples written. Safe from any task.
-uint16_t loggerReceiverGetPowerHistory(float* outWatts, uint16_t maxSamples);
+//-- Copies the newest retained power history samples (one per accepted
+//-- telegram, oldest first) into outSamples, at most maxSamples of them:
+//-- when fewer are asked than retained, the newest ones are copied. Each
+//-- sample carries the total watts plus its "HH:MM:SS" time text. Returns
+//-- the number of samples written. Safe from any task.
+uint16_t loggerReceiverGetPowerHistory(loggerPowerHistorySample* outSamples, uint16_t maxSamples);
 
 //-- Copies metadata of the retained records, newest first. Returns the
 //-- number of records written.

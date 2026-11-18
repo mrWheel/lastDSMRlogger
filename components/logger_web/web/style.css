@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-17 · Build: 12 */
+   Date: 2026-11-18 · Build: 15 */
 
 :root
 {
@@ -592,15 +592,6 @@ footer
   border-bottom: none;
 }
 
-.powerRowHead
-{
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 6px;
-}
-
 .powerPhaseLabel
 {
   font-weight: 600;
@@ -707,11 +698,31 @@ footer
   right: 6px;
 }
 
-/* The measured watt value sits centred above its bar. */
+/* One head line above each bar: the phase name left, the measured watt
+   centred and the ampere and volt chips right. Only the watt itself is
+   coloured (red consumption, green feed-in); the label and the chips keep
+   their own colours. */
 .powerWatt
 {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 10px;
   margin: 0 0 6px;
-  text-align: center;
+}
+
+.powerWatt .powerPhaseLabel
+{
+  justify-self: start;
+}
+
+.powerWatt .powerChips
+{
+  justify-self: end;
+}
+
+.powerWattValue
+{
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
   font-size: 1.05rem;
@@ -719,24 +730,24 @@ footer
   transition: color 0.3s ease;
 }
 
-.powerWatt.consume
+.powerWattValue.consume
 {
   color: #ff3b30;
 }
 
-.powerWatt.produce
+.powerWattValue.produce
 {
   color: #34c759;
 }
 
 @media (prefers-color-scheme: dark)
 {
-  .powerWatt.consume
+  .powerWattValue.consume
   {
     color: #ff453a;
   }
 
-  .powerWatt.produce
+  .powerWattValue.produce
   {
     color: #30d158;
   }
@@ -752,11 +763,32 @@ footer
 
 .powerSparkWrap
 {
+  position: relative;
   margin-top: 8px;
   padding: 8px;
   border: 1px solid var(--separator);
   border-radius: 12px;
   background: var(--controlFill);
+}
+
+/* Hover popup of the total power history: light Apple-style chip above the
+   hovered bar carrying its meter time and total watts (positioned by
+   app.js). */
+.powerTooltip
+{
+  position: absolute;
+  padding: 5px 10px;
+  border-radius: 9px;
+  background: var(--card);
+  color: var(--fg);
+  border: 1px solid var(--hairline);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translateX(-50%);
+  box-shadow: var(--shadow);
+  z-index: 5;
 }
 
 #powerSpark

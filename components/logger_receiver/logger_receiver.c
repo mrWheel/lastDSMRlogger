@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.c - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-17 · Build: 17
+//-- Date: 2026-11-17 · Build: 18
 //--
 //-- The parserDSMR adapter task owns the parser instance while it runs. The
 //-- event callback copies the complete accepted frame and the decoded fields
@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "driver/uart.h"
 #include "dsmr_uart_esp32.h"
@@ -141,9 +142,10 @@ typedef struct
 
   //-- Total watts of the newest accepted telegrams for the SPA realtime bar
   //-- history: one sample per accepted telegram in a ring, oldest first when
-  //-- read back. Stored under the same mutex as the last power frame, so a
-  //-- reader never mixes two telegram cadences.
-  float powerHistory[LOGGER_POWER_HISTORY_CAPACITY];
+  //-- read back. Each sample also carries its "HH:MM:SS" time text so the
+  //-- SPA can label a hovered bar. Stored under the same mutex as the last
+  //-- power frame, so a reader never mixes two telegram cadences.
+  loggerPowerHistorySample powerHistory[LOGGER_POWER_HISTORY_CAPACITY];
   uint16_t powerHistoryCount;
   uint16_t powerHistoryNext;
 
@@ -543,6 +545,30 @@ static void extractPowerSnapshot(const loggerTelegramRecord* record, bool testDa
   extractPanelMeterTime(record, snapshot->meterTime, sizeof snapshot->meterTime);
 }
 
+//-- Time label of one bar history sample: the meter time of OBIS 0-0:1.0.0
+//-- ("HH:MM:SS"), or the device wall clock when the frame published none.
+//-- Empty when neither source is available; the SPA then shows a dash.
+static void fillPowerHistoryTime(const loggerTelegramRecord* record, char* out, size_t outSize)
+{
+  if (record->meta.meterTimeText[0] != '\0')
+  {
+    snprintf(out, outSize, "%s", record->meta.meterTimeText);
+    return;
+  }
+
+  time_t now = time(NULL);
+  struct tm brokenTime;
+
+  if ((now >= 1700000000) && (localtime_r(&now, &brokenTime) != NULL))
+  {
+    strftime(out, outSize, "%H:%M:%S", &brokenTime);
+  }
+  else
+  {
+    out[0] = '\0';
+  }
+}
+
 //-- --------------------------------------------------------------------------
 //-- Parser event callback (receive task context)
 //-- --------------------------------------------------------------------------
@@ -840,9 +866,12 @@ static void onParserEvent(const dsmrParser* parser, const dsmrParserEvent* event
     self->hasLastPower = true;
 
     //-- One bar history sample per accepted telegram: the ring keeps the
-    //-- newest totals for the SPA realtime view across reloads and view
-    //-- switches, independent of what any browser is watching.
-    self->powerHistory[self->powerHistoryNext] = powerSnapshot.totalWatts;
+    //-- newest totals (with the meter time they belong to) for the SPA
+    //-- realtime view across reloads and view switches, independent of what
+    //-- any browser is watching.
+    self->powerHistory[self->powerHistoryNext].watts = powerSnapshot.totalWatts;
+    fillPowerHistoryTime(stagingRecord, self->powerHistory[self->powerHistoryNext].timeText,
+                         sizeof self->powerHistory[self->powerHistoryNext].timeText);
     self->powerHistoryNext =
         (uint16_t)((self->powerHistoryNext + 1u) % LOGGER_POWER_HISTORY_CAPACITY);
 
@@ -1996,11 +2025,11 @@ bool loggerReceiverGetPowerSnapshot(loggerPowerSnapshot* snapshot, uint32_t* cap
   return found;
 }
 
-uint16_t loggerReceiverGetPowerHistory(float* outWatts, uint16_t maxSamples)
+uint16_t loggerReceiverGetPowerHistory(loggerPowerHistorySample* outSamples, uint16_t maxSamples)
 {
   LoggerReceiver* self = &instance;
 
-  if ((outWatts == NULL) || (maxSamples == 0u))
+  if ((outSamples == NULL) || (maxSamples == 0u))
   {
     return 0u;
   }
@@ -2021,7 +2050,7 @@ uint16_t loggerReceiverGetPowerHistory(float* outWatts, uint16_t maxSamples)
 
   for (uint16_t index = 0u; index < count; index++)
   {
-    outWatts[index] = self->powerHistory[(start + index) % LOGGER_POWER_HISTORY_CAPACITY];
+    outSamples[index] = self->powerHistory[(start + index) % LOGGER_POWER_HISTORY_CAPACITY];
   }
 
   xSemaphoreGive(self->mutex);

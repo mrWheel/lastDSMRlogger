@@ -99,7 +99,7 @@
       <h2>Telegrams</h2>
       <div id="telegramState" class="message"></div>
       <div class="listToolbar">
-        <button id="showTelegram" type="button">Show</button>
+        <button id="showTelegram" type="button">Pause</button>
       </div>
       <!-- Read-only scrolling log of the retained records: rows show the
            meter time of OBIS 0-0:1.0.0 and carry no click selection. -->
@@ -123,11 +123,13 @@
 
     <section id="viewPower" class="card" hidden>
       <!-- Replica of the TFT power panel: a centre-zero bar per phase and
-           for the total on the same 100..3800 W ladder with the measured
-           watt value centred above each bar, plus a vertical-bar history
+           for the total on the same 100..3800 W ladder with one head line
+           per bar (phase name left, the coloured measured watt centred,
+           ampere and volt chips right), plus a vertical-bar history
            of the total power across the last 90 accepted measurements kept
            by the device. The name bar prints Phase Load left and a test
-           data note right. Rows are built by app.js. -->
+           data note right. Hovering a history bar pops up its meter time
+           and total watts (app.js). Rows are built by app.js. -->
       <div id="powerPanel" hidden>
         <div class="powerTitle">
           <span class="powerName">Phase Load</span>

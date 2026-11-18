@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-17 · Build: 13
+// Date: 2026-11-18 · Build: 16
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -24,7 +24,9 @@ const state =
   config: null,
   selectedSeq: null,
   latestSeq: null,
-  followLatest: false,
+  // Live follow is on from the start: the newest accepted telegram is shown
+  // until the user freezes the pane with Pause (the button then reads Show).
+  followLatest: true,
   pendingRawSeq: null,
   ws: null,
   wsReady: false,
@@ -738,19 +740,20 @@ function renderDetail(detail)
 //-- Realtime power view
 //-- --------------------------------------------------------------------------
 
-// Replica of the TFT power panel: one centre-zero bar per phase plus Totaal
+// Replica of the TFT power panel: one centre-zero bar per phase plus Total
 // on the same ladder the display uses (the device sends the picked scale,
-// so both present the same numbers), with the measured watt value above
-// each bar. Consumption grows red to the left of centre, feed-in green to
-// the right. Below the bars a vertical-bar history follows the total power
+// so both present the same numbers). One head line above each bar carries
+// the phase name left, the measured watt centred (the only coloured text:
+// red consumption, green feed-in) and the ampere and volt chips right.
+// Below the bars a vertical-bar history follows the total power
 // across the last 90 accepted measurements kept by the device: one
 // centre-zero bar per accepted telegram on hairline scale division lines.
 const POWER_ROWS =
 [
-  {label: "Fase 1"},
-  {label: "Fase 2"},
-  {label: "Fase 3"},
-  {label: "Totaal"},
+  {label: "Phase 1"},
+  {label: "Phase 2"},
+  {label: "Phase 3"},
+  {label: "Total"},
 ];
 
 // The device keeps and sends the newest 90 accepted total watts for the
@@ -760,6 +763,14 @@ const POWER_HISTORY_MAX = 90;
 
 const powerRowRefs = [];
 let powerTimer = null;
+
+// Hover popup of the total power history: with the mouse over the plot the
+// bar under the cursor is labelled with its meter time and its total watts.
+// powerSparkLayout keeps the drawing geometry of the newest frame,
+// powerHoverX the x position of the mouse inside the canvas (null: outside).
+let powerSparkLayout = null;
+let powerHoverX = null;
+let powerTip = null;
 
 // Scale ladder step of the newest power frame: kept for redraws (resizes)
 // that happen without a fresh message.
@@ -775,12 +786,17 @@ function buildPowerRows()
     const rowDiv = document.createElement("div");
     rowDiv.className = "powerRow";
 
-    const head = document.createElement("div");
-    head.className = "powerRowHead";
+    // One head line per bar: phase name left, measured watt centred and
+    // the ampere and volt chips right (only the watt is coloured).
+    const value = document.createElement("div");
+    value.className = "powerWatt";
 
     const label = document.createElement("span");
     label.className = "powerPhaseLabel";
     label.textContent = row.label;
+
+    const watts = document.createElement("span");
+    watts.className = "powerWattValue";
 
     const chips = document.createElement("span");
     chips.className = "powerChips";
@@ -793,8 +809,9 @@ function buildPowerRows()
 
     chips.appendChild(ampsChip);
     chips.appendChild(voltsChip);
-    head.appendChild(label);
-    head.appendChild(chips);
+    value.appendChild(label);
+    value.appendChild(watts);
+    value.appendChild(chips);
 
     const track = document.createElement("div");
     track.className = "powerBarTrack";
@@ -825,16 +842,13 @@ function buildPowerRows()
     track.appendChild(tickMid);
     track.appendChild(tickRight);
 
-    const value = document.createElement("div");
-    value.className = "powerWatt";
-
-    rowDiv.appendChild(head);
     rowDiv.appendChild(value);
     rowDiv.appendChild(track);
     el.powerRows.appendChild(rowDiv);
 
-    powerRowRefs.push({label: label, ampsChip: ampsChip, voltsChip: voltsChip, consumeFill: consumeFill,
-                       produceFill: produceFill, tickLeft: tickLeft, tickRight: tickRight, value: value});
+    powerRowRefs.push({label: label, watts: watts, ampsChip: ampsChip, voltsChip: voltsChip,
+                       consumeFill: consumeFill, produceFill: produceFill, tickLeft: tickLeft,
+                       tickRight: tickRight});
   });
 }
 
@@ -883,9 +897,11 @@ function renderPower(message)
     row.tickLeft.textContent = "-" + message.scale;
     row.tickRight.textContent = String(message.scale);
 
-    row.value.textContent = formatWatt(watts);
-    row.value.classList.toggle("consume", watts < 0);
-    row.value.classList.toggle("produce", watts > 0);
+    // Only the watt text takes the red/green colouring; the phase label and
+    // the chips keep their own fixed styling.
+    row.watts.textContent = formatWatt(watts);
+    row.watts.classList.toggle("consume", watts < 0);
+    row.watts.classList.toggle("produce", watts > 0);
 
     const amps = (typeof entry.amps === "number") ? entry.amps : 0;
     const volts = (typeof entry.volts === "number") ? entry.volts : 0;
@@ -901,9 +917,11 @@ function renderPower(message)
   // frames locally: one sample per newly accepted telegram.
   if (Array.isArray(message.history))
   {
-    state.powerHistory = message.history.slice(-POWER_HISTORY_MAX).map((total) =>
+    state.powerHistory = message.history.slice(-POWER_HISTORY_MAX).map((entry) =>
     {
-      return {total: total};
+      // Current firmware sends {watts, time} objects; a plain number from
+      // older firmware still renders (the tooltip then shows a dash).
+      return (typeof entry === "number") ? {total: entry} : {total: entry.watts, time: entry.time};
     });
   }
   else if (message.sequence !== state.powerLastSeq)
@@ -991,6 +1009,8 @@ function drawPowerSpark(scale)
 
   if (samples.length === 0)
   {
+    powerSparkLayout = null;
+    updatePowerTooltip();
     return;
   }
 
@@ -1040,6 +1060,49 @@ function drawPowerSpark(scale)
   ctx.arc(lastX, lastY, 3, 0, Math.PI * 2);
   ctx.fillStyle = lastColor;
   ctx.fill();
+
+  // Keep the hover popup in step with the freshly drawn bars (a redraw runs
+  // on every power frame and on every resize while the mouse may still sit
+  // over the plot).
+  powerSparkLayout = {samples: samples, slot: slot, cssWidth: cssWidth};
+  updatePowerTooltip();
+}
+
+function updatePowerTooltip()
+{
+  if (powerTip === null)
+  {
+    powerTip = document.createElement("div");
+    powerTip.className = "powerTooltip";
+    powerTip.hidden = true;
+    el.powerSpark.parentElement.appendChild(powerTip);
+  }
+
+  const layout = powerSparkLayout;
+
+  if ((layout === null) || (layout.samples.length === 0) || (powerHoverX === null))
+  {
+    powerTip.hidden = true;
+    return;
+  }
+
+  const index = Math.min(layout.samples.length - 1,
+                         Math.max(0, Math.floor(powerHoverX / layout.slot)));
+  const sample = layout.samples[index];
+
+  // One slot per sample (the drawing's own pitch): the bar centre of the
+  // hovered slot; a lone sample sits in the middle like on the canvas.
+  const centre = (layout.samples.length === 1) ? (layout.cssWidth / 2) : ((index + 0.5) * layout.slot);
+
+  powerTip.textContent = (sample.time || "--:--:--") + "  ·  " + formatWatt(sample.total);
+  powerTip.hidden = false;
+
+  // Centre the popup above the hovered bar and push it back from the edges
+  // so it never sticks out of the plot.
+  const half = powerTip.offsetWidth / 2;
+  const left = Math.min(layout.cssWidth - half, Math.max(half, centre));
+  powerTip.style.left = (el.powerSpark.offsetLeft + left) + "px";
+  powerTip.style.top = (el.powerSpark.offsetTop + 2) + "px";
 }
 
 function powerPollDelayMs()
@@ -1154,6 +1217,21 @@ function boot()
     {
       drawPowerSpark(lastPowerScale);
     }
+  });
+
+  // Hovering the history plot pops up the meter time and total watts of
+  // the bar under the cursor; leaving the plot hides the popup again.
+  el.powerSpark.addEventListener("mousemove", (event) =>
+  {
+    const rect = el.powerSpark.getBoundingClientRect();
+    powerHoverX = event.clientX - rect.left;
+    updatePowerTooltip();
+  });
+
+  el.powerSpark.addEventListener("mouseleave", () =>
+  {
+    powerHoverX = null;
+    updatePowerTooltip();
   });
 
   wsConnect();
