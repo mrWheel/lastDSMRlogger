@@ -624,6 +624,21 @@ function selectTelegram(sequence)
   wsSend("cmd=raw&seq=" + encodeURIComponent(sequence));
 }
 
+// The device stores field timestamps as ISO 8601 (2026-11-18T12:15:07); the
+// summary table shows them day first instead: 18-11-2026 - 12:15:07. Text
+// that does not match the ISO shape is returned unchanged.
+function formatFieldTimestamp(text)
+{
+  const iso = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2}:\d{2})/.exec(text || "");
+
+  if (!iso)
+  {
+    return text || "";
+  }
+
+  return iso[3] + "-" + iso[2] + "-" + iso[1] + " - " + iso[4];
+}
+
 function renderDetail(detail)
 {
   const meta = detail.meta;
@@ -681,7 +696,7 @@ function renderDetail(detail)
       // keeps its own text and stays distinguishable.
       (field.value === "") ? "(unavailable)" : field.value,
       field.unit,
-      field.hasTimestamp ? field.timestamp : "",
+      field.hasTimestamp ? formatFieldTimestamp(field.timestamp) : "",
       (field.mbusChannel > 0) ? ("ch " + field.mbusChannel) : "",
     ];
 

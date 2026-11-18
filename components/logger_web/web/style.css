@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-18 · Build: 15 */
+   Date: 2026-11-18 · Build: 16 */
 
 :root
 {
@@ -50,6 +50,8 @@
 body
 {
   margin: 0;
+  /* Bottom room for the status block pinned over the footer (see .status). */
+  padding-bottom: 64px;
   font-family: var(--font);
   font-size: 0.95rem;
   background: var(--bg);
@@ -143,10 +145,17 @@ header h1
   background: var(--separator);
 }
 
+/* Connection status block: pinned to the bottom of the viewport so it stays
+   visible at the bottom of the screen on every view while content scrolls. */
 .status
 {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 12px;
+  z-index: 10;
   max-width: 960px;
-  margin: 12px auto 0;
+  margin: 0 auto;
   padding: 9px 16px;
   font-size: 0.82rem;
   color: var(--secondary);
