@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-18 · Build: 16
+// Date: 2026-11-19 · Build: 17
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -8,7 +8,8 @@
 // All dynamic data travels over one WebSocket at /ws: the
 // device pushes status, the telegram list and the realtime power frame, the
 // browser sends form-urlencoded commands (cmd=config, cmd=save,
-// cmd=telegram, cmd=raw, cmd=view, cmd=telegrams, cmd=power). Raw telegram
+// cmd=telegram, cmd=raw, cmd=view, cmd=telegrams, cmd=power,
+// cmd=ringfile). Raw telegram
 // bytes arrive as a binary frame
 // behind their JSON header. Every rendering path uses textContent so
 // telegram text is never interpreted as HTML. The active screen name is
@@ -44,6 +45,7 @@ const VIEWS =
   {id: "settings", label: "Settings", section: "viewSettings", command: "cmd=config"},
   {id: "telegrams", label: "Telegrams", section: "viewTelegrams", command: "cmd=telegrams"},
   {id: "power", label: "Phase Load", section: "viewPower", command: "cmd=power"},
+  {id: "ringfile", label: "Show RingFile", section: "viewRingFile", command: "cmd=ringfile"},
 ];
 
 const el = {};
@@ -64,7 +66,8 @@ function bindElements()
                "telegramDetail", "recordMeta", "recordNotes", "summaryTable", "rawView", "footerInfo",
                "powerPanel", "powerTelegram", "powerRows",
                "powerScaleLabel", "powerSpark",
-               "viewSettings", "viewTelegrams", "viewPower"];
+               "ringFileState", "refreshRingFile", "ringFileTable",
+               "viewSettings", "viewTelegrams", "viewPower", "viewRingFile"];
 
   ids.forEach((id) =>
   {
@@ -192,6 +195,10 @@ function handleTextMessage(message)
       renderPower(message);
       break;
 
+    case "ringfile":
+      renderRingFileList(message);
+      break;
+
     case "raw":
       state.pendingRawSeq = message.sequence;
       break;
@@ -235,6 +242,10 @@ function handleServerError(message)
   else if (message.request === "save")
   {
     el.settingsMessage.textContent = "Rejected: " + message.error + ". The active configuration is preserved.";
+  }
+  else if (message.request === "ringfile")
+  {
+    setRingFileState(message.error || "Ring file unavailable.");
   }
   else
   {
@@ -1148,6 +1159,87 @@ function updatePowerPolling()
 }
 
 //-- --------------------------------------------------------------------------
+//-- RingFile view
+//-- --------------------------------------------------------------------------
+
+// The device walks its ring file newest to oldest and answers cmd=ringfile
+// with every retained minute record in that order: the table simply follows
+// the frame. Rows are built with textContent only.
+
+function setRingFileState(message)
+{
+  el.ringFileState.textContent = message;
+}
+
+// The 10-digit wall-clock minute key (YYMMDDhhmm, e.g. 2611191642) as the
+// user reads it: 2026-11-19 16:42. Text that is not ten digits is returned
+// unchanged.
+function formatMinuteKey(key)
+{
+  const digits = String(key).padStart(10, "0");
+  const minute = /^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/.exec(digits);
+
+  if (minute === null)
+  {
+    return digits;
+  }
+
+  return "20" + minute[1] + "-" + minute[2] + "-" + minute[3] + " " + minute[4] + ":" + minute[5];
+}
+
+function renderRingFileList(message)
+{
+  const tbody = el.ringFileTable.tBodies[0];
+  tbody.textContent = "";
+
+  const records = message.records || [];
+
+  if (records.length === 0)
+  {
+    setRingFileState(message.available
+                     ? "No minute records stored yet: the store writes one every minute."
+                     : "The meter store is not running on the device.");
+    return;
+  }
+
+  setRingFileState(records.length + " minute" + ((records.length === 1) ? "" : "s") +
+                   " shown, newest first" +
+                   (message.available ? "" : " (the device walk did not finish)"));
+
+  records.forEach((record) =>
+  {
+    const row = document.createElement("tr");
+    const cells = [
+      formatMinuteKey(record.key),
+      (typeof record.edT1 === "number") ? record.edT1.toFixed(3) : "-",
+      (typeof record.edT2 === "number") ? record.edT2.toFixed(3) : "-",
+      (typeof record.erT1 === "number") ? record.erT1.toFixed(3) : "-",
+      (typeof record.erT2 === "number") ? record.erT2.toFixed(3) : "-",
+      (typeof record.gas === "number") ? record.gas.toFixed(3) : "-",
+      (typeof record.t1 === "number") ? record.t1.toFixed(2) : "-",
+      (typeof record.t2 === "number") ? record.t2.toFixed(2) : "-",
+    ];
+
+    cells.forEach((text, index) =>
+    {
+      const cell = document.createElement("td");
+      cell.textContent = text;
+
+      // The measured columns align right so the digits of successive
+      // minutes line up; the minute column keeps the default left.
+      if (index > 0)
+      {
+        cell.className = "valueNumeric";
+      }
+
+      row.appendChild(cell);
+    });
+
+    tbody.appendChild(row);
+  });
+}
+
+//-- --------------------------------------------------------------------------
 //-- View switching and boot
 //-- --------------------------------------------------------------------------
 
@@ -1221,6 +1313,13 @@ function boot()
   el.selCountry.addEventListener("change", () =>
   {
     fillProfiles(el.selCountry.value, null);
+  });
+
+  // The ring file gains one record per minute and the view does not poll:
+  // this button re-requests the newest frame on demand.
+  el.refreshRingFile.addEventListener("click", () =>
+  {
+    wsSend("cmd=ringfile");
   });
 
   // The bar history is drawn to the container width: redraw on resize while

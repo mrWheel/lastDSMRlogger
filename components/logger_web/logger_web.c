@@ -1,12 +1,12 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-17 · Build: 10
+//-- Date: 2026-11-19 · Build: 11
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
 //-- form-urlencoded commands (cmd=config, cmd=save, cmd=telegrams,
-//-- cmd=telegram, cmd=raw, cmd=power, cmd=view);
+//-- cmd=telegram, cmd=raw, cmd=power, cmd=ringfile, cmd=view);
 //-- raw telegram bytes travel as a binary frame behind their JSON header so
 //-- no client ever interprets telegram text as HTML. Browser to device
 //-- messages stay form-urlencoded so no third-party JSON parser is required
@@ -34,6 +34,7 @@
 #include "logger_board.h"
 #include "logger_receiver.h"
 #include "logger_settings.h"
+#include "logger_store.h"
 
 static const char* tag = "loggerWeb";
 
@@ -58,6 +59,10 @@ extern const char styleCssEnd[] asm("_binary_style_css_end");
 //-- frame plus that array with headroom.
 #define WEB_POWER_JSON_BYTES 6144
 #define WEB_DETAIL_JSON_BYTES (24u * 1024u)
+//-- The ring file JSON lists every retained minute record (up to twenty:
+//-- key, five counters and two tariff amounts each), so it is sized with
+//-- headroom above the fullest table.
+#define WEB_RINGFILE_JSON_BYTES 4096
 
 //-- --------------------------------------------------------------------------
 //-- WebSocket transport
@@ -1050,6 +1055,52 @@ static void appendPowerJson(stringBuilder* sb)
   sbAppend(sb, "]}");
 }
 
+//-- Ring file frame for the SPA Show RingFile view: every retained minute
+//-- record of the meter store, newest minute first, exactly as the ring walk
+//-- returns them. The counters keep the units of the telegram (kWh and m³),
+//-- the tariff amounts are the fictional billing cents in EUR. available
+//-- reports whether the store walk completed: while the store task never
+//-- opened its ring the records array simply stays empty.
+typedef struct
+{
+  stringBuilder* sb;
+  uint32_t emitted;
+} RingFileEmit;
+
+//-- Visitor of the ring walk: appends one record as a JSON object. Runs on
+//-- the httpd task between the walk's own cursor operations.
+static bool appendRingFileRecord(uint64_t minuteKey, const loggerMeterRecord* record,
+                                 void* userData)
+{
+  RingFileEmit* emit = (RingFileEmit*)userData;
+  stringBuilder* sb = emit->sb;
+
+  sbAppendFmt(sb,
+              "%s{\"key\":%" PRIu64 ",\"edT1\":%.3f,\"edT2\":%.3f,\"erT1\":%.3f,\"erT2\":%.3f,"
+              "\"gas\":%.3f,\"t1\":%.2f,\"t2\":%.2f}",
+              (emit->emitted > 0u) ? "," : "", minuteKey, record->energyDeliveredTariff1Kwh,
+              record->energyDeliveredTariff2Kwh, record->energyReturnedTariff1Kwh,
+              record->energyReturnedTariff2Kwh, record->gasDeliveredM3, record->tariffAmount1Euro,
+              record->tariffAmount2Euro);
+  emit->emitted++;
+
+  //-- Stop the walk the moment the buffer is full: the client receives the
+  //-- records that fit instead of a truncated JSON tail.
+  return !sb->overflow;
+}
+
+static void appendRingFileJson(stringBuilder* sb)
+{
+  RingFileEmit emit;
+  memset(&emit, 0, sizeof emit);
+  emit.sb = sb;
+
+  sbAppend(sb, "{\"type\":\"ringfile\",\"records\":[");
+  esp_err_t walked = loggerStoreListRecords(appendRingFileRecord, &emit);
+  sbAppend(sb, "],\"available\":");
+  sbAppendFmt(sb, "%s}", (walked == ESP_OK) ? "true" : "false");
+}
+
 //-- Callback of appendTelegramDetailJson: renders one retained record in
 //-- place while the receive-side lock is held. Memory only: no network and
 //-- no blocking, as required by the inspect contract.
@@ -1291,6 +1342,31 @@ static esp_err_t handlePowerGet(httpd_req_t* req)
   return result;
 }
 
+static esp_err_t handleRingFileGet(httpd_req_t* req)
+{
+  //-- The minute table of the meter ring file for diagnostics: the same
+  //-- frame the cmd=ringfile answer sends.
+  char* buffer = malloc(WEB_RINGFILE_JSON_BYTES);
+
+  if (buffer == NULL)
+  {
+    return sendError(req, 500, "out of memory");
+  }
+
+  stringBuilder sb;
+  sbInit(&sb, buffer, WEB_RINGFILE_JSON_BYTES);
+  appendRingFileJson(&sb);
+
+  if (sb.overflow)
+  {
+    ESP_LOGE(tag, "ring file json overflow");
+  }
+
+  esp_err_t result = sendJson(req, buffer);
+  free(buffer);
+  return result;
+}
+
 static esp_err_t handleViewReport(httpd_req_t* req)
 {
   char body[WEB_BODY_MAX];
@@ -1372,6 +1448,30 @@ static void wsHandleCommand(httpd_req_t* req, const char* body)
     stringBuilder sb;
     sbInit(&sb, buffer, WEB_POWER_JSON_BYTES);
     appendPowerJson(&sb);
+    wsSendReply(req, buffer);
+    free(buffer);
+    return;
+  }
+
+  if (strcmp(command, "ringfile") == 0)
+  {
+    char* buffer = malloc(WEB_RINGFILE_JSON_BYTES);
+
+    if (buffer == NULL)
+    {
+      wsSendReply(req, "{\"type\":\"error\",\"request\":\"ringfile\",\"error\":\"out of memory\"}");
+      return;
+    }
+
+    stringBuilder sb;
+    sbInit(&sb, buffer, WEB_RINGFILE_JSON_BYTES);
+    appendRingFileJson(&sb);
+
+    if (sb.overflow)
+    {
+      ESP_LOGE(tag, "ring file json overflow");
+    }
+
     wsSendReply(req, buffer);
     free(buffer);
     return;
@@ -1743,8 +1843,11 @@ esp_err_t loggerWebStart(void)
   //-- WebSocket command handling builds the telegram detail JSON (nested
   //-- string builders plus vsnprintf) on the httpd task stack: the 4 KB
   //-- default overflows there, which silently killed the whole web server
-  //-- (dropped telegrams and details, blank panes). 8 KB measured headroom.
-  config.stack_size = 8192;
+  //-- (dropped telegrams and details, blank panes). The Show RingFile answer
+  //-- also drives ring_file_store from this task, and the component
+  //-- documents at least 8 KB of stack for any task using it; 10 KB covers
+  //-- both paths with headroom.
+  config.stack_size = 10240;
 
   //-- WebSocket sessions stay open for the life of the page; an LRU purge
   //-- could evict them to make room for ordinary requests.
@@ -1772,6 +1875,7 @@ esp_err_t loggerWebStart(void)
   registerUri(server, "/api/telegrams", HTTP_GET, false, handleTelegramsGet);
   registerUri(server, "/api/telegram/*", HTTP_GET, false, handleTelegramGet);
   registerUri(server, "/api/power", HTTP_GET, false, handlePowerGet);
+  registerUri(server, "/api/ringfile", HTTP_GET, false, handleRingFileGet);
   registerUri(server, "/api/view", HTTP_POST, false, handleViewReport);
   registerUri(server, "/ws", HTTP_GET, true, handleWebSocket);
 

@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: app_main.c - application entry
-//-- Date: 2026-11-17 · Build: 6
+//-- Date: 2026-11-19 · Build: 8
 //--
 //-- Boot order: the board debug lines come up first, then NVS, then the P1
 //-- receiver. Reception starts as soon as a valid configuration is stored and
@@ -13,7 +13,8 @@
 
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
-const char* PROG_VERSION = "v0.4.10";
+extern const char* PROG_VERSION;
+const char* PROG_VERSION = "v0.4.11";
 
 #include <stdio.h>
 #include <string.h>
@@ -31,6 +32,7 @@ const char* PROG_VERSION = "v0.4.10";
 #include "logger_board.h"
 #include "logger_receiver.h"
 #include "logger_settings.h"
+#include "logger_store.h"
 #include "logger_web.h"
 #include "nvs_flash.h"
 #include "wifi_provisioner.h"
@@ -192,6 +194,16 @@ void app_main(void)
   else
   {
     ESP_LOGI(tag, "no valid stored settings, awaiting configuration");
+  }
+
+  //-- The meter store runs on its own task: it mounts the LittleFS storage
+  //-- partition and keeps the last twenty minute records in a ring file,
+  //-- printing the complete list to the console every ten minutes.
+  esp_err_t storeStarted = loggerStoreInit();
+
+  if (storeStarted != ESP_OK)
+  {
+    ESP_LOGE(tag, "meter store could not start: %s", esp_err_to_name(storeStarted));
   }
 
   BaseType_t created =

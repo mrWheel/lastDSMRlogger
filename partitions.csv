@@ -1,13 +1,17 @@
 # lastDSMRlogger partition table — 8 MB SPI flash
-# Date: 2026-11-16 · Build: 2
+# Date: 2026-11-19 · Build: 3
 #
 # The nvs partition keeps the address it had on the default single app
 # table, so stored settings survive the switch to this table. The two OTA
 # app slots are sized far beyond the current ~1 MB image, leaving room for
-# embedded assets and future features.
+# embedded assets and future features. The storage partition carries the
+# LittleFS volume with the meter ring file of the logger_store component;
+# the 256 KiB size follows the ring_file_store example and leaves the
+# volume far from full.
 # Name,     Type, SubType, Offset,   Size,     Flags
 nvs,        data, nvs,     0x9000,   0x6000,
 otadata,    data, ota,     ,         0x2000,
 phy_init,   data, phy,     ,         0x1000,
 ota_0,      app,  ota_0,   ,         0x300000,
 ota_1,      app,  ota_1,   ,         0x300000,
+storage,    data, littlefs, ,        0x40000,

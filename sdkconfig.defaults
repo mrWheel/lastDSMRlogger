@@ -1,5 +1,5 @@
 # lastDSMRlogger - default SDK configuration
-# Date: 2026-11-16 · Build: 2
+# Date: 2026-11-19 · Build: 3
 
 # Hardware target: ESP32-S3 on the TFT LCD Display EC11 Piggyback Board v3.
 CONFIG_IDF_TARGET="esp32s3"
@@ -38,3 +38,8 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # The SPA assets are embedded in the firmware image.
+
+# The meter store writes its LittleFS ring file once a minute while the P1
+# UART receiver is live; flash operations disable the cache, so the UART ISR
+# must stay in IRAM to never lose a received byte (joltwallet/littlefs README).
+CONFIG_UART_ISR_IN_IRAM=y

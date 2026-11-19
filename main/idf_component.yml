@@ -7,5 +7,7 @@
 ## is not published in the registry.
 
 dependencies:
-  "michmich/esp-idf-wifi-provisioner":
-    version: "0.4.0"
+  michmich/esp-idf-wifi-provisioner:
+    version: 0.4.0
+  mrwheel/ring_file_store: ^0.1.2
+  joltwallet/littlefs: ^1.23.1
