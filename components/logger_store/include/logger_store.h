@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.h - per-minute smart meter ring file store
-//-- Date: 2026-11-20 · Build: 3
+//-- Date: 2026-11-20 · Build: 4
 //--
 //-- One record per minute lands in a fixed-capacity ring file on the
 //-- LittleFS storage partition, stored through mrwheel's ring_file_store
@@ -16,6 +16,7 @@
 #define LOGGER_STORE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -74,5 +75,12 @@ esp_err_t loggerStoreListRecords(loggerStoreRecordVisitor visitor, void* userDat
 //-- the volume is mounted, and NULL before the store task mounted it or when
 //-- the store stays disabled.
 const char* loggerStoreMountPoint(void);
+
+//-- Capacity statistics of the mounted LittleFS storage volume: total bytes
+//-- and used bytes (the free space is the difference). Keeps the partition
+//-- label private to this component. Returns false when the store is not
+//-- running or the statistics could not be read; the outputs stay untouched
+//-- in that case.
+bool loggerStoreVolumeInfo(size_t* totalBytes, size_t* usedBytes);
 
 #endif //-- LOGGER_STORE_H

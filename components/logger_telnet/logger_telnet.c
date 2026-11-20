@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_telnet.c - telnet console server on port 23
-//-- Date: 2026-11-20 · Build: 4
+//-- Date: 2026-11-20 · Build: 5
 //--
 //-- A plain BSD-socket console task: it listens on port 23, serves exactly
 //-- one session at a time and answers a read-only command set from the
@@ -19,6 +19,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <netinet/in.h>
@@ -28,6 +29,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -55,6 +57,8 @@ static const char* tag = "loggerTelnet";
 #define TELNET_RECV_BUFFER_BYTES 256
 #define TELNET_PRINT_LINE_BYTES 512
 #define TELNET_OUT_BUFFER_BYTES 4096
+//-- Mount point plus a full d_name (NAME_MAX) plus separator and terminator.
+#define TELNET_PATH_BYTES 320
 #define TELNET_PROMPT "logger> "
 
 //-- Minimal telnet negotiation: the console echoes and is full duplex, so
@@ -194,16 +198,18 @@ static const char* stateName(loggerReceiverState state)
 
 static void printHelp(int fd)
 {
-  telnetSendText(fd, "\r\navailable commands:\r\n"
-                     "  help               this command list\r\n"
-                     "  status             reception, counters, clock, Wi-Fi and control owner\r\n"
-                     "  version            firmware and parser versions\r\n"
-                     "  telegrams          the telegrams retained in RAM\r\n"
-                     "  telegram <seq>     decoded fields of one retained telegram\r\n"
-                     "  raw <seq>          exact bytes of one retained telegram\r\n"
-                     "  power              the realtime power frame of the newest telegram\r\n"
-                     "  ringfile           the minute records of the meter ring file\r\n"
-                     "  quit               close this session\r\n");
+  telnetSendText(
+      fd, "\r\navailable commands:\r\n"
+          "  help               this command list\r\n"
+          "  status             reception, counters, clock, Wi-Fi and control owner\r\n"
+          "  version            firmware and parser versions\r\n"
+          "  telegrams          the telegrams retained in RAM\r\n"
+          "  telegram <seq>     decoded fields of one retained telegram\r\n"
+          "  raw <seq>          exact bytes of one retained telegram\r\n"
+          "  power              the realtime power frame of the newest telegram\r\n"
+          "  ringfile           the minute records of the meter ring file\r\n"
+          "  store              LittleFS volume: files with sizes, capacity and free space\r\n"
+          "  quit               close this session\r\n");
 }
 
 static void printStatus(int fd)
@@ -495,6 +501,108 @@ static void printRingFile(int fd)
   free(buffer);
 }
 
+//-- LittleFS volume overview: every file on the mounted storage volume with
+//-- its size, followed by the total capacity and the free space. The walk
+//-- runs on the console task while the store task keeps writing its minute
+//-- records: the LittleFS VFS layer serialises both sides, and the answer is
+//-- built in memory (like the ring file walk) so the socket is never written
+//-- to mid-scan.
+static void printStore(int fd)
+{
+  const char* mountPoint = loggerStoreMountPoint();
+
+  if (mountPoint == NULL)
+  {
+    telnetPrintf(fd, "\r\nthe LittleFS storage volume is not mounted (meter store disabled)\r\n");
+    return;
+  }
+
+  TelnetOut out;
+  char* buffer = malloc(TELNET_OUT_BUFFER_BYTES);
+
+  if (buffer == NULL)
+  {
+    telnetPrintf(fd, "out of memory\r\n");
+    return;
+  }
+
+  out.buffer = buffer;
+  out.capacity = TELNET_OUT_BUFFER_BYTES;
+  out.length = 0u;
+  out.overflow = false;
+
+  outAppendFmt(&out, "\r\nLittleFS volume at %s:\r\n", mountPoint);
+
+  DIR* directory = opendir(mountPoint);
+
+  if (directory == NULL)
+  {
+    outAppendFmt(&out, "(the volume directory could not be opened: errno %d)\r\n", errno);
+  }
+  else
+  {
+    uint32_t fileCount = 0u;
+    struct dirent* entry = NULL;
+
+    while ((entry = readdir(directory)) != NULL)
+    {
+      if ((strcmp(entry->d_name, ".") == 0) || (strcmp(entry->d_name, "..") == 0))
+      {
+        continue;
+      }
+
+      char path[TELNET_PATH_BYTES];
+      snprintf(path, sizeof path, "%s/%s", mountPoint, entry->d_name);
+
+      struct stat details;
+      memset(&details, 0, sizeof details);
+
+      if (stat(path, &details) != 0)
+      {
+        outAppendFmt(&out, "  %-24s  (not readable: errno %d)\r\n", entry->d_name, errno);
+        continue;
+      }
+
+      fileCount++;
+
+      if (S_ISDIR(details.st_mode))
+      {
+        outAppendFmt(&out, "  %-24s  <directory>\r\n", entry->d_name);
+      }
+      else
+      {
+        outAppendFmt(&out, "  %-24s %10ld bytes\r\n", entry->d_name, (long)details.st_size);
+      }
+    }
+
+    closedir(directory);
+
+    outAppendFmt(&out, "%" PRIu32 " file(s) on the volume\r\n", fileCount);
+  }
+
+  size_t totalBytes = 0u;
+  size_t usedBytes = 0u;
+
+  if (loggerStoreVolumeInfo(&totalBytes, &usedBytes))
+  {
+    outAppendFmt(&out, "capacity     : %lu bytes total, %lu used, %lu free\r\n",
+                 (unsigned long)totalBytes, (unsigned long)usedBytes,
+                 (unsigned long)(totalBytes - usedBytes));
+  }
+  else
+  {
+    outAppendFmt(&out, "capacity     : statistics not available\r\n");
+  }
+
+  if (out.overflow)
+  {
+    outAppendFmt(&out, "... output truncated\r\n");
+  }
+
+  telnetSend(fd, out.buffer, out.length);
+  free(buffer);
+}
+
 //-- Handles one complete command line. Returns false when the session must
 //-- close (the quit command).
 static bool handleLine(int fd, char* line)
@@ -562,6 +670,10 @@ static bool handleLine(int fd, char* line)
   else if (strcasecmp(line, "ringfile") == 0)
   {
     printRingFile(fd);
+  }
+  else if (strcasecmp(line, "store") == 0)
+  {
+    printStore(fd);
   }
   else if ((strcasecmp(line, "quit") == 0) || (strcasecmp(line, "exit") == 0))
   {
