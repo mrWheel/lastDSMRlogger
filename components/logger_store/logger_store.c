@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.c - per-minute smart meter ring file store
-//-- Date: 2026-11-19 · Build: 2
+//-- Date: 2026-11-20 · Build: 3
 //--
 //-- The store task owns all ring_file_store work: it mounts the LittleFS
 //-- storage partition, breaks any lock file left by an interrupted run,
@@ -467,6 +467,13 @@ static void storeTask(void* argument)
 //-- --------------------------------------------------------------------------
 //-- Public operations
 //-- --------------------------------------------------------------------------
+
+const char* loggerStoreMountPoint(void)
+{
+  //-- The handle is published once the volume is mounted and the ring is
+  //-- open, so it doubles as the "volume available" flag for the SMB share.
+  return (ringHandle != NULL) ? STORE_MOUNT_POINT : NULL;
+}
 
 esp_err_t loggerStoreInit(void)
 {

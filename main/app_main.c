@@ -1,20 +1,21 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: app_main.c - application entry
-//-- Date: 2026-11-19 · Build: 9
+//-- Date: 2026-11-20 · Build: 10
 //--
 //-- Boot order: the board debug lines come up first, then NVS, then the P1
 //-- receiver. Reception starts as soon as a valid configuration is stored and
 //-- continues while Wi-Fi is disconnected. The Wi-Fi provisioner runs in its
 //-- own task because its start path blocks while it retries saved credentials;
-//-- the SPA server starts after the first successful connection because the
-//-- captive portal owns port 80 during provisioning.
+//-- the SPA server, the telnet console and the SMB share start after the
+//-- first successful connection because the captive portal owns port 80
+//-- during provisioning.
 //-- ==========================================================================
 
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
 extern const char* PROG_VERSION;
-const char* PROG_VERSION = "v0.4.12";
+const char* PROG_VERSION = "v0.4.13";
 
 #include <stdio.h>
 #include <string.h>
@@ -37,6 +38,7 @@ const char* PROG_VERSION = "v0.4.12";
 #include "logger_telnet.h"
 #include "logger_web.h"
 #include "nvs_flash.h"
+#include "smb_server.h"
 #include "wifi_provisioner.h"
 
 static const char* tag = "appMain";
@@ -61,6 +63,44 @@ static void onSntpSynced(struct timeval* tv)
 {
   (void)tv;
   ESP_LOGI(tag, "clock synchronised via %s", SNTP_SERVER);
+}
+
+//-- The SMB share exposes the meter store's mounted LittleFS volume to the
+//-- local network through mrwheel's smb_server component. The share is
+//-- read-only and guest-accessible: a visitor can inspect or copy the ring
+//-- file but can never delete or corrupt the logger's own records.
+static void startSmbShare(void)
+{
+  if (smb_server_is_running())
+  {
+    //-- A repeated station reconnect reports another connect: one share per
+    //-- boot is enough.
+    return;
+  }
+
+  const char* mountPoint = loggerStoreMountPoint();
+
+  if (mountPoint == NULL)
+  {
+    ESP_LOGW(tag, "storage volume not mounted, the SMB share stays off");
+    return;
+  }
+
+  smb_server_config_t config = SMB_SERVER_DEFAULT_CONFIG();
+  config.share_name = "DSMRLOGGER";
+  config.mount_point = mountPoint;
+  config.read_only = true;
+
+  esp_err_t result = smb_server_start(&config);
+
+  if (result != ESP_OK)
+  {
+    ESP_LOGE(tag, "SMB share could not start: %s", esp_err_to_name(result));
+    return;
+  }
+
+  ESP_LOGI(tag, "SMB share '%s' open on port %u (read-only, guest access)", config.share_name,
+           (unsigned)config.port);
 }
 
 static void onWifiConnected(void)
@@ -119,6 +159,8 @@ static void onWifiConnected(void)
   {
     ESP_LOGI(tag, "telnet console open on port 23");
   }
+
+  startSmbShare();
 }
 
 static void onWifiPortalStart(void)

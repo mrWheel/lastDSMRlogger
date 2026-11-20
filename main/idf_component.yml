@@ -1,13 +1,17 @@
 ## lastDSMRlogger - managed component dependencies
-## Date: 2026-11-14 · Build: 1
+## Date: 2026-11-20 · Build: 2
 ##
 ## The esp-idf-wifi-provisioner is pulled from the ESP Component Registry and
-## pinned to the verified release. The esp32_s3_piggyback board component is
-## vendored under components/ (see README.md for its pinned commit) because it
-## is not published in the registry.
+## pinned to the verified release. 
+## The esp32_s3_piggyback board component is vendored under components/ (see README.md for its pinned commit) because it
+## is not published in the registry. 
+## The ring_file_store component manages the meter store's ring file, keeping the last twenty minutes of records.
+## The smb_server component publishes the
+## meter store's LittleFS volume as a read-only guest SMB share.
+## littlefs component provides the underlying filesystem for the meter store's volume.
 
 dependencies:
-  michmich/esp-idf-wifi-provisioner:
-    version: 0.4.0
+  michmich/esp-idf-wifi-provisioner: ^0.4.0
   mrwheel/ring_file_store: ^0.1.2
   joltwallet/littlefs: ^1.23.1
+  mrwheel/smb_server: ^0.3.0

@@ -1,7 +1,7 @@
 # lastDSMRlogger
 
-Buildnumber: 20
-Last update-date: 2026-11-19
+Buildnumber: 21
+Last update-date: 2026-11-20
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -49,6 +49,9 @@ automatically.
 |parserDSMR                |`https://github.com/mrWheel/parserDSMR` checkout at `../parserDSMR`                                         |revision `686a3aeefb5c4b107ce9884023fab4014b184b31` (v0.9.1, includes the raw-frame API and `dsmrParserVersion()`; `PROG_VERSION` now has internal linkage, so it no longer clashes with the application's own symbol) |
 |esp32_s3_piggyback        |`https://github.com/mrWheel/esp32-s3-Piggyback`, component directory `components/esp32_s3_piggyback`       |commit `912fa25b86fdb62d8f1005ae57e227c5803db373` (v1.3.0), vendored under `components/` |
 |esp-idf-wifi-provisioner  |ESP Component Registry `michmich/esp-idf-wifi-provisioner`                                                  |version `0.4.0` (upstream commit `2c7aaa6aa0e319a429186ee470e137b8579f632f`) |
+|ring_file_store           |ESP Component Registry `mrwheel/ring_file_store`                                                            |`^0.1.2` |
+|littlefs                  |ESP Component Registry `joltwallet/littlefs`                                                                |`^1.23.1` |
+|smb_server                |ESP Component Registry `mrwheel/smb_server`                                                                 |`^0.3.0` (GPL-3.0, guest-only SMB2/SMB3 file server) |
 
 parserDSMR is consumed as the checkout's `components/parserDSMR` directory
 through `EXTRA_COMPONENT_DIRS` in the root `CMakeLists.txt`. The checkout
@@ -364,6 +367,25 @@ these read-only commands:
 |`power`          |the realtime power frame of the newest accepted telegram         |
 |`ringfile`       |the minute records of the meter ring file                        |
 |`quit`           |close the session                                                |
+
+### SMB network share
+
+Once the station has joined and the meter store has mounted the LittleFS
+storage partition, the device also runs an SMB2/SMB3 file server on port 445
+(mrwheel's `smb_server` component). It publishes the storage volume as the
+read-only guest share `DSMRLOGGER`: the ring file `meter.rfs` can be inspected
+or copied from any machine on the local network, while the logger's own
+records stay protected against accidental modification.
+
+- macOS: `smbutil view -G //guest@<device-ip>`, then
+  `open smb://guest@<device-ip>/DSMRLOGGER` (or Finder → Connect to Server).
+- Linux: `mount -t cifs //<device-ip>/DSMRLOGGER /mnt/dsmrlogger -o guest,ro`
+- Windows: map `\\<device-ip>\DSMRLOGGER` in Explorer (any credentials work).
+
+The server is guest-only and never signs or encrypts traffic: there are no
+user accounts and no transport security, so only trusted local networks
+should reach the device. When the storage volume could not be mounted the
+share stays off and the console logs the reason.
 
 ## 7. RAM limits (documented target configuration)
 

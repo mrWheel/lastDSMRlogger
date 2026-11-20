@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.h - per-minute smart meter ring file store
-//-- Date: 2026-11-19 · Build: 2
+//-- Date: 2026-11-20 · Build: 3
 //--
 //-- One record per minute lands in a fixed-capacity ring file on the
 //-- LittleFS storage partition, stored through mrwheel's ring_file_store
@@ -67,5 +67,12 @@ typedef bool (*loggerStoreRecordVisitor)(uint64_t minuteKey, const loggerMeterRe
 //-- when the walk could not complete, and ESP_OK otherwise (an empty ring
 //-- simply never calls the visitor).
 esp_err_t loggerStoreListRecords(loggerStoreRecordVisitor visitor, void* userData);
+
+//-- VFS mount point of the LittleFS storage volume, published for the SMB
+//-- network share (the component exposes an already mounted VFS path and
+//-- the store task owns this mount). Returns the absolute mount point while
+//-- the volume is mounted, and NULL before the store task mounted it or when
+//-- the store stays disabled.
+const char* loggerStoreMountPoint(void);
 
 #endif //-- LOGGER_STORE_H

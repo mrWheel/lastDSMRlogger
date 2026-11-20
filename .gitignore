@@ -13,7 +13,6 @@ sdkconfig.old
 !/projects/project.json
 !/projects/*.png
 
-
 # ESP-IDF and local tooling
 .espressif/
 .vscode/.cache/
@@ -25,6 +24,7 @@ sdkconfig.old
 
 # Other
 .claude/
+*.un~
 
 # python temp
 __pycach__
