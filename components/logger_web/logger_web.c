@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-19 · Build: 11
+//-- Date: 2026-11-20 · Build: 13
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -32,6 +33,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "logger_board.h"
+#include "logger_control.h"
 #include "logger_receiver.h"
 #include "logger_settings.h"
 #include "logger_store.h"
@@ -68,8 +70,11 @@ extern const char styleCssEnd[] asm("_binary_style_css_end");
 //-- WebSocket transport
 //-- --------------------------------------------------------------------------
 
-//-- Browser clients with an open /ws session. Pushes run from a dedicated
-//-- task so a stalled client cannot block the receive task or the parser.
+//-- Browser clients with an open /ws session. Exactly one client — web or
+//-- telnet — may hold control at a time via the logger_control arbiter, so
+//-- in practice this table only ever carries the owning fd. Pushes run from
+//-- a dedicated task so a stalled client cannot block the receive task or
+//-- the parser.
 #define WS_MAX_CLIENTS 4
 #define WS_PUSH_INTERVAL_MS 1000u
 #define WS_PUSH_TASK_STACK_BYTES 4096
@@ -219,26 +224,59 @@ static void wsSendToClient(int fd, const char* text)
   }
 }
 
+//-- Copies the fd of the /ws client that currently holds the single control
+//-- token. False when control is with the telnet console or free: then no
+//-- browser may receive pushes at all.
+static bool webControlOwnerFd(int* ownerFd)
+{
+  loggerControlClient ownerClient = LOGGER_CONTROL_WEB;
+  int fd = -1;
+
+  if (!loggerControlGetOwner(&ownerClient, &fd))
+  {
+    return false;
+  }
+
+  *ownerFd = (ownerClient == LOGGER_CONTROL_WEB) ? fd : -1;
+  return *ownerFd >= 0;
+}
+
 static void wsSendToAll(const char* text)
 {
-  int targets[WS_MAX_CLIENTS];
+  //-- Single-operator rule: only the client holding control is pushed to;
+  //-- every other session was evicted by the arbiter when this one claimed
+  //-- control, so the client table already only ever carries that one fd.
+  int ownerFd = -1;
 
-  if (wsMutex == NULL)
+  if (!webControlOwnerFd(&ownerFd))
   {
     return;
   }
 
-  xSemaphoreTake(wsMutex, portMAX_DELAY);
-  memcpy(targets, wsFds, sizeof targets);
-  xSemaphoreGive(wsMutex);
+  wsSendToClient(ownerFd, text);
+}
 
-  for (uint8_t index = 0u; index < WS_MAX_CLIENTS; index++)
-  {
-    if (targets[index] != -1)
-    {
-      wsSendToClient(targets[index], text);
-    }
-  }
+//-- The arbiter calls this when a telnet session (or a newer browser tab)
+//-- claims control from the current web client. The evicted page first gets
+//-- the takeover text frame, then its socket is force-closed — the async
+//-- send is queued before the close, so the browser still shows its popup
+//-- with the take-control-back button. Modelled on the single-/ws-client
+//-- rule of the reference radio project.
+static void webEvictCallback(loggerControlClient evicted, int evictedFd)
+{
+  (void)evicted;
+  wsSendToClient(evictedFd, "{\"type\":\"takenover\",\"message\":\"Control of the logger was "
+                            "taken over by another client.\"}");
+
+  //-- Give the TCP stack a moment to push the popup frame into the wire
+  //-- before the close queues its FIN. A page that loses the socket without
+  //-- ever seeing the message does not halt and reconnects within two
+  //-- seconds, stealing control back and starting a ping-pong with the new
+  //-- owner: message delivery is the one thing that must never lose that
+  //-- race, so the close is deliberately delayed a little.
+  vTaskDelay(pdMS_TO_TICKS(50));
+
+  httpd_sess_trigger_close(server, evictedFd);
 }
 
 //-- Sends one text frame back on the request that received the command.
@@ -1625,7 +1663,14 @@ static esp_err_t handleWebSocket(httpd_req_t* req)
   //-- data frames: that is where a client must be registered for pushes.
   //-- wsClientAdd ignores sockets it already knows, so calling it on every
   //-- frame is cheap and cannot miss a client.
-  wsClientAdd(httpd_req_to_sockfd(req));
+  int clientFd = httpd_req_to_sockfd(req);
+  wsClientAdd(clientFd);
+
+  //-- Single-operator rule: the reporting of a session claims control. The
+  //-- arbiter evicts the previous owner (web page popup or telnet farewell)
+  //-- through its registered callback; for the current owner this is a
+  //-- cheap no-op, same per-frame check as the reference project uses.
+  loggerControlClaim(LOGGER_CONTROL_WEB, clientFd);
 
   if (req->method == HTTP_GET)
   {
@@ -1806,6 +1851,19 @@ static void wsPushTaskLoop(void* argument)
   }
 }
 
+//-- Clears the /ws registration and the control token when a socket really
+//-- closes, so a reconnect after an ordinary disconnect is never locked out
+//-- by a stale owner entry (only an actual close clears it — the reference
+//-- project's pitfall: a reconnect must not look like a takeover). The
+//-- close_fn contract: this function owns the close() call.
+static void webCloseFn(httpd_handle_t handle, int sockfd)
+{
+  (void)handle;
+  wsClientRemove(sockfd);
+  loggerControlRelease(LOGGER_CONTROL_WEB, sockfd);
+  close(sockfd);
+}
+
 //-- --------------------------------------------------------------------------
 //-- Server lifecycle
 //-- --------------------------------------------------------------------------
@@ -1840,6 +1898,11 @@ esp_err_t loggerWebStart(void)
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.max_uri_handlers = 16;
 
+  //-- A single page load opens roughly five concurrent sockets; the default
+  //-- of four was already too tight for one browser (see the sizing note in
+  //-- sdkconfig.defaults). The telnet console and SNTP share the LWIP pool.
+  config.max_open_sockets = 8;
+
   //-- WebSocket command handling builds the telegram detail JSON (nested
   //-- string builders plus vsnprintf) on the httpd task stack: the 4 KB
   //-- default overflows there, which silently killed the whole web server
@@ -1853,6 +1916,9 @@ esp_err_t loggerWebStart(void)
   //-- could evict them to make room for ordinary requests.
   config.lru_purge_enable = false;
 
+  //-- Clears the control token and the /ws table when a socket closes.
+  config.close_fn = webCloseFn;
+
   esp_err_t result = httpd_start(&server, &config);
 
   if (result != ESP_OK)
@@ -1864,6 +1930,7 @@ esp_err_t loggerWebStart(void)
   wsClientsInit();
   wsPushedAcceptedCount = 0u;
   wsPushedPowerSequence = 0u;
+  loggerControlRegisterEvict(LOGGER_CONTROL_WEB, webEvictCallback);
 
   registerUri(server, "/", HTTP_GET, false, handleRoot);
   registerUri(server, "/app.js", HTTP_GET, false, handleAppJs);

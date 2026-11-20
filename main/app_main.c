@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: app_main.c - application entry
-//-- Date: 2026-11-19 · Build: 8
+//-- Date: 2026-11-19 · Build: 9
 //--
 //-- Boot order: the board debug lines come up first, then NVS, then the P1
 //-- receiver. Reception starts as soon as a valid configuration is stored and
@@ -14,7 +14,7 @@
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
 extern const char* PROG_VERSION;
-const char* PROG_VERSION = "v0.4.11";
+const char* PROG_VERSION = "v0.4.12";
 
 #include <stdio.h>
 #include <string.h>
@@ -30,9 +30,11 @@ const char* PROG_VERSION = "v0.4.11";
 #include "freertos/task.h"
 #include "dsmr_parser.h"
 #include "logger_board.h"
+#include "logger_control.h"
 #include "logger_receiver.h"
 #include "logger_settings.h"
 #include "logger_store.h"
+#include "logger_telnet.h"
 #include "logger_web.h"
 #include "nvs_flash.h"
 #include "wifi_provisioner.h"
@@ -102,8 +104,21 @@ static void onWifiConnected(void)
   loggerBoardWifiConnected(ssid, ip);
   ESP_LOGI(tag, "station joined '%s' with IP %s, SPA reachable there", ssid, ip);
 
-  //-- The captive portal released port 80 when it stopped: serve the SPA.
+  //-- The captive portal released port 80 when it stopped: serve the SPA and
+  //-- open the telnet console. Both share one control token: the client that
+  //-- reports itself first is the single operator.
   loggerWebStart();
+
+  esp_err_t telnetStarted = loggerTelnetStart();
+
+  if (telnetStarted != ESP_OK)
+  {
+    ESP_LOGE(tag, "telnet console could not start: %s", esp_err_to_name(telnetStarted));
+  }
+  else
+  {
+    ESP_LOGI(tag, "telnet console open on port 23");
+  }
 }
 
 static void onWifiPortalStart(void)
@@ -171,6 +186,10 @@ void app_main(void)
   loggerBoardShowParserVersion(dsmrParserVersion());
 
   initialiseNvs();
+
+  //-- The single-operator arbiter for the web and telnet control channels:
+  //-- ready before any server can claim control.
+  ESP_ERROR_CHECK(loggerControlInit());
 
   ESP_ERROR_CHECK(loggerReceiverInit());
 

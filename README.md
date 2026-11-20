@@ -1,7 +1,7 @@
 # lastDSMRlogger
 
-Buildnumber: 19
-Last update-date: 2026-11-17
+Buildnumber: 20
+Last update-date: 2026-11-19
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -332,6 +332,38 @@ quirk of ESP-IDF 6.0.2: `uart_driver_delete()` keeps its revoked-pin mask in
 a 32-bit variable, so reservations of GPIOs ≥ 32 are never revoked and the
 next install reports them busy. The pin routing itself is applied normally
 and forwarding works; the warning can be ignored.
+
+### Telnet console and the single operator
+
+Together with the SPA the device opens a telnet console on port 23
+(`telnet <device-ip> 23` from any machine on the local network). Exactly one
+operator may control the logger at a time: the SPA's WebSocket session or one
+telnet session — whichever client reports itself last holds the control
+token. Ordinary page and API requests are not operators.
+
+- A telnet client connecting while a browser page is open takes control: the
+  page shows a popup that control was taken over by another client, with a
+  **Take back control** button that reloads the page and claims control back
+  (the evicted telnet session then prints a clear farewell and closes). While
+  the popup is open the page does not auto-reconnect.
+- A second telnet client displaces the first the same way: the first session
+  receives `*** Control of the logger was taken over by another client.` and
+  is closed.
+
+The console greets with the firmware version and the peer address and answers
+these read-only commands:
+
+|Command          |Shows                                                            |
+|-----------------|-----------------------------------------------------------------|
+|`help`           |the command list                                                 |
+|`status`         |reception state, counters, clock, Wi-Fi and the control owner    |
+|`version`        |firmware and parserDSMR versions                                 |
+|`telegrams`      |the telegrams retained in RAM                                    |
+|`telegram <seq>` |decoded fields of one retained telegram                          |
+|`raw <seq>`      |exact accepted bytes of one retained telegram                    |
+|`power`          |the realtime power frame of the newest accepted telegram         |
+|`ringfile`       |the minute records of the meter ring file                        |
+|`quit`           |close the session                                                |
 
 ## 7. RAM limits (documented target configuration)
 

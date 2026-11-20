@@ -1,5 +1,5 @@
 # lastDSMRlogger - default SDK configuration
-# Date: 2026-11-19 · Build: 3
+# Date: 2026-11-19 · Build: 4
 
 # Hardware target: ESP32-S3 on the TFT LCD Display EC11 Piggyback Board v3.
 CONFIG_IDF_TARGET="esp32s3"
@@ -17,6 +17,13 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # The SPA exchanges its dynamic data with the device over a WebSocket; the
 # esp_http_server WebSocket support must be compiled in.
 CONFIG_HTTPD_WS_SUPPORT=y
+
+# Socket headroom: one browser page load alone opens about five concurrent
+# connections (index.html, style.css, app.js, favicon.ico and /ws), and the
+# pool is shared system-wide with the telnet console (listen + client), the
+# provisioner and SNTP. The default of 10 starves a second client — the same
+# pitfall the reference radio project documents with its httpd/LWIP sizing.
+CONFIG_LWIP_MAX_SOCKETS=16
 
 # The module also carries an 8 MB octal PSRAM chip: enable it at boot so the
 # receiver can carve its large telegram buffers (retained history, staging

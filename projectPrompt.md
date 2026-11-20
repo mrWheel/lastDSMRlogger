@@ -1,7 +1,7 @@
 lastDSMRlogger — Project Specification
 
-Buildnumber: 1
-Last update-date: 2026-11-14
+Buildnumber: 2
+Last update-date: 2026-11-19
 
 Every Markdown document in the project shall include `Buildnumber` and `Last update-date` metadata near the beginning. Keep both values current whenever a Markdown document is created or edited.
 
@@ -69,7 +69,13 @@ The view shall distinguish input awaiting configuration, input awaiting data, an
 • Use MichMich's `esp-idf-wifi-provisioner` component for connecting with saved Wi-Fi credentials and captive-portal fallback when credentials are not yet provisioned or the saved network cannot be joined. Document the first-boot provisioning flow without requiring firmware recompilation. The logger shall continue processing P1 telegrams while Wi-Fi is disconnected and shall serve the SPA again after reconnecting. The project shall document the local URL or how to find the device IP.
 • The deliverable shall include the ESP-IDF project files, the pinned parser dependency, embedded SPA assets, and a README with build, flash, monitor, Wi-Fi setup, P1 wiring, and hardware verification instructions. The normal build path shall use idf.py set-target esp32s3, idf.py build, and idf.py -p PORT flash monitor.
 
-7. Acceptance criteria
+7. Control channels and telnet console
+
+The device shall allow exactly one operator at a time across its control channels: one web browser `/ws` session or one telnet session. Ordinary HTTP asset and API requests are not operators; the single-client rule governs control traffic only. The client that reports itself holds the control token; when another client reports itself, control moves to the new client and the previous owner is ended. An evicted web page shall first receive a takeover message on its WebSocket and then have its socket closed, and shall show a popup stating that control was taken over by another client together with a button that reloads the page and claims control back; while that popup is open the page's WebSocket auto-reconnect is halted so control never bounces back on its own. An evicted telnet session shall receive a clear text farewell on its own session before that socket is closed. The token is released when a socket actually closes, so an ordinary disconnect and reconnect is never mistaken for a takeover. The rule follows the single-`/ws`-client design of the reference radioProject (checked on the first data frame, cleared in the httpd `close_fn`).
+
+The device shall run a telnet console server on port 23, started together with the SPA once the station has joined. It shall serve exactly one telnet session at a time. The console shall greet with the firmware version and the peer address, prompt for commands with line editing (backspace), perform minimal telnet negotiation (server-side echo, incoming IAC sequences skipped), and answer read-only commands: `help`, `status`, `version`, `telegrams`, `telegram <seq>`, `raw <seq>`, `power`, `ringfile` and `quit`. `status` shall report reception state, RX GPIO and data source, profile and interval, uptime, receive counters, last diagnostics and error, device clock, Wi-Fi SSID and IP, and the current control owner. `raw <seq>` shall write the exact accepted bytes with their original line endings and trailer. Console output shall never block P1 reception, and the console task shall not draw on the TFT board (the board mutex can be held across a repaint window); telnet connect and disconnect are reported on the serial console log.
+
+8. Acceptance criteria
 
 1. The project builds with ESP-IDF 6.0.2 for ESP32-S3. After flash and documented Wi-Fi setup, the device serves both SPA views.
 2. Saving a supported GPIO, country/profile, and M-Bus configuration activates the complete configuration and survives a power cycle. Invalid pins, mismatched country/profile pairs, and unsupported M-Bus settings produce feedback and preserve the active configuration.
@@ -78,3 +84,4 @@ The view shall distinguish input awaiting configuration, input awaiting data, an
 5. M-Bus Auto, Disabled, and expected-type mismatch behavior is verified with more than one channel. Raw data remains available for every channel in an accepted frame.
 6. At the fastest supported telegram cadence, the history remains bounded and a slow browser does not stall reception. A network disconnect and reconnect preserves reception and restores access to the web interface.
 7. On the physical target, a conditioned P1 signal on a selectable J5 pin is received with the documented interface settings. The selected RX GPIO and console operate together and the board’s reserved peripheral pins remain available for their assigned functions.
+8. With the SPA open and holding control, a telnet client connecting takes control: the browser shows the takeover popup with the take-control-back button and stops auto-reconnecting, and its pushed updates stop. Pressing the button reclaims control and the evicted telnet session shows its clear takeover farewell. A second telnet client displaces the first in the same way. With control free, either channel can operate, and a normal disconnect/reconnect is not blocked by a stale token.

@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-19 · Build: 17 */
+   Date: 2026-11-19 · Build: 18 */
 
 :root
 {
@@ -933,4 +933,73 @@ footer
   {
     padding-bottom: 90px;
   }
+}
+
+/* Control-takeover popup (see #takeoverModal in index.html): dim overlay
+   with a centered card in the .card style and the #saveSettings button
+   look, shown when the single control token moves to the telnet console
+   or to another browser. */
+.modal
+{
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.modal[hidden]
+{
+  display: none;
+}
+
+.modalCard
+{
+  max-width: 340px;
+  background: var(--card);
+  border: 1px solid var(--separator);
+  border-radius: 14px;
+  padding: 22px 24px;
+  box-shadow: var(--shadow);
+  text-align: center;
+}
+
+.modalCard h2
+{
+  margin-bottom: 8px;
+}
+
+.modalCard p
+{
+  color: var(--secondary);
+  margin: 0 0 18px;
+}
+
+#takeoverTakeBack
+{
+  padding: 10px 22px;
+  background: var(--accent);
+  color: #fff;
+  font-family: inherit;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  border: none;
+  border-radius: 11px;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(0, 122, 255, 0.35);
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+
+#takeoverTakeBack:hover
+{
+  background: var(--accentPressed);
+}
+
+#takeoverTakeBack:active
+{
+  transform: scale(0.97);
 }
