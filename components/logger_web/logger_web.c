@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-20 · Build: 14
+//-- Date: 2026-11-20 · Build: 15
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -61,10 +61,10 @@ extern const char styleCssEnd[] asm("_binary_style_css_end");
 //-- frame plus that array with headroom.
 #define WEB_POWER_JSON_BYTES 6144
 #define WEB_DETAIL_JSON_BYTES (24u * 1024u)
-//-- The ring file JSON lists every retained minute record (up to twenty:
-//-- key, five counters and two tariff amounts each), so it is sized with
-//-- headroom above the fullest table.
-#define WEB_RINGFILE_JSON_BYTES 4096
+//-- The ring file JSON lists every retained record of one ring (the hours
+//-- ring is the largest at forty-nine: key, five counters and three tariff
+//-- amounts each), so it is sized with headroom above the fullest table.
+#define WEB_RINGFILE_JSON_BYTES 8192
 
 //-- --------------------------------------------------------------------------
 //-- WebSocket transport
@@ -1093,12 +1093,13 @@ static void appendPowerJson(stringBuilder* sb)
   sbAppend(sb, "]}");
 }
 
-//-- Ring file frame for the SPA Show RingFile view: every retained minute
-//-- record of the meter store, newest minute first, exactly as the ring walk
-//-- returns them. The counters keep the units of the telegram (kWh and m³),
-//-- the tariff amounts are the fictional billing cents in EUR. available
-//-- reports whether the store walk completed: while the store task never
-//-- opened its ring the records array simply stays empty.
+//-- Ring file frame for the SPA Show RingFile view: every retained record
+//-- of the selected meter ring (hours, days or months), newest period
+//-- first, exactly as the ring walk returns them. The counters keep the
+//-- units of the telegram (kWh and m³), the tariff amounts are the
+//-- fictional billing cents in EUR. ring echoes the walked selector and
+//-- available reports whether the store walk completed: while the store
+//-- task never opened its rings the records array simply stays empty.
 typedef struct
 {
   stringBuilder* sb;
@@ -1107,19 +1108,18 @@ typedef struct
 
 //-- Visitor of the ring walk: appends one record as a JSON object. Runs on
 //-- the httpd task between the walk's own cursor operations.
-static bool appendRingFileRecord(uint64_t minuteKey, const loggerMeterRecord* record,
-                                 void* userData)
+static bool appendRingFileRecord(uint64_t key, const loggerMeterRecord* record, void* userData)
 {
   RingFileEmit* emit = (RingFileEmit*)userData;
   stringBuilder* sb = emit->sb;
 
   sbAppendFmt(sb,
               "%s{\"key\":%" PRIu64 ",\"edT1\":%.3f,\"edT2\":%.3f,\"erT1\":%.3f,\"erT2\":%.3f,"
-              "\"gas\":%.3f,\"t1\":%.2f,\"t2\":%.2f}",
-              (emit->emitted > 0u) ? "," : "", minuteKey, record->energyDeliveredTariff1Kwh,
+              "\"gas\":%.3f,\"t1\":%.2f,\"t2\":%.2f,\"tG\":%.2f}",
+              (emit->emitted > 0u) ? "," : "", key, record->energyDeliveredTariff1Kwh,
               record->energyDeliveredTariff2Kwh, record->energyReturnedTariff1Kwh,
               record->energyReturnedTariff2Kwh, record->gasDeliveredM3, record->tariffAmount1Euro,
-              record->tariffAmount2Euro);
+              record->tariffAmount2Euro, record->tariffAmountGasEuro);
   emit->emitted++;
 
   //-- Stop the walk the moment the buffer is full: the client receives the
@@ -1127,14 +1127,38 @@ static bool appendRingFileRecord(uint64_t minuteKey, const loggerMeterRecord* re
   return !sb->overflow;
 }
 
-static void appendRingFileJson(stringBuilder* sb)
+//-- The optional ring selector of a ring file request: "ring=hours|days|"
+//-- "month(s)" read from a form body or a URL query. Absent or empty keeps
+//-- the hours default; an invalid name is reported as false so the caller
+//-- can answer with an error.
+static bool ringFromParameters(const char* parameters, loggerMeterRing_t* ring)
+{
+  *ring = LOGGER_RING_HOURS;
+
+  if (parameters == NULL)
+  {
+    return true;
+  }
+
+  char name[16];
+
+  if (!formGet(parameters, "ring", name, sizeof name))
+  {
+    return true;
+  }
+
+  return loggerStoreRingFromName(name, ring);
+}
+
+static void appendRingFileJson(stringBuilder* sb, loggerMeterRing_t ring)
 {
   RingFileEmit emit;
   memset(&emit, 0, sizeof emit);
   emit.sb = sb;
 
-  sbAppend(sb, "{\"type\":\"ringfile\",\"records\":[");
-  esp_err_t walked = loggerStoreListRecords(appendRingFileRecord, &emit);
+  sbAppendFmt(sb, "{\"type\":\"ringfile\",\"ring\":\"%s\",\"records\":[",
+              loggerStoreRingName(ring));
+  esp_err_t walked = loggerStoreListRecords(ring, appendRingFileRecord, &emit);
   sbAppend(sb, "],\"available\":");
   sbAppendFmt(sb, "%s}", (walked == ESP_OK) ? "true" : "false");
 }
@@ -1382,8 +1406,17 @@ static esp_err_t handlePowerGet(httpd_req_t* req)
 
 static esp_err_t handleRingFileGet(httpd_req_t* req)
 {
-  //-- The minute table of the meter ring file for diagnostics: the same
-  //-- frame the cmd=ringfile answer sends.
+  //-- The ring table of one meter ring file for diagnostics: the same frame
+  //-- the cmd=ringfile answer sends. The optional ?ring= query selects the
+  //-- ring (hours by default).
+  loggerMeterRing_t ring = LOGGER_RING_HOURS;
+  const char* query = strchr(req->uri, '?');
+
+  if ((query != NULL) && !ringFromParameters(query + 1, &ring))
+  {
+    return sendError(req, 400, "unknown ring");
+  }
+
   char* buffer = malloc(WEB_RINGFILE_JSON_BYTES);
 
   if (buffer == NULL)
@@ -1393,7 +1426,7 @@ static esp_err_t handleRingFileGet(httpd_req_t* req)
 
   stringBuilder sb;
   sbInit(&sb, buffer, WEB_RINGFILE_JSON_BYTES);
-  appendRingFileJson(&sb);
+  appendRingFileJson(&sb, ring);
 
   if (sb.overflow)
   {
@@ -1493,6 +1526,14 @@ static void wsHandleCommand(httpd_req_t* req, const char* body)
 
   if (strcmp(command, "ringfile") == 0)
   {
+    loggerMeterRing_t ring = LOGGER_RING_HOURS;
+
+    if (!ringFromParameters(body, &ring))
+    {
+      wsSendReply(req, "{\"type\":\"error\",\"request\":\"ringfile\",\"error\":\"unknown ring\"}");
+      return;
+    }
+
     char* buffer = malloc(WEB_RINGFILE_JSON_BYTES);
 
     if (buffer == NULL)
@@ -1503,7 +1544,7 @@ static void wsHandleCommand(httpd_req_t* req, const char* body)
 
     stringBuilder sb;
     sbInit(&sb, buffer, WEB_RINGFILE_JSON_BYTES);
-    appendRingFileJson(&sb);
+    appendRingFileJson(&sb, ring);
 
     if (sb.overflow)
     {

@@ -820,10 +820,29 @@ footer
 }
 
 /* --------------------------------------------------------------------------
-   RingFile view: the minute table of the on-device meter ring file. The
-   numeric columns reuse td.valueNumeric (right aligned, see the decoded
-   summary rule); nowrap keeps each minute on one line inside .tableWrap.
+   RingFile view: the table of one on-device meter ring (hours, days or
+   months). The radio group picks the ring and pushes the Refresh button to
+   the right end of the toolbar; the numeric columns reuse td.valueNumeric
+   (right aligned, see the decoded summary rule); nowrap keeps each period
+   on one line inside .tableWrap.
    ------------------------------------------------------------------------ */
+.ringRadioGroup
+{
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-right: auto;
+  font-size: 0.85rem;
+}
+
+.ringRadioGroup label
+{
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
 #ringFileTable th,
 #ringFileTable td
 {

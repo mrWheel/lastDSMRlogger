@@ -148,16 +148,25 @@
       <h2>RingFile</h2>
       <div id="ringFileState" class="message"></div>
       <div class="listToolbar">
+        <!-- The ring to show: the device keeps one ring file per period
+             (hours "YYMMDDhh", days "YYMMDD", months "YYMM"); picking
+             another radio button requests that ring right away. -->
+        <div class="ringRadioGroup">
+          <label><input type="radio" name="ringFileChoice" value="hours" checked> Hours</label>
+          <label><input type="radio" name="ringFileChoice" value="days"> Days</label>
+          <label><input type="radio" name="ringFileChoice" value="months"> Months</label>
+        </div>
         <button id="refreshRingFile" type="button">Refresh</button>
       </div>
-      <!-- The minute records of the on-device ring file, newest first (the
-           device walks its ring from the newest slot): one row per stored
-           minute with the five meter counters (kWh and m³) and the two
-           fictional tariff amounts (EUR). Rows are built by app.js. -->
+      <!-- The records of the selected on-device ring file, newest period
+           first (the device walks its ring from the newest slot): one row
+           per stored period with the five meter counters (kWh and m³) and
+           the three fictional tariff amounts (EUR). The first column header
+           follows the ring (Hour / Day / Month). Rows are built by app.js. -->
       <div class="tableWrap">
         <table id="ringFileTable">
           <thead>
-            <tr><th>Minute</th><th>Ed T1 kWh</th><th>Ed T2 kWh</th><th>Er T1 kWh</th><th>Er T2 kWh</th><th>Gas m³</th><th>Tariff 1 €</th><th>Tariff 2 €</th></tr>
+            <tr><th id="ringFileKeyHeader">Hour</th><th>Ed T1 kWh</th><th>Ed T2 kWh</th><th>Er T1 kWh</th><th>Er T2 kWh</th><th>Gas m³</th><th>Tariff 1 €</th><th>Tariff 2 €</th><th>Tariff Gas €</th></tr>
           </thead>
           <tbody></tbody>
         </table>

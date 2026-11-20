@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-20 · Build: 21
+// Date: 2026-11-20 · Build: 22
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -66,8 +66,17 @@ const VIEWS =
   {id: "settings", label: "Settings", section: "viewSettings", command: "cmd=config"},
   {id: "telegrams", label: "Telegrams", section: "viewTelegrams", command: "cmd=telegrams"},
   {id: "power", label: "Phase Load", section: "viewPower", command: "cmd=power"},
-  {id: "ringfile", label: "Show RingFile", section: "viewRingFile", command: "cmd=ringfile"},
+  {id: "ringfile", label: "Show RingFile", section: "viewRingFile",
+   command: () => "cmd=ringfile&ring=" + selectedRing()},
 ];
+
+// Resolves a view's command: either a fixed string or a function evaluated
+// when the view is (re)requested, so the ring file view always asks for the
+// ring its radio group has selected.
+function viewCommand(view)
+{
+  return (typeof view.command === "function") ? view.command() : view.command;
+}
 
 const el = {};
 
@@ -87,7 +96,7 @@ function bindElements()
                "telegramDetail", "recordMeta", "recordNotes", "summaryTable", "rawView", "footerInfo",
                "powerPanel", "powerTelegram", "powerRows",
                "powerScaleLabel", "powerSpark",
-               "ringFileState", "refreshRingFile", "ringFileTable",
+               "ringFileState", "refreshRingFile", "ringFileTable", "ringFileKeyHeader",
                "viewSettings", "viewTelegrams", "viewPower", "viewRingFile",
                "takeoverModal", "takeoverMessage", "takeoverTakeBack"];
 
@@ -131,7 +140,7 @@ function requestCurrentView()
 
   if (view !== undefined)
   {
-    wsSend(view.command);
+    wsSend(viewCommand(view));
   }
 }
 
@@ -1255,29 +1264,64 @@ function updatePowerPolling()
 //-- RingFile view
 //-- --------------------------------------------------------------------------
 
-// The device walks its ring file newest to oldest and answers cmd=ringfile
-// with every retained minute record in that order: the table simply follows
-// the frame. Rows are built with textContent only.
+// The device walks the ring its answer names ("ring" echoes the requested
+// period) newest to oldest and answers cmd=ringfile&ring=<period> with
+// every retained record in that order: the table simply follows the frame.
+// Rows are built with textContent only.
+
+// One entry per on-device ring: digits = width of the wall-clock period key
+// the device sends (YYMMDDhh / YYMMDD / YYMM), title = first column header,
+// unit = singular wording of the state line.
+const RINGS =
+{
+  hours: {digits: 8, title: "Hour", unit: "hour"},
+  days: {digits: 6, title: "Day", unit: "day"},
+  months: {digits: 4, title: "Month", unit: "month"},
+};
 
 function setRingFileState(message)
 {
   el.ringFileState.textContent = message;
 }
 
-// The 10-digit wall-clock minute key (YYMMDDhhmm, e.g. 2611191642) as the
-// user reads it: 2026-11-19 16:42. Text that is not ten digits is returned
-// unchanged.
-function formatMinuteKey(key)
+// The ring the radio group currently selects; unknown or missing states
+// fall back to the hours default.
+function selectedRing()
 {
-  const digits = String(key).padStart(10, "0");
-  const minute = /^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/.exec(digits);
+  const checked = document.querySelector('input[name="ringFileChoice"]:checked');
 
-  if (minute === null)
+  return (checked && RINGS[checked.value]) ? checked.value : "hours";
+}
+
+// Requests the table of the currently selected ring.
+function sendRingFile()
+{
+  wsSend("cmd=ringfile&ring=" + selectedRing());
+}
+
+// The wall-clock period key as the user reads it: 26111916 becomes
+// "2026-11-19 16" in the hours ring, 261119 becomes "2026-11-19" in the
+// days ring and 2611 becomes "2026-11" in the months ring. Text that is
+// not all digits is returned unchanged.
+function formatRingKey(key, digits)
+{
+  const text = String(key).padStart(digits, "0");
+
+  if (!/^\d+$/.test(text))
   {
-    return digits;
+    return text;
   }
 
-  return "20" + minute[1] + "-" + minute[2] + "-" + minute[3] + " " + minute[4] + ":" + minute[5];
+  const date = "20" + text.slice(0, 2) + "-" + text.slice(2, 4);
+
+  if (digits <= 4)
+  {
+    return date;
+  }
+
+  const full = date + "-" + text.slice(4, 6);
+
+  return (digits <= 6) ? full : (full + " " + text.slice(6, 8));
 }
 
 function renderRingFileList(message)
@@ -1285,25 +1329,29 @@ function renderRingFileList(message)
   const tbody = el.ringFileTable.tBodies[0];
   tbody.textContent = "";
 
+  const ring = RINGS[message.ring] ? message.ring : selectedRing();
+  const info = RINGS[ring];
+  el.ringFileKeyHeader.textContent = info.title;
+
   const records = message.records || [];
 
   if (records.length === 0)
   {
     setRingFileState(message.available
-                     ? "No minute records stored yet: the store writes one every minute."
+                     ? "No " + info.unit + " records stored yet (is the clock synchronised?)."
                      : "The meter store is not running on the device.");
     return;
   }
 
-  setRingFileState(records.length + " minute" + ((records.length === 1) ? "" : "s") +
-                   " shown, newest first" +
+  setRingFileState(records.length + " " + info.unit +
+                   ((records.length === 1) ? " record" : " records") + " shown, newest first" +
                    (message.available ? "" : " (the device walk did not finish)"));
 
   records.forEach((record) =>
   {
     const row = document.createElement("tr");
     const cells = [
-      formatMinuteKey(record.key),
+      formatRingKey(record.key, info.digits),
       (typeof record.edT1 === "number") ? record.edT1.toFixed(3) : "-",
       (typeof record.edT2 === "number") ? record.edT2.toFixed(3) : "-",
       (typeof record.erT1 === "number") ? record.erT1.toFixed(3) : "-",
@@ -1311,6 +1359,7 @@ function renderRingFileList(message)
       (typeof record.gas === "number") ? record.gas.toFixed(3) : "-",
       (typeof record.t1 === "number") ? record.t1.toFixed(2) : "-",
       (typeof record.t2 === "number") ? record.t2.toFixed(2) : "-",
+      (typeof record.tG === "number") ? record.tG.toFixed(2) : "-",
     ];
 
     cells.forEach((text, index) =>
@@ -1319,7 +1368,7 @@ function renderRingFileList(message)
       cell.textContent = text;
 
       // The measured columns align right so the digits of successive
-      // minutes line up; the minute column keeps the default left.
+      // periods line up; the period column keeps the default left.
       if (index > 0)
       {
         cell.className = "valueNumeric";
@@ -1373,7 +1422,7 @@ function showScreen(name)
     tabButtons[entry.id].setAttribute("aria-selected", String(entry.id === view.id));
   });
 
-  wsSend(view.command);
+  wsSend(viewCommand(view));
   reportActiveScreen();
   updatePowerPolling();
 }
@@ -1408,11 +1457,20 @@ function boot()
     fillProfiles(el.selCountry.value, null);
   });
 
-  // The ring file gains one record per minute and the view does not poll:
-  // this button re-requests the newest frame on demand.
+  // The ring records follow the latest telegram and the view does not poll:
+  // this button re-requests the newest frame of the selected ring on demand,
+  // and picking another radio button fetches that ring immediately.
   el.refreshRingFile.addEventListener("click", () =>
   {
-    wsSend("cmd=ringfile");
+    sendRingFile();
+  });
+
+  document.querySelectorAll('input[name="ringFileChoice"]').forEach((radio) =>
+  {
+    radio.addEventListener("change", () =>
+    {
+      sendRingFile();
+    });
   });
 
   // Take over control again after another browser page evicted this page:

@@ -1,6 +1,6 @@
 # lastDSMRlogger
 
-Buildnumber: 22
+Buildnumber: 23
 Last update-date: 2026-11-20
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
@@ -368,7 +368,7 @@ these read-only commands:
 |`telegram <seq>` |decoded fields of one retained telegram                          |
 |`raw <seq>`      |exact accepted bytes of one retained telegram                    |
 |`power`          |the realtime power frame of the newest accepted telegram         |
-|`ringfile`       |the minute records of the meter ring file                        |
+|`showRing <ring>`|stored records of one meter ring: `month`, `days` or `hours`       |
 |`quit`           |close the session                                                |
 
 ### SMB network share
@@ -376,9 +376,10 @@ these read-only commands:
 Once the station has joined and the meter store has mounted the LittleFS
 storage partition, the device also runs an SMB2/SMB3 file server on port 445
 (mrwheel's `smb_server` component). It publishes the storage volume as the
-read-only guest share `DSMRLOGGER`: the ring file `meter.rfs` can be inspected
-or copied from any machine on the local network, while the logger's own
-records stay protected against accidental modification.
+read-only guest share `DSMRLOGGER`: the three ring files `hours.rfs`,
+`days.rfs` and `months.rfs` can be inspected or copied from any machine on
+the local network, while the logger's own records stay protected against
+accidental modification.
 
 - macOS: `smbutil view -G //guest@<device-ip>`, then
   `open smb://guest@<device-ip>/DSMRLOGGER` (or Finder → Connect to Server).

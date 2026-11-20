@@ -15,7 +15,7 @@
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
 extern const char* PROG_VERSION;
-const char* PROG_VERSION = "v0.4.15";
+const char* PROG_VERSION = "v0.4.16";
 
 #include <stdio.h>
 #include <string.h>
@@ -258,8 +258,8 @@ void app_main(void)
   }
 
   //-- The meter store runs on its own task: it mounts the LittleFS storage
-  //-- partition and keeps the last twenty minute records in a ring file,
-  //-- printing the complete list to the console every ten minutes.
+  //-- partition and keeps the last 49 hour, 32 day and 24 month records in
+  //-- three buffered ring files, synchronized together at every hour change.
   esp_err_t storeStarted = loggerStoreInit();
 
   if (storeStarted != ESP_OK)

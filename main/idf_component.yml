@@ -5,7 +5,7 @@
 ## pinned to the verified release. 
 ## The esp32_s3_piggyback board component is vendored under components/ (see README.md for its pinned commit) because it
 ## is not published in the registry. 
-## The ring_file_store component manages the meter store's ring file, keeping the last twenty minutes of records.
+## The ring_file_store component manages the meter store's three buffered ring files (hours, days and months).
 ## The smb_server component publishes the
 ## meter store's LittleFS volume as a read-only guest SMB share.
 ## littlefs component provides the underlying filesystem for the meter store's volume.

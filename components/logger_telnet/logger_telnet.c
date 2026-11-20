@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_telnet.c - telnet console server on port 23
-//-- Date: 2026-11-20 · Build: 5
+//-- Date: 2026-11-20 · Build: 6
 //--
 //-- A plain BSD-socket console task: it listens on port 23, serves exactly
 //-- one session at a time and answers a read-only command set from the
@@ -207,7 +207,8 @@ static void printHelp(int fd)
           "  telegram <seq>     decoded fields of one retained telegram\r\n"
           "  raw <seq>          exact bytes of one retained telegram\r\n"
           "  power              the realtime power frame of the newest telegram\r\n"
-          "  ringfile           the minute records of the meter ring file\r\n"
+          "  showRing {month|days|hours}\r\n"
+          "                     the stored records of one meter ring (default hours)\r\n"
           "  store              LittleFS volume: files with sizes, capacity and free space\r\n"
           "  quit               close this session\r\n");
 }
@@ -458,23 +459,40 @@ static void printPower(int fd)
 }
 
 //-- Visitor of the ring walk: builds the answer in memory instead of writing
-//-- to the socket while the store handle is held by the walk.
-static bool appendRingFileRecord(uint64_t minuteKey, const loggerMeterRecord* record,
-                                 void* userData)
+//-- to the socket while the store handle is held by the walk. The key is
+//-- printed at the width of the walked ring's period key ("YYMMDDhh",
+//-- "YYMMDD" or "YYMM").
+typedef struct
 {
-  TelnetOut* out = (TelnetOut*)userData;
+  TelnetOut* out;
+  int keyWidth;
+} RingPrint;
 
-  outAppendFmt(out,
-               "%" PRIu64 "  edT1 %.3f  edT2 %.3f  erT1 %.3f  erT2 %.3f  gas %.3f  t1 %.2f  t2 %.2f"
-               "\r\n",
-               minuteKey, record->energyDeliveredTariff1Kwh, record->energyDeliveredTariff2Kwh,
-               record->energyReturnedTariff1Kwh, record->energyReturnedTariff2Kwh,
-               record->gasDeliveredM3, record->tariffAmount1Euro, record->tariffAmount2Euro);
-  return !out->overflow;
+static bool appendRingFileRecord(uint64_t key, const loggerMeterRecord* record, void* userData)
+{
+  RingPrint* print = (RingPrint*)userData;
+
+  outAppendFmt(print->out,
+               "%0*" PRIu64 "  edT1 %.3f  edT2 %.3f  erT1 %.3f  erT2 %.3f  gas %.3f"
+               "  t1 %.2f  t2 %.2f  tg %.2f\r\n",
+               print->keyWidth, key, record->energyDeliveredTariff1Kwh,
+               record->energyDeliveredTariff2Kwh, record->energyReturnedTariff1Kwh,
+               record->energyReturnedTariff2Kwh, record->gasDeliveredM3, record->tariffAmount1Euro,
+               record->tariffAmount2Euro, record->tariffAmountGasEuro);
+  return !print->out->overflow;
 }
 
-static void printRingFile(int fd)
+static void printRingFile(int fd, const char* periodText)
 {
+  loggerMeterRing_t ring = LOGGER_RING_HOURS;
+
+  if ((periodText != NULL) && (periodText[0] != '\0') &&
+      !loggerStoreRingFromName(periodText, &ring))
+  {
+    telnetPrintf(fd, "unknown ring '%s' - use month, days or hours\r\n", periodText);
+    return;
+  }
+
   TelnetOut out;
   char* buffer = malloc(TELNET_OUT_BUFFER_BYTES);
 
@@ -489,8 +507,12 @@ static void printRingFile(int fd)
   out.length = 0u;
   out.overflow = false;
 
-  outAppendFmt(&out, "\r\nminute records (newest first):\r\n");
-  esp_err_t walked = loggerStoreListRecords(appendRingFileRecord, &out);
+  RingPrint print;
+  print.out = &out;
+  print.keyWidth = (ring == LOGGER_RING_HOURS) ? 8 : ((ring == LOGGER_RING_DAYS) ? 6 : 4);
+
+  outAppendFmt(&out, "\r\n%s ring records (newest first):\r\n", loggerStoreRingName(ring));
+  esp_err_t walked = loggerStoreListRecords(ring, appendRingFileRecord, &print);
 
   if (walked != ESP_OK)
   {
@@ -503,8 +525,8 @@ static void printRingFile(int fd)
 
 //-- LittleFS volume overview: every file on the mounted storage volume with
 //-- its size, followed by the total capacity and the free space. The walk
-//-- runs on the console task while the store task keeps writing its minute
-//-- records: the LittleFS VFS layer serialises both sides, and the answer is
+//-- runs on the console task while the store task keeps writing its ring
+//-- snapshots: the LittleFS VFS layer serialises both sides, and the answer is
 //-- built in memory (like the ring file walk) so the socket is never written
 //-- to mid-scan.
 static void printStore(int fd)
@@ -667,9 +689,19 @@ static bool handleLine(int fd, char* line)
   {
     printPower(fd);
   }
-  else if (strcasecmp(line, "ringfile") == 0)
+  else if ((strcasecmp(line, "showRing") == 0) || (strcasecmp(line, "ringfile") == 0))
   {
-    printRingFile(fd);
+    //-- The argument picks the ring (month, days or hours, default hours);
+    //-- ringfile stays as the old synonym of showRing hours.
+    if (arguments != NULL)
+    {
+      while (isspace((unsigned char)*arguments))
+      {
+        arguments++;
+      }
+    }
+
+    printRingFile(fd, arguments);
   }
   else if (strcasecmp(line, "store") == 0)
   {
