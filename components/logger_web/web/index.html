@@ -171,14 +171,15 @@
        view (see the fixed .status style in style.css). -->
   <div id="statusStrip" class="status">Connecting to the logger...</div>
 
-  <!-- Control-takeover popup: shown when the telnet console or another
-       browser tab claims the single control token from this page (the
-       "takenover" message in app.js). The button reloads the page, whose
+  <!-- Control-takeover popup: shown when another browser tab claims the
+       web control slot from this page (the telnet console has its own
+       slot and never displaces this page; see the "takenover" message in
+       app.js). The button reloads the page, whose
        first WebSocket frame claims control back for this browser. -->
   <div id="takeoverModal" class="modal" hidden>
     <div class="modalCard">
       <h2>Control taken over</h2>
-      <p id="takeoverMessage">Control of the logger was taken over by another client.</p>
+      <p id="takeoverMessage">Control of the logger was taken over by another browser page.</p>
       <button id="takeoverTakeBack" type="button">Take back control</button>
     </div>
   </div>

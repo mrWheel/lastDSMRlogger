@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-20 · Build: 20
+// Date: 2026-11-20 · Build: 21
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -15,9 +15,10 @@
 // telegram text is never interpreted as HTML. The active screen name is
 // reported to the device so the on-device debug lines show what the browser
 // is displaying. If the link drops, the client reconnects and re-requests
-// what the current view needs. Only one client controls the logger at a
-// time: when the telnet console or another browser claims control, the
-// device sends a "takenover" message and closes this socket; the page then
+// what the current view needs. Only one browser page holds the web control
+// slot at a time (the telnet console has its own slot and never displaces a
+// page): when another browser page claims control, the device sends a
+// "takenover" message and closes this socket; the page then
 // shows its takeover popup (no auto-reconnect, or control would bounce back
 // on its own) and the Take back control button reloads the page so its
 // first frame claims control again.
@@ -36,13 +37,13 @@ const state =
   pendingRawSeq: null,
   ws: null,
   wsReady: false,
-  // True once the device reports that another client took control: the
+  // True once the device reports that another browser page took control: the
   // popup is open and the auto-reconnect loop must stay halted until the
   // user presses Take back control (which reloads the page).
   controlHalted: false,
   // Anti ping-pong guard: a session that is closed again within seconds of
-  // opening (three times in a row) means control keeps moving to a client
-  // that never halts — typically a stale page running an app.js older than
+  // opening (three times in a row) means control keeps moving to a browser
+  // page that never halts — typically a stale page running an app.js older than
   // the takeover popup, which reconnects and re-claims forever. The page
   // then stops retrying and hands the decision to the user through the
   // takeover popup. A moment of real traffic resets the streak.
@@ -161,12 +162,12 @@ function wsConnect()
     // would silently steal control back, so it stays halted.
     if (state.controlHalted)
     {
-      el.statusStrip.textContent = "Control was taken over by another client.";
+      el.statusStrip.textContent = "Control was taken over by another browser page.";
       return;
     }
 
     // Ping-pong guard: closed again seconds after opening means another
-    // client keeps claiming control without ever halting. After three such
+    // browser page keeps claiming control without ever halting. After three such
     // quick cycles the page stops fighting and shows the popup instead of
     // reconnecting forever.
     const livedFor = state.wsOpenedAt ? Date.now() - state.wsOpenedAt : Number.MAX_SAFE_INTEGER;
@@ -182,8 +183,8 @@ function wsConnect()
 
     if (state.rapidCloseStreak >= WS_RAPID_CLOSE_LIMIT)
     {
-      showTakeoverModal("Another client keeps taking control of the logger. Press the button " +
-                        "to reconnect and take control again.");
+      showTakeoverModal("Another browser page keeps taking control of the logger. Press the " +
+                        "button to reconnect and take control again.");
       return;
     }
 
@@ -291,7 +292,7 @@ function handleTextMessage(message)
 
 //-- Control-takeover popup (markup at the end of index.html). The device
 //-- sends this message just before it closes the socket of a page that lost
-//-- the single control token to the telnet console or to another browser.
+//-- the web control slot to another browser page.
 //-- Auto-reconnect stays halted while the popup is open; Take back control
 //-- reloads the page, and the fresh page's first frame claims control back.
 function showTakeoverModal(message)
@@ -304,7 +305,7 @@ function showTakeoverModal(message)
     el.takeoverMessage.textContent = message;
   }
 
-  el.statusStrip.textContent = "Control was taken over by another client.";
+  el.statusStrip.textContent = "Control was taken over by another browser page.";
   el.takeoverModal.hidden = false;
 }
 
@@ -1414,9 +1415,9 @@ function boot()
     wsSend("cmd=ringfile");
   });
 
-  // Take over control again after the telnet console (or another browser)
-  // evicted this page: a reload claims control with the first frame of the
-  // fresh WebSocket session.
+  // Take over control again after another browser page evicted this page:
+  // a reload claims control with the first frame of the fresh WebSocket
+  // session.
   el.takeoverTakeBack.addEventListener("click", () =>
   {
     location.reload();

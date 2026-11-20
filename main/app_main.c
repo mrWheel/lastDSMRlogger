@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: app_main.c - application entry
-//-- Date: 2026-11-20 · Build: 10
+//-- Date: 2026-11-20 · Build: 11
 //--
 //-- Boot order: the board debug lines come up first, then NVS, then the P1
 //-- receiver. Reception starts as soon as a valid configuration is stored and
@@ -15,7 +15,7 @@
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
 extern const char* PROG_VERSION;
-const char* PROG_VERSION = "v0.4.13";
+const char* PROG_VERSION = "v0.4.14";
 
 #include <stdio.h>
 #include <string.h>
@@ -145,8 +145,8 @@ static void onWifiConnected(void)
   ESP_LOGI(tag, "station joined '%s' with IP %s, SPA reachable there", ssid, ip);
 
   //-- The captive portal released port 80 when it stopped: serve the SPA and
-  //-- open the telnet console. Both share one control token: the client that
-  //-- reports itself first is the single operator.
+  //-- open the telnet console. Each channel arbitrates its own clients: one
+  //-- browser page and one telnet session may be active at the same time.
   loggerWebStart();
 
   esp_err_t telnetStarted = loggerTelnetStart();

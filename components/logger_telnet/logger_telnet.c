@@ -1,18 +1,18 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_telnet.c - telnet console server on port 23
-//-- Date: 2026-11-20 · Build: 3
+//-- Date: 2026-11-20 · Build: 4
 //--
 //-- A plain BSD-socket console task: it listens on port 23, serves exactly
 //-- one session at a time and answers a read-only command set from the
-//-- receiver, store and settings APIs. Control of the logger is decided by
-//-- the shared logger_control arbiter: accepting a telnet client claims
-//-- control (the web page then shows its takeover popup) and when the web
-//-- page (or a newer telnet client) claims it back, the evict callback of
-//-- this component prints a clear farewell to the session and shuts its
-//-- socket down, so the task notices and cleans up on its own. Every output
-//-- line is built with snprintf; only the raw telegram dump writes bytes as
-//-- received.
+//-- receiver, store and settings APIs. The console slot is decided by the
+//-- shared logger_control arbiter, which keeps one slot per channel: the
+//-- web page holds its own slot and is never displaced from here. Accepting
+//-- a telnet client claims the console slot, and when a newer telnet client
+//-- claims it back, the evict callback of this component prints a clear
+//-- farewell to the session and shuts its socket down, so the task notices
+//-- and cleans up on its own. Every output line is built with snprintf; only
+//-- the raw telegram dump writes bytes as received.
 //-- ==========================================================================
 
 #include "logger_telnet.h"
@@ -71,16 +71,14 @@ static const char* tag = "loggerTelnet";
 static TaskHandle_t telnetTask;
 static volatile bool taskRunning = false;
 
-//-- True while (TELNET, fd) still holds control: every byte batch is checked
-//-- against the arbiter, so a session that lost control mid-flight never
-//-- answers another command.
+//-- True while fd still holds the telnet console slot: every byte batch is
+//-- checked against the arbiter, so a session that lost the slot to a newer
+//-- telnet client mid-flight never answers another command.
 static bool telnetIsOwner(int fd)
 {
-  loggerControlClient ownerClient = LOGGER_CONTROL_WEB;
   int ownerFd = -1;
 
-  return loggerControlGetOwner(&ownerClient, &ownerFd) && (ownerClient == LOGGER_CONTROL_TELNET) &&
-         (ownerFd == fd);
+  return loggerControlGetOwner(LOGGER_CONTROL_TELNET, &ownerFd) && (ownerFd == fd);
 }
 
 //-- --------------------------------------------------------------------------
@@ -281,18 +279,14 @@ static void printStatus(int fd)
 
   telnetPrintf(fd, "wifi         : '%s' at %s\r\n", ssid, ip);
 
-  loggerControlClient ownerClient = LOGGER_CONTROL_WEB;
-  int ownerFd = -1;
+  //-- One slot per channel: a browser page and this console can each hold
+  //-- their own at the same time, so both are reported.
+  int webOwnerFd = -1;
+  int telnetOwnerFd = -1;
 
-  if (loggerControlGetOwner(&ownerClient, &ownerFd))
-  {
-    telnetPrintf(fd, "control      : %s client\r\n",
-                 (ownerClient == LOGGER_CONTROL_TELNET) ? "telnet" : "web");
-  }
-  else
-  {
-    telnetPrintf(fd, "control      : free\r\n");
-  }
+  telnetPrintf(fd, "control      : web %s, telnet %s\r\n",
+               loggerControlGetOwner(LOGGER_CONTROL_WEB, &webOwnerFd) ? "claimed" : "free",
+               loggerControlGetOwner(LOGGER_CONTROL_TELNET, &telnetOwnerFd) ? "claimed" : "free");
 }
 
 static void printVersion(int fd)
@@ -587,16 +581,18 @@ static bool handleLine(int fd, char* line)
 //-- Eviction of this server's client by the arbiter
 //-- --------------------------------------------------------------------------
 
-//-- Runs when the web page (or a newer telnet client) claims control from
-//-- this session: print the clear farewell and force the socket closed. The
+//-- Runs when a newer telnet client claims the console slot from this
+//-- session (the web page has its own slot and never evicts telnet): print
+//-- the clear farewell and force the socket closed. The
 //-- console task notices the shut-down socket, cleans up its own state and
 //-- releases control (the release is a no-op because the new owner is
 //-- already registered by then).
 static void telnetEvictCallback(loggerControlClient evicted, int evictedFd)
 {
   (void)evicted;
-  telnetSendText(evictedFd, "\r\n*** Control of the logger was taken over by another client.\r\n"
-                            "*** This telnet session is closed. Goodbye.\r\n");
+  telnetSendText(evictedFd,
+                 "\r\n*** The telnet console was taken over by another telnet client.\r\n"
+                 "*** This telnet session is closed. Goodbye.\r\n");
   shutdown(evictedFd, SHUT_RDWR);
 }
 
@@ -733,8 +729,9 @@ static void telnetTaskLoop(void* argument)
       }
       else if (!telnetIsOwner(clientFd))
       {
-        //-- Control moved to the web page while bytes were in flight: the
-        //-- evict callback already said goodbye; finish the session here.
+        //-- The console slot moved to a newer telnet client while bytes
+        //-- were in flight: the evict callback already said goodbye; finish
+        //-- the session here.
         telnetCloseClient(clientFd);
         clientFd = -1;
       }
@@ -815,9 +812,10 @@ static void telnetTaskLoop(void* argument)
         char peerIp[16];
         snprintf(peerIp, sizeof peerIp, "%s", inet_ntoa(peer.sin_addr));
 
-        //-- Claiming control evicts the current owner through its arbiter
-        //-- callback: the web page gets its takeover popup, an older telnet
-        //-- session gets its farewell line and shut-down socket.
+        //-- Claiming the console slot evicts an older telnet session
+        //-- through its arbiter callback (farewell line and shut-down
+        //-- socket); the web page holds its own slot and keeps running
+        //-- untouched.
         loggerControlClaim(LOGGER_CONTROL_TELNET, newFd);
 
         if ((clientFd >= 0) && (clientFd != newFd))
@@ -836,13 +834,12 @@ static void telnetTaskLoop(void* argument)
         greeted = telnetPrintf(clientFd, "\r\nlastDSMRlogger %s - telnet console (%s)\r\n",
                                PROG_VERSION, peerIp) &&
                   greeted;
-        greeted = telnetSendText(clientFd,
-                                 "This session takes control of the logger: an open web page "
-                                 "gives up its\r\n"
-                                 "control with a popup and the previous telnet session, if any, "
-                                 "is closed.\r\n"
-                                 "Type help for the command list.\r\n") &&
-                  greeted;
+        greeted =
+            telnetSendText(clientFd,
+                           "This session takes the telnet console slot: the previous telnet\r\n"
+                           "session, if any, is closed. An open web page keeps its own control.\r\n"
+                           "Type help for the command list.\r\n") &&
+            greeted;
         greeted = telnetSendText(clientFd, TELNET_PROMPT) && greeted;
 
         if (!greeted)

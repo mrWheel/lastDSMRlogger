@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-19 · Build: 18 */
+   Date: 2026-11-20 · Build: 19 */
 
 :root
 {
@@ -937,8 +937,8 @@ footer
 
 /* Control-takeover popup (see #takeoverModal in index.html): dim overlay
    with a centered card in the .card style and the #saveSettings button
-   look, shown when the single control token moves to the telnet console
-   or to another browser. */
+   look, shown when the web control slot moves to another browser page
+   (the telnet console has its own slot). */
 .modal
 {
   position: fixed;

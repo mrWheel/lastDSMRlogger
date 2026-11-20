@@ -1,6 +1,6 @@
 # lastDSMRlogger
 
-Buildnumber: 21
+Buildnumber: 22
 Last update-date: 2026-11-20
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
@@ -336,22 +336,25 @@ a 32-bit variable, so reservations of GPIOs ≥ 32 are never revoked and the
 next install reports them busy. The pin routing itself is applied normally
 and forwarding works; the warning can be ignored.
 
-### Telnet console and the single operator
+### Telnet console and the per-channel control slots
 
 Together with the SPA the device opens a telnet console on port 23
 (`telnet <device-ip> 23` from any machine on the local network). Exactly one
-operator may control the logger at a time: the SPA's WebSocket session or one
-telnet session — whichever client reports itself last holds the control
-token. Ordinary page and API requests are not operators.
+operator per channel may control the logger: the SPA's WebSocket session and
+one telnet session each hold their own control slot, so a browser page and a
+telnet session run side by side. Ordinary page and API requests are not
+operators.
 
-- A telnet client connecting while a browser page is open takes control: the
-  page shows a popup that control was taken over by another client, with a
-  **Take back control** button that reloads the page and claims control back
-  (the evicted telnet session then prints a clear farewell and closes). While
-  the popup is open the page does not auto-reconnect.
-- A second telnet client displaces the first the same way: the first session
-  receives `*** Control of the logger was taken over by another client.` and
-  is closed.
+- A telnet client connecting while a browser page is open never displaces
+  the page: both stay active and the page keeps receiving its pushes.
+- A second telnet client displaces the first: the first session receives
+  `*** The telnet console was taken over by another telnet client.` and is
+  closed. The browser page is not disturbed.
+- A second browser page displaces the first: the evicted page shows a popup
+  that control was taken over by another browser page, with a **Take back
+  control** button that reloads the page and claims the web slot back.
+  While the popup is open the page does not auto-reconnect. The telnet
+  session is not disturbed.
 
 The console greets with the firmware version and the peer address and answers
 these read-only commands:

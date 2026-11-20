@@ -9,9 +9,11 @@
 ## The smb_server component publishes the
 ## meter store's LittleFS volume as a read-only guest SMB share.
 ## littlefs component provides the underlying filesystem for the meter store's volume.
+## The espressif/mqtt component handles MQTT communication for the logger.
 
 dependencies:
   michmich/esp-idf-wifi-provisioner: ^0.4.0
   mrwheel/ring_file_store: ^0.1.2
   joltwallet/littlefs: ^1.23.1
   mrwheel/smb_server: ^0.3.0
+  espressif/mqtt: ^1.1.0

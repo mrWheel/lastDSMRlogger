@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-20 · Build: 13
+//-- Date: 2026-11-20 · Build: 14
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -70,11 +70,11 @@ extern const char styleCssEnd[] asm("_binary_style_css_end");
 //-- WebSocket transport
 //-- --------------------------------------------------------------------------
 
-//-- Browser clients with an open /ws session. Exactly one client — web or
-//-- telnet — may hold control at a time via the logger_control arbiter, so
-//-- in practice this table only ever carries the owning fd. Pushes run from
-//-- a dedicated task so a stalled client cannot block the receive task or
-//-- the parser.
+//-- Browser clients with an open /ws session. Exactly one browser client
+//-- holds the web control slot via the logger_control arbiter (the telnet
+//-- console has its own slot and never displaces a page), so in practice
+//-- this table only ever carries the owning fd. Pushes run from a dedicated
+//-- task so a stalled client cannot block the receive task or the parser.
 #define WS_MAX_CLIENTS 4
 #define WS_PUSH_INTERVAL_MS 1000u
 #define WS_PUSH_TASK_STACK_BYTES 4096
@@ -224,28 +224,27 @@ static void wsSendToClient(int fd, const char* text)
   }
 }
 
-//-- Copies the fd of the /ws client that currently holds the single control
-//-- token. False when control is with the telnet console or free: then no
-//-- browser may receive pushes at all.
+//-- Copies the fd of the /ws client that currently holds the web control
+//-- slot. False when no browser holds it (no page has reported itself yet
+//-- or every page closed): then no browser may receive pushes at all. The
+//-- telnet console has its own slot and never blocks web pushes.
 static bool webControlOwnerFd(int* ownerFd)
 {
-  loggerControlClient ownerClient = LOGGER_CONTROL_WEB;
-  int fd = -1;
-
-  if (!loggerControlGetOwner(&ownerClient, &fd))
+  if (!loggerControlGetOwner(LOGGER_CONTROL_WEB, ownerFd))
   {
+    *ownerFd = -1;
     return false;
   }
 
-  *ownerFd = (ownerClient == LOGGER_CONTROL_WEB) ? fd : -1;
   return *ownerFd >= 0;
 }
 
 static void wsSendToAll(const char* text)
 {
-  //-- Single-operator rule: only the client holding control is pushed to;
-  //-- every other session was evicted by the arbiter when this one claimed
-  //-- control, so the client table already only ever carries that one fd.
+  //-- Single-browser rule: only the client holding the web control slot is
+  //-- pushed to; every other tab was evicted by the arbiter when this one
+  //-- claimed the slot, so the client table already only ever carries that
+  //-- one fd.
   int ownerFd = -1;
 
   if (!webControlOwnerFd(&ownerFd))
@@ -256,8 +255,9 @@ static void wsSendToAll(const char* text)
   wsSendToClient(ownerFd, text);
 }
 
-//-- The arbiter calls this when a telnet session (or a newer browser tab)
-//-- claims control from the current web client. The evicted page first gets
+//-- The arbiter calls this when a newer browser tab claims the web control
+//-- slot from the current web client (the telnet console owns its own slot
+//-- and never evicts a page). The evicted page first gets
 //-- the takeover text frame, then its socket is force-closed — the async
 //-- send is queued before the close, so the browser still shows its popup
 //-- with the take-control-back button. Modelled on the single-/ws-client
@@ -266,7 +266,7 @@ static void webEvictCallback(loggerControlClient evicted, int evictedFd)
 {
   (void)evicted;
   wsSendToClient(evictedFd, "{\"type\":\"takenover\",\"message\":\"Control of the logger was "
-                            "taken over by another client.\"}");
+                            "taken over by another browser page.\"}");
 
   //-- Give the TCP stack a moment to push the popup frame into the wire
   //-- before the close queues its FIN. A page that loses the socket without
@@ -1666,9 +1666,10 @@ static esp_err_t handleWebSocket(httpd_req_t* req)
   int clientFd = httpd_req_to_sockfd(req);
   wsClientAdd(clientFd);
 
-  //-- Single-operator rule: the reporting of a session claims control. The
-  //-- arbiter evicts the previous owner (web page popup or telnet farewell)
-  //-- through its registered callback; for the current owner this is a
+  //-- Single-browser rule: the reporting of a session claims the web
+  //-- control slot. The arbiter evicts the previous web client (popup)
+  //-- through its registered callback; the telnet console owns a separate
+  //-- slot and is never touched from here. For the current owner this is a
   //-- cheap no-op, same per-frame check as the reference project uses.
   loggerControlClaim(LOGGER_CONTROL_WEB, clientFd);
 
@@ -1851,7 +1852,7 @@ static void wsPushTaskLoop(void* argument)
   }
 }
 
-//-- Clears the /ws registration and the control token when a socket really
+//-- Clears the /ws registration and the web control slot when a socket really
 //-- closes, so a reconnect after an ordinary disconnect is never locked out
 //-- by a stale owner entry (only an actual close clears it — the reference
 //-- project's pitfall: a reconnect must not look like a takeover). The
@@ -1916,7 +1917,7 @@ esp_err_t loggerWebStart(void)
   //-- could evict them to make room for ordinary requests.
   config.lru_purge_enable = false;
 
-  //-- Clears the control token and the /ws table when a socket closes.
+  //-- Clears the web control slot and the /ws table when a socket closes.
   config.close_fn = webCloseFn;
 
   esp_err_t result = httpd_start(&server, &config);
