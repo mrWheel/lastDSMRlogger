@@ -1509,16 +1509,20 @@ function renderRingFileList(message)
 // per period on a zero line: the used kWh (red) grow upwards and the
 // returned kWh (green) hang below the zero line, with a centred legend; the
 // lower panel carries a blue line of the gas m³ per period with its own
-// legend. The months view pairs every period with its retained predecessor:
-// the used pair (red this period, orange previous) stands side by side
-// above the zero line, the returned pair (dark green this period, light
-// green previous) below it, and the gas panel draws both lines (blue this
-// period, light blue previous). Each panel has grid lines, y labels and
-// rotated period labels; the label band reserves exactly the room the
-// slanted text needs, so nothing is cut off and no dead space is left
-// between the panels. Hovering a slot pops up a separate chip per series:
-// the used kWh and the returned kWh each get their own chip riding along
-// their bar on the energy panel, the gas m³ gets one over the gas panel.
+// legend. The months view pairs every period with the same month of the
+// year before (YY-MM against (YY-1)-MM): the used pair (red this period,
+// orange previous) stands side by side above the zero line, the returned
+// pair (dark green this period, light green previous) below it, and the
+// gas panel draws both lines (blue this period, light blue previous). A
+// month whose year-ago counterpart the ring no longer retains draws its
+// pair alone. Each panel has grid lines, y labels and rotated period
+// labels; the label band reserves exactly the room the slanted text
+// needs, so nothing is cut off and no dead space is left between the
+// panels. Hovering pops up a separate chip per series: on the hours and
+// days views the used kWh and the returned kWh each get their own chip
+// riding along their bar on the energy panel; on the months view the
+// energy panel shows exactly one chip, named for and riding along the bar
+// the cursor sits on. The gas m³ gets one chip over the gas panel.
 // The state line names the on-device API that serves the underlying ring
 // records. Everything is drawn straight from the frame's numbers, nothing
 // is interpreted.
@@ -1671,91 +1675,6 @@ function dayNameOf2000(year2, month, day)
                   Math.floor(yearOfCentury / 4) + Math.floor(century / 4) + (5 * century)) % 7;
 
   return DAY_NAMES[(zeller + 6) % 7];
-}
-
-// The key of the period that follows a period key, calendar carry over in
-// the ring's own key shape (YYMMDDhh, YYMMDD or YYMM): the same adjacency
-// check the device applied when it built the series, so the months view can
-// recognise a true predecessor across a hole in the ring.
-function nextPeriodKey(ring, key)
-{
-  const value = Number(key);
-
-  if (!Number.isFinite(value) || value < 0)
-  {
-    return -1;
-  }
-
-  let rest = Math.floor(value);
-  let hour = 0;
-  let day = 1;
-  let month = 1;
-
-  if (ring === "hours")
-  {
-    hour = rest % 100;
-    rest = Math.floor(rest / 100);
-  }
-
-  if (ring !== "months")
-  {
-    day = rest % 100;
-    rest = Math.floor(rest / 100);
-  }
-
-  month = rest % 100;
-  let year2 = Math.floor(rest / 100);
-
-  if (ring === "hours")
-  {
-    hour += 1;
-
-    if (hour > 23)
-    {
-      hour = 0;
-      day += 1;
-    }
-
-    if (day > daysInMonth2000(year2, month))
-    {
-      day = 1;
-      month += 1;
-    }
-  }
-  else if (ring === "days")
-  {
-    day += 1;
-
-    if (day > daysInMonth2000(year2, month))
-    {
-      day = 1;
-      month += 1;
-    }
-  }
-  else
-  {
-    month += 1;
-  }
-
-  if (month > 12)
-  {
-    month = 1;
-    year2 = (year2 + 1) % 100;
-  }
-
-  let result = year2 * 100 + month;
-
-  if (ring !== "months")
-  {
-    result = result * 100 + day;
-  }
-
-  if (ring === "hours")
-  {
-    result = result * 100 + hour;
-  }
-
-  return result;
 }
 
 // The period key as the axis reads it: 26111916 becomes "19-11 16:00" on
@@ -1987,19 +1906,20 @@ function drawGraphLine(ctx, values, firstSlot, slot, plotLeft, yOf, color)
   });
 }
 
-// The record that pairs with the one at index as its direct predecessor:
-// only the array entry just before it, and only when the two keys name
-// directly consecutive periods (the series can hold a hole).
-function periodPreviousRecord(records, index, ring)
+// The record that pairs with the one at index on the months view: the ring
+// entry of the same month one year back (the YYMM key minus a hundred, so
+// 2611 pairs with 2511), or null when the ring no longer retains that
+// month.
+function periodYearAgoRecord(records, index)
 {
-  if (index === 0)
+  const yearAgoKey = Number(records[index].key) - 100;
+
+  if (yearAgoKey < 0)
   {
     return null;
   }
 
-  const previous = records[index - 1];
-
-  return (nextPeriodKey(ring, previous.key) === Number(records[index].key)) ? previous : null;
+  return records.find((candidate) => Number(candidate.key) === yearAgoKey) || null;
 }
 
 // Used/returned bars on the energy panel: one bar pair per record (red
@@ -2037,12 +1957,12 @@ function drawPeriodBars(ctx, records, slot, plotLeft, yOfEnergy)
   });
 }
 
-// Months view: every period stands next to its retained predecessor, used
-// pair above the zero line (red this period, orange previous), returned
-// pair below it (dark green this period, light green previous). A period
-// without a retained predecessor draws its pair alone, like the mockup's
-// first months.
-function drawPeriodBarsPaired(ctx, records, slot, plotLeft, yOfEnergy, ring)
+// Months view: every period stands next to the same month of the year
+// before, used pair above the zero line (red this period, orange
+// previous), returned pair below it (dark green this period, light green
+// previous). A period whose year-ago month the ring no longer retains
+// draws its pair alone, like the mockup's first months.
+function drawPeriodBarsPaired(ctx, records, slot, plotLeft, yOfEnergy)
 {
   const pairWidth = Math.max(4, slot * 0.7);
   const barWidth = Math.max(1, (pairWidth - 1) / 2);
@@ -2053,7 +1973,7 @@ function drawPeriodBarsPaired(ctx, records, slot, plotLeft, yOfEnergy, ring)
     const centre = plotLeft + (index + 0.5) * slot;
     const leftX = centre - pairWidth / 2;
     const rightX = leftX + barWidth + 1;
-    const previous = periodPreviousRecord(records, index, ring);
+    const previous = periodYearAgoRecord(records, index);
 
     const bars =
     [
@@ -2171,7 +2091,7 @@ function drawPeriodGraph(viewId)
 
   if (paired)
   {
-    drawPeriodBarsPaired(ctx, records, slot, plotLeft, yOfEnergy, config.ring);
+    drawPeriodBarsPaired(ctx, records, slot, plotLeft, yOfEnergy);
   }
   else
   {
@@ -2182,7 +2102,7 @@ function drawPeriodGraph(viewId)
                       (record) => periodGraphLabel(config.ring, record.key));
 
   //-- Lower panel: the gas m³ per period as a blue line (the months view
-  // adds the light blue line of the previous periods).
+  // adds the light blue line of the same months one year back).
   const yOfGas = drawGraphPanelFrame(ctx, panel2, gasStep, gasMax, 0, "m³",
                                      paired
                                      ? [{color: GRAPH_COLORS.gas, label: "Gas (this period)"},
@@ -2199,7 +2119,7 @@ function drawPeriodGraph(viewId)
     {
       drawGraphLine(ctx, records.map((record, index) =>
       {
-        const previous = periodPreviousRecord(records, index, config.ring);
+        const previous = periodYearAgoRecord(records, index);
 
         return previous ? (previous.gas || 0) : null;
       }), 0, slot, plotLeft, yOfGas, GRAPH_COLORS.gasPrevious);
@@ -2227,12 +2147,16 @@ function drawPeriodGraph(viewId)
 }
 
 // Hover popups: separate chips per series (same chip style as the power
-// history popup). While the cursor is over the energy panel the used kWh
-// and the returned kWh each get their own chip, one riding above the top
-// of the red bar and one just under the tip of the green bar, so the two
-// amounts are read apart instead of merged into a net figure; over the gas
-// panel a single chip shows the gas m³. All chips centre on the hovered
-// slot and stay inside the plot.
+// history popup). While the cursor is over the energy panel of the hours
+// and days views the used kWh and the returned kWh each get their own
+// chip, one riding above the top of the red bar and one just under the
+// tip of the green bar, so the two amounts are read apart instead of
+// merged into a net figure. The months view reads one bar at a time: the
+// cursor gets exactly one chip, for the bar it sits on (left column this
+// period, right column the same month one year back; above the zero line
+// that bar is a used bar, below it a returned one), riding along that
+// bar. Over the gas panel a single chip shows the gas m³. The chips
+// centre on their own bar and stay inside the plot.
 function updatePeriodGraphTooltip(viewId)
 {
   const graph = periodGraphs[viewId];
@@ -2243,17 +2167,30 @@ function updatePeriodGraphTooltip(viewId)
     return;
   }
 
+  const paired = (viewId === "monthsGraph");
+
   if (graph.tips === null)
   {
     graph.tips = {};
 
-    [["used", "tipUsed"], ["returned", "tipReturned"], ["gas", "tipGas"]].forEach((pair) =>
+    // The months view rides four energy bars (this period and the same
+    // month of last year, used and returned), the other views two.
+    const series = [["used", "tipUsed"], ["returned", "tipReturned"]];
+
+    if (paired)
+    {
+      series.push(["usedPrevious", "tipUsedPrevious"], ["returnedPrevious", "tipReturnedPrevious"]);
+    }
+
+    series.push(["gas", "tipGas"]);
+
+    series.forEach((entry) =>
     {
       const tip = document.createElement("div");
-      tip.className = "hoursGraphTooltip " + pair[1];
+      tip.className = "hoursGraphTooltip " + entry[1];
       tip.hidden = true;
       canvas.parentElement.appendChild(tip);
-      graph.tips[pair[0]] = tip;
+      graph.tips[entry[0]] = tip;
     });
   }
 
@@ -2277,12 +2214,12 @@ function updatePeriodGraphTooltip(viewId)
   const record = layout.records[index];
   const centre = layout.plotLeft + (index + 0.5) * layout.slot;
 
-  function place(tip, top)
+  function place(tip, top, x)
   {
     tip.hidden = false;
 
     const half = tip.offsetWidth / 2;
-    const left = Math.min(layout.cssWidth - half, Math.max(half, centre));
+    const left = Math.min(layout.cssWidth - half, Math.max(half, x));
     tip.style.left = (canvas.offsetLeft + left) + "px";
     tip.style.top = (canvas.offsetTop + top) + "px";
   }
@@ -2290,28 +2227,71 @@ function updatePeriodGraphTooltip(viewId)
   if (graph.hoverY >= layout.panelSplitY)
   {
     tips.gas.textContent = (record.gas || 0).toFixed(3) + " m³";
-    place(tips.gas, layout.panelGas.y + 2);
+    place(tips.gas, layout.panelGas.y + 2, centre);
     return;
   }
 
   const energy = layout.panelEnergy;
-  const usedValue = record.used || 0;
-  const returnedValue = record.returned || 0;
 
-  tips.used.textContent = "Used " + usedValue.toFixed(3) + " kWh";
-  tips.returned.textContent = "Returned " + returnedValue.toFixed(3) + " kWh";
+  if (!paired)
+  {
+    const usedValue = record.used || 0;
+    const returnedValue = record.returned || 0;
 
-  // Each chip rides along its own bar (clamped inside the panel), so the
-  // used chip reads with the red series and the returned chip with the
-  // green one.
-  const usedTop = Math.max(energy.y + 2,
-                           Math.min(layout.yOfEnergy(usedValue) - 22, energy.y + energy.height - 22));
-  const returnedTop = Math.max(energy.y + 2,
-                               Math.min(layout.yOfEnergy(-returnedValue) + 3,
-                                        energy.y + energy.height - 22));
+    tips.used.textContent = "Used " + usedValue.toFixed(3) + " kWh";
+    tips.returned.textContent = "Returned " + returnedValue.toFixed(3) + " kWh";
 
-  place(tips.used, usedTop);
-  place(tips.returned, returnedTop);
+    // Each chip rides along its own bar (clamped inside the panel), so the
+    // used chip reads with the red series and the returned chip with the
+    // green one.
+    const usedTop = Math.max(energy.y + 2,
+                             Math.min(layout.yOfEnergy(usedValue) - 22, energy.y + energy.height - 22));
+    const returnedTop = Math.max(energy.y + 2,
+                                 Math.min(layout.yOfEnergy(-returnedValue) + 3,
+                                          energy.y + energy.height - 22));
+
+    place(tips.used, usedTop, centre);
+    place(tips.returned, returnedTop, centre);
+
+    return;
+  }
+
+  // Months view: one chip for the hovered bar only. The slot geometry
+  // mirrors drawPeriodBarsPaired (left column this period, right column
+  // the same month of last year); above the zero line the cursor reads a
+  // used bar, below it a returned one.
+  const pairWidth = Math.max(4, layout.slot * 0.7);
+  const barWidth = Math.max(1, (pairWidth - 1) / 2);
+  const leftX = centre - pairWidth / 2;
+  const rightX = leftX + barWidth + 1;
+
+  const fromPrevious = (graph.hoverX >= centre);
+  const previous = periodYearAgoRecord(layout.records, index);
+
+  // The right column only holds bars when the ring retains the month of
+  // last year; hovering that empty column shows nothing.
+  if (fromPrevious && (previous === null))
+  {
+    return;
+  }
+
+  const source = fromPrevious ? previous : record;
+  const isUsed = (graph.hoverY < layout.yOfEnergy(0));
+  const value = (isUsed ? source.used : source.returned) || 0;
+  const tipName = isUsed ? (fromPrevious ? "usedPrevious" : "used")
+                         : (fromPrevious ? "returnedPrevious" : "returned");
+  const label = (isUsed ? "Used" : "Returned") +
+                (fromPrevious ? " (previous)" : " (this period)");
+
+  tips[tipName].textContent = label + " " + value.toFixed(3) + " kWh";
+
+  const chipTop = isUsed
+                ? Math.max(energy.y + 2,
+                           Math.min(layout.yOfEnergy(value) - 22, energy.y + energy.height - 22))
+                : Math.max(energy.y + 2,
+                           Math.min(layout.yOfEnergy(-value) + 3, energy.y + energy.height - 22));
+
+  place(tips[tipName], chipTop, (fromPrevious ? rightX : leftX) + barWidth / 2);
 }
 
 //-- --------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # lastDSMRlogger
 
-Buildnumber: 36
+Buildnumber: 37
 Last update-date: 2026-11-21
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
@@ -223,17 +223,22 @@ the device.
   upper panel carries bars for the used (red) and returned (green) kWh on a
   zero line with a centred legend; the lower panel a blue line of the gas
   m³ per period with its own legend. On the months view every period is
-  paired with its retained predecessor (like the monthsGraph mockup): the
-  used pair — red this period, orange previous — stands side by side above
-  the zero line, the returned pair — dark green this period, light green
-  previous — below it, and the gas panel draws both lines (blue this
-  period, light blue previous). Each panel has grid lines with y labels, a
-  unit label and rotated period labels (hours `19-11 16:00`, days
-  `Thursday 22-10`, months `November`, January carrying the year); the
-  label band is sized to the slanted text, so nothing is cut off and no
-  dead space survives between the panels. Hovering a slot pops up separate
-  chips: one for the used kWh and one for the returned kWh riding along
-  their bar on the energy panel, one for the gas m³ over the gas panel; the
+  paired with the same month of the year before — YY-MM against
+  (YY-1)-MM, so each pair compares the month against last year (like the
+  monthsGraph mockup): the used pair — red this period, orange previous —
+  stands side by side above the zero line, the returned pair — dark green
+  this period, light green previous — below it, and the gas panel draws
+  both lines (blue this period, light blue previous); a month whose
+  year-ago counterpart the ring no longer retains draws its pair alone.
+  Each panel has grid lines with y labels, a unit label and rotated period
+  labels (hours `19-11 16:00`, days `Thursday 22-10`, months `November`,
+  January carrying the year); the label band is sized to the slanted text,
+  so nothing is cut off and no dead space survives between the panels.
+  Hovering pops up separate chips: one for the used kWh and one for the
+  returned kWh riding along their bar on the energy panel, one for the gas
+  m³ over the gas panel — except on the months view, where the energy
+  panel shows exactly one chip: the one for the bar the cursor sits on
+  (this period or previous year, used or returned); the
   state line names the API the records come from
   (`/api/ringfile?ring=hours|days|months`). The device turns the retained
   cumulative counters into per-period differences

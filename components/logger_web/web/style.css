@@ -882,7 +882,8 @@ footer
 }
 
 /* The period graphs show a chip per series: the coloured left border ties
-   each chip to its series (red used, green returned, blue gas). */
+   each chip to its series (red used, green returned, blue gas; the months
+   view adds the orange and light green of the year-ago pair). */
 .hoursGraphTooltip.tipUsed
 {
   border-left: 3px solid #ff3b30;
@@ -891,6 +892,16 @@ footer
 .hoursGraphTooltip.tipReturned
 {
   border-left: 3px solid #34c759;
+}
+
+.hoursGraphTooltip.tipUsedPrevious
+{
+  border-left: 3px solid #ff9500;
+}
+
+.hoursGraphTooltip.tipReturnedPrevious
+{
+  border-left: 3px solid #8ce99a;
 }
 
 .hoursGraphTooltip.tipGas
