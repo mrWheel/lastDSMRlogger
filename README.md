@@ -1,6 +1,6 @@
 # lastDSMRlogger
 
-Buildnumber: 28
+Buildnumber: 34
 Last update-date: 2026-11-21
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
@@ -169,9 +169,13 @@ the device.
   profile (human-readable label, stable ID persisted, kept separate from the
   version reported by the meter), and M-Bus channels 1–4 with Auto, Disabled
   or an explicit device type. All dropdowns are filled from the valid
-  choices the device reports. Save validates and applies the complete
-  configuration as one operation and stores it in NVS; on any failure the
-  active configuration is preserved and the reason is shown.
+  choices the device reports. An **MQTT** group enters the broker IP/URL,
+  broker port, user, password, top topic and broadcast interval
+  (0 = no broadcast); a **Network** group enters the hostname and the fixed
+  IP (only the last part — empty or 0 means plain DHCP). Save validates and
+  applies the complete configuration as one operation and stores it in NVS;
+  on any failure the active configuration is preserved and the reason is
+  shown.
 - **Telegrams**: a read-only **scrolling log window** over the retained
   records, newest on top. Rows are plain lines and carry no click selection.
   Each row shows the sequence number and the **meter time of OBIS
@@ -272,6 +276,17 @@ example a repeating `M-Bus device type mismatch @ 0-1:24.1.0`) reaches the
 console at most once per reception session — it shows again after a boot or
 a settings change, which resets the deduplication. The reception counters
 and the web status strip stay complete regardless.
+
+Only a telegram that was read in and found faulty raises the rejected
+count: a crc mismatch, a syntax error, an oversized frame. Nothing else
+does: telegrams skipped because they arrive inside the read interval stay
+out of every counter, and an abandoned partial frame (the parser's
+inter-byte or frame timeout, the meter pausing between bursts) is not an
+error — the logger simply awaits the next complete telegram. Data loss has
+its own counter and an M-Bus type mismatch annotates an accepted telegram,
+so neither adds to the rejected total. Because older firmware counted every
+diagnostic, the persisted rejected total is rebased to zero once after this
+firmware boots.
 
 ### API
 
@@ -385,7 +400,7 @@ the LittleFS volume):
 |Command          |Shows                                                            |
 |-----------------|-----------------------------------------------------------------|
 |`help`           |the command list                                                 |
-|`status`         |reception state, counters, clock, Wi-Fi and the control owner    |
+|`status`         |reception state, counters, clock, Wi-Fi, control owner **and** the device state block (copyright, hostname, versions, memory, chip, flash) |
 |`version`        |firmware and parserDSMR versions                                 |
 |`telegrams`      |the telegrams retained in RAM                                    |
 |`telegram <seq>` |decoded fields of one retained telegram                          |
@@ -426,6 +441,53 @@ share stays off and the console logs the reason.
 The share stays read-only by design, so import files (next subsection) land
 on the volume through the storage partition image, not through the share.
 
+### MQTT publication
+
+The **MQTT** group in the Settings view publishes the meter data to a broker
+on the local network (the broker may be any IP, host name or full
+`mqtt://`/`mqtts://` URI; an empty broker keeps publication off):
+
+|Setting                |Effect                                                                                     |
+|-----------------------|-------------------------------------------------------------------------------------------|
+|Broker IP or URL       |the broker to connect to; empty disables MQTT                                              |
+|Broker port            |used when the broker text carries no port (default 1883)                                   |
+|User / Password        |broker credentials; both empty for an anonymous broker                                     |
+|Top topic              |every broadcast goes to `<top topic>/telegram` (empty selects `lastdsmrlogger`)            |
+|Broadcast interval (s) |how often the latest telegram is published; **0 = no broadcast**                           |
+
+When publication is on, the device publishes the **most recently accepted
+telegram** as one JSON document every interval seconds — and once right
+after every broker connect, so a fresh subscriber sees the latest frame
+without waiting. The document is `{"actual":{…}}` with one entry per
+decoded field. The entry name is the field's display label when it has one
+— an adjusted label wins over the built-in name of the active profile's
+field table — and the **OBIS code** when the field carries no label. The
+entry value is the parsed value as a JSON **number** when its text spells
+a decimal number (so graphs, calculations and automations can consume it
+directly) and as a JSON **string** in every other case (timestamps, device
+ids, status words). Two fields sharing a label publish the second one
+under its OBIS code so the object never holds a duplicate key:
+
+```json
+{"actual":{"1-0:1.8.1":1260.013,"electricity_imported_total":1260.013,
+ "tarif_indicator":"1","0-0:1.0.0":"2026-11-21T17:37:38+0100"}}
+```
+
+Publication runs only while the station has joined: the client comes up at
+every Wi-Fi connect (a broker lookup before LWIP is up would crash the
+device, so it never starts on a disconnected station), goes down when the
+link drops, retries on its own when the broker disappears, and reconfigures
+live when the settings are saved.
+
+The hostname and fixed IP in the **Network** group take effect at the same
+save: the hostname is stored right away and announced to DHCP and mDNS, and
+the fixed IP pins the last octet of the granted address (the network part
+comes from the router's lease; empty or 0 returns to plain DHCP). Work that
+touches the lease itself — re-requesting it for a new name, pinning or
+withdrawing a fixed address — is performed by the Wi-Fi task within seconds
+after the save replies, because it briefly leaves the station interface and
+would otherwise abort the very browser request that saved it.
+
 ### Importing historical periods (`populate`)
 
 The console command `populate {hours|days|months}` imports historical
@@ -435,23 +497,27 @@ relative to the volume root (typically `RINGmonths.csv`); an empty
 line cancels.
 
 The file starts with a header line. Its first column names the period key
-(`YYMMDDHH`, `YYMMDD` or `YYMM`); the value columns are OBIS codes, with or
-without the `*255` method suffix:
+(`YYMMDDHH`, `YYMMDD` or `YYMM`); the value columns are named by OBIS code
+(with or without the `*255` method suffix) or, for the three tariff amounts
+that have no code of their own, by the rubrics of the ring print (`t1`, `t2`
+and `tg`):
 
-|OBIS code                          |Ring field                |Unit|
+|Column                             |Ring field                |Unit|
 |-----------------------------------|--------------------------|----|
 |`1-0:1.8.1`                        |energy delivered tariff 1 |kWh |
 |`1-0:1.8.2`                        |energy delivered tariff 2 |kWh |
 |`1-0:2.8.1`                        |energy returned tariff 1  |kWh |
 |`1-0:2.8.2`                        |energy returned tariff 2  |kWh |
 |`0-1:24.1.0` (or `0-1:24.2.1`/`.3`)|gas delivered             |m³  |
+|`t1`                               |tariff 1 amount           |€   |
+|`t2`                               |tariff 2 amount           |€   |
+|`tg`                               |gas amount                |€   |
 
-Unknown columns — including the `#` and the empty trailing columns that
-exported files carry — are skipped. Every data line starts with the period
-key (8, 6 or 4 digits) and carries its values in header order; **a blank or
-missing value becomes 0**, and the tariff amount fields never appear in a
-file, so they stay 0 too. Several lines of one period update the same
-record: the last line wins.
+Unknown columns — including the `#` and the empty trailing columns
+handwritten files may carry — are skipped. Every data line starts with the
+period key (8, 6 or 4 digits) and carries its values in header order; **a
+blank or missing value becomes 0**. Several lines of one period update the
+same record: the last line wins.
 
 The optional mode argument picks what happens to the records the ring
 already holds:
@@ -479,11 +545,12 @@ logger> showring hours
 The console command `ring2csv {hours|days|months}` writes one meter ring
 back to the LittleFS volume as a semicolon separated csv file named
 `RING<ring>.csv` at the volume root: the header
-`YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255`
+`YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255;t1;t2;tg`
 followed by one line per retained record, oldest period first, the key as
-eight `YYMMDDHH` digits and the five counters at three decimals. The file is
-re-importable through `populate` unchanged, and the read-only `DSMRLOGGER`
-SMB share exposes it for inspection or editing on any machine.
+eight `YYMMDDHH` digits, the five counters at three decimals and the three
+tariff amounts at two. Every field the ring file holds is exported, so the
+file is re-importable through `populate` unchanged, and the read-only
+`DSMRLOGGER` SMB share exposes it for inspection or editing on any machine.
 
 ```
 logger> ring2csv hours
@@ -499,7 +566,10 @@ Input files land on the device through the storage partition image: drop
 them into `storageImage/` — the folder the image is built from, and the
 import csv files land at the volume root (the sample `RINGhours.csv`,
 `RINGdays.csv` and `RINGmonths.csv` ship there) —
-rebuild and write `build/storage.bin` to the device:
+rebuild and write `build/storage.bin` to the device. macOS Finder leaves
+`.DS_Store` files in every folder it browses; the image is built from a
+staged copy of the folder that filters `.DS_Store` (and AppleDouble `._`
+companions) out, so Finder junk never reaches the LittleFS volume.
 
 ```
 python $IDF_PATH/components/partition_table/parttool.py \

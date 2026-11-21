@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-21 · Build: 16
+//-- Date: 2026-11-21 · Build: 17
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -40,6 +40,11 @@
 #include "logger_store.h"
 
 static const char* tag = "loggerWeb";
+
+//-- The application's notification for a saved configuration (network
+//-- identity and MQTT live in the application, not in this component);
+//-- installed through loggerWebSetSettingsSavedCallback.
+static loggerWebSettingsSavedCb settingsSavedCallback = NULL;
 
 //-- The program version string is defined by the application entry
 //-- (main/app_main.c) and shown in the SPA header through the status JSON.
@@ -611,6 +616,22 @@ static void appendSettingsJson(stringBuilder* sb, const loggerSettingsConfig* co
   sbAppend(sb, ",\"displayFlipped\":");
   sbAppend(sb, config->displayFlipped ? "true" : "false");
 
+  //-- MQTT publication and network identity, prefilled into the settings
+  //-- view. The password rides along so the field can show what is stored.
+  sbAppend(sb, ",\"mqttBroker\":");
+  sbAppendJsonString(sb, config->mqttBroker);
+  sbAppendFmt(sb, ",\"mqttPort\":%u", (unsigned)config->mqttPort);
+  sbAppend(sb, ",\"mqttUser\":");
+  sbAppendJsonString(sb, config->mqttUser);
+  sbAppend(sb, ",\"mqttPassword\":");
+  sbAppendJsonString(sb, config->mqttPassword);
+  sbAppend(sb, ",\"mqttTopTopic\":");
+  sbAppendJsonString(sb, config->mqttTopTopic);
+  sbAppendFmt(sb, ",\"mqttIntervalSeconds\":%" PRIu32, config->mqttIntervalSeconds);
+  sbAppend(sb, ",\"hostname\":");
+  sbAppendJsonString(sb, config->hostname);
+  sbAppendFmt(sb, ",\"fixedIpLastOctet\":%u", (unsigned)config->fixedIpLastOctet);
+
   sbAppend(sb, ",\"mbus\":[");
 
   for (uint8_t channel = DSMR_MBUS_CHANNEL_MIN; channel <= DSMR_MBUS_CHANNEL_MAX; channel++)
@@ -774,9 +795,48 @@ static void appendConfigJson(stringBuilder* sb)
 //-- body. Used by the HTTP POST and by cmd=save on the WebSocket so both
 //-- paths validate and roll back identically. NULL on success, otherwise the
 //-- failure reason for the SPA.
+//-- Copies src into dst with leading and trailing blanks removed,
+//-- truncating instead of overflowing.
+static void copyTrimmed(char* dst, size_t dstSize, const char* src)
+{
+  while ((*src == ' ') || (*src == '\t'))
+  {
+    src++;
+  }
+
+  size_t length = strlen(src);
+
+  while ((length > 0u) && ((src[length - 1u] == ' ') || (src[length - 1u] == '\t')))
+  {
+    length--;
+  }
+
+  if (length >= dstSize)
+  {
+    length = dstSize - 1u;
+  }
+
+  memcpy(dst, src, length);
+  dst[length] = '\0';
+}
+
+//-- Lowercases every letter of the buffer in place (hostname spelling).
+static void lowercaseText(char* text)
+{
+  while (*text != '\0')
+  {
+    if ((*text >= 'A') && (*text <= 'Z'))
+    {
+      *text = (char)(*text + ('a' - 'A'));
+    }
+
+    text++;
+  }
+}
+
 static const char* applySettingsFromForm(const char* body)
 {
-  char text[64];
+  char text[LOGGER_MQTT_BROKER_MAX];
   loggerSettingsConfig candidate;
   memset(&candidate, 0, sizeof candidate);
   candidate.structVersion = LOGGER_SETTINGS_VERSION;
@@ -831,6 +891,83 @@ static const char* applySettingsFromForm(const char* body)
   {
     candidate.displayFlipped = (text[0] == '1');
   }
+
+  //-- MQTT publication fields. Absent fields leave the candidate zeroed,
+  //-- which keeps publication disabled; blanks around the values are cut.
+  if (formGet(body, "mqttBroker", text, sizeof text))
+  {
+    copyTrimmed(candidate.mqttBroker, sizeof candidate.mqttBroker, text);
+  }
+
+  if (formGet(body, "mqttUser", text, sizeof text))
+  {
+    copyTrimmed(candidate.mqttUser, sizeof candidate.mqttUser, text);
+  }
+
+  if (formGet(body, "mqttPassword", text, sizeof text))
+  {
+    copyTrimmed(candidate.mqttPassword, sizeof candidate.mqttPassword, text);
+  }
+
+  if (formGet(body, "mqttTopTopic", text, sizeof text))
+  {
+    copyTrimmed(candidate.mqttTopTopic, sizeof candidate.mqttTopTopic, text);
+  }
+
+  //-- The broker port is clamped like the read interval: an unusable value
+  //-- becomes the default 1883 whenever a broker is named at all.
+  int mqttPort = 0;
+
+  if (formGet(body, "mqttPort", text, sizeof text))
+  {
+    mqttPort = atoi(text);
+  }
+
+  if ((candidate.mqttBroker[0] != '\0') && ((mqttPort < 1) || (mqttPort > 65535)))
+  {
+    mqttPort = (int)LOGGER_SETTINGS_MQTT_PORT_DEFAULT;
+  }
+
+  candidate.mqttPort = (uint16_t)((mqttPort < 0) ? 0 : mqttPort);
+
+  //-- The broadcast interval is clamped to its bounds; 0 means no broadcast.
+  int mqttInterval = 0;
+
+  if (formGet(body, "mqttInterval", text, sizeof text))
+  {
+    mqttInterval = atoi(text);
+  }
+
+  if (mqttInterval < 0)
+  {
+    mqttInterval = 0;
+  }
+
+  if (mqttInterval > (int)LOGGER_SETTINGS_MQTT_INTERVAL_MAX_S)
+  {
+    mqttInterval = (int)LOGGER_SETTINGS_MQTT_INTERVAL_MAX_S;
+  }
+
+  candidate.mqttIntervalSeconds = (uint32_t)mqttInterval;
+
+  //-- The hostname arrives in any casing: stored lowercase.
+  if (formGet(body, "hostname", text, sizeof text))
+  {
+    copyTrimmed(candidate.hostname, sizeof candidate.hostname, text);
+    lowercaseText(candidate.hostname);
+  }
+
+  //-- The fixed IP keeps only its last octet; out-of-range input becomes a
+  //-- plain DHCP address (0).
+  int fixedOctet = 0;
+
+  if (formGet(body, "fixedIp", text, sizeof text))
+  {
+    fixedOctet = atoi(text);
+  }
+
+  candidate.fixedIpLastOctet =
+      (uint8_t)((fixedOctet < 1) ? 0 : ((fixedOctet > 254) ? 254 : fixedOctet));
 
   if (!formGet(body, "country", candidate.countryCode, sizeof candidate.countryCode))
   {
@@ -903,6 +1040,13 @@ static const char* applySettingsFromForm(const char* body)
   //-- The persisted configuration owns the panel orientation too: apply it
   //-- only now, after activation and persistence both succeeded.
   loggerBoardSetRotation(candidate.displayFlipped);
+
+  //-- Services outside the receive path (network identity, MQTT) adopt the
+  //-- stored values through the application's notification callback.
+  if (settingsSavedCallback != NULL)
+  {
+    settingsSavedCallback(&candidate);
+  }
 
   ESP_LOGI(tag,
            "configuration applied and stored: gpio %d, profile %s, rx polarity %s, tx polarity %s, "
@@ -2219,4 +2363,9 @@ esp_err_t loggerWebStart(void)
 bool loggerWebIsRunning(void)
 {
   return server != NULL;
+}
+
+void loggerWebSetSettingsSavedCallback(loggerWebSettingsSavedCb callback)
+{
+  settingsSavedCallback = callback;
 }

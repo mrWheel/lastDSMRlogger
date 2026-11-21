@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-21 · Build: 24
+// Date: 2026-11-21 · Build: 25
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -94,6 +94,8 @@ function bindElements()
                "txPolarityToggle", "txPolNormalLabel", "txPolInvertedLabel", "inpInterval",
                "displayRotationToggle", "rotNormalLabel", "rotUpsideDownLabel",
                "selCountry", "selProfile", "selMbus1", "selMbus2", "selMbus3", "selMbus4",
+               "inpMqttBroker", "inpMqttPort", "inpMqttUser", "inpMqttPassword", "inpMqttTopic",
+               "inpMqttInterval", "inpHostname", "inpFixedIp",
                "saveSettings", "telegramState", "showTelegram", "telegramLog",
                "telegramDetail", "recordMeta", "recordNotes", "summaryTable", "rawView", "footerInfo",
                "powerPanel", "powerTelegram", "powerRows",
@@ -584,6 +586,18 @@ function renderSettings(message)
 
   el.inpInterval.value = (settings && settings.intervalSeconds) ? String(settings.intervalSeconds) : "10";
 
+  // MQTT publication and network identity prefill straight from storage;
+  // an absent broker simply keeps publication off.
+  el.inpMqttBroker.value = (settings && settings.mqttBroker) ? settings.mqttBroker : "";
+  el.inpMqttPort.value = (settings && settings.mqttPort) ? String(settings.mqttPort) : "1883";
+  el.inpMqttUser.value = (settings && settings.mqttUser) ? settings.mqttUser : "";
+  el.inpMqttPassword.value = (settings && settings.mqttPassword) ? settings.mqttPassword : "";
+  el.inpMqttTopic.value = (settings && settings.mqttTopTopic) ? settings.mqttTopTopic : "";
+  el.inpMqttInterval.value =
+      (settings && settings.mqttIntervalSeconds) ? String(settings.mqttIntervalSeconds) : "0";
+  el.inpHostname.value = (settings && settings.hostname) ? settings.hostname : "";
+  el.inpFixedIp.value = (settings && settings.fixedIpLastOctet) ? String(settings.fixedIpLastOctet) : "0";
+
   fillSelect(el.selCountry, choices.countries);
 
   const mbus = mbusOptions(choices.mbusTypes || []);
@@ -653,6 +667,52 @@ function saveSettings(event)
   // The rotation switch position maps to the stored displayFlipped flag.
   const displayFlipped = el.displayRotationToggle.checked ? "1" : "0";
 
+  // The broker port is clamped like the interval: an unusable value becomes
+  // the default 1883 whenever a broker is named at all.
+  let mqttPort = parseInt(el.inpMqttPort.value, 10);
+  const mqttBroker = (el.inpMqttBroker.value || "").trim();
+
+  if (!Number.isFinite(mqttPort) || (mqttPort < 1) || (mqttPort > 65535))
+  {
+    mqttPort = (mqttBroker.length > 0) ? 1883 : 0;
+  }
+
+  el.inpMqttPort.value = String(mqttPort);
+
+  // The broadcast interval is clamped to 0..86400; 0 keeps publication off.
+  let mqttInterval = parseInt(el.inpMqttInterval.value, 10);
+
+  if (!Number.isFinite(mqttInterval) || (mqttInterval < 0))
+  {
+    mqttInterval = 0;
+  }
+
+  if (mqttInterval > 86400)
+  {
+    mqttInterval = 86400;
+  }
+
+  el.inpMqttInterval.value = String(mqttInterval);
+
+  // The hostname is stored lowercase; the fixed IP keeps only a valid last
+  // octet (anything unusable means plain DHCP).
+  const hostname = (el.inpHostname.value || "").trim().toLowerCase();
+  el.inpHostname.value = hostname;
+
+  let fixedIp = parseInt(el.inpFixedIp.value, 10);
+
+  if (!Number.isFinite(fixedIp) || (fixedIp < 1))
+  {
+    fixedIp = 0;
+  }
+
+  if (fixedIp > 254)
+  {
+    fixedIp = 254;
+  }
+
+  el.inpFixedIp.value = String(fixedIp);
+
   const body = "cmd=save" +
                "&rxGpio=" + encodeURIComponent(rxGpio) +
                "&rxInverted=" + rxInverted +
@@ -664,7 +724,15 @@ function saveSettings(event)
                "&mbus1=" + encodeURIComponent(el.selMbus1.value) +
                "&mbus2=" + encodeURIComponent(el.selMbus2.value) +
                "&mbus3=" + encodeURIComponent(el.selMbus3.value) +
-               "&mbus4=" + encodeURIComponent(el.selMbus4.value);
+               "&mbus4=" + encodeURIComponent(el.selMbus4.value) +
+               "&mqttBroker=" + encodeURIComponent(mqttBroker) +
+               "&mqttPort=" + encodeURIComponent(mqttPort) +
+               "&mqttUser=" + encodeURIComponent((el.inpMqttUser.value || "").trim()) +
+               "&mqttPassword=" + encodeURIComponent(el.inpMqttPassword.value || "") +
+               "&mqttTopTopic=" + encodeURIComponent((el.inpMqttTopic.value || "").trim()) +
+               "&mqttInterval=" + encodeURIComponent(mqttInterval) +
+               "&hostname=" + encodeURIComponent(hostname) +
+               "&fixedIp=" + encodeURIComponent(fixedIp);
 
   wsSend(body);
 }

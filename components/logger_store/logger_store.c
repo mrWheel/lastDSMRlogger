@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.c - hour, day and month smart meter ring file store
-//-- Date: 2026-11-21 · Build: 9
+//-- Date: 2026-11-21 · Build: 10
 //--
 //-- The store task owns all ring_file_store work: it mounts the LittleFS
 //-- storage partition, removes the ring file of the retired minute store,
@@ -502,12 +502,17 @@ typedef enum
   IMPORT_FIELD_DELIVERED_2,
   IMPORT_FIELD_RETURNED_1,
   IMPORT_FIELD_RETURNED_2,
-  IMPORT_FIELD_GAS
+  IMPORT_FIELD_GAS,
+  IMPORT_FIELD_TARIFF_1,
+  IMPORT_FIELD_TARIFF_2,
+  IMPORT_FIELD_TARIFF_GAS
 } ImportField;
 
-//-- Header column name (an OBIS code without method suffix) to payload
-//-- field. The gas counter is accepted under the catalogue code 0-1:24.1.0
-//-- and under the Dutch and Belgian publishing codes alike.
+//-- Header column name to payload field. The counters are named by their
+//-- OBIS code (without method suffix); the gas counter is accepted under the
+//-- catalogue code 0-1:24.1.0 and under the Dutch and Belgian publishing
+//-- codes alike. The three tariff amounts have no OBIS code of their own and
+//-- carry the same rubrics the ring print uses: t1, t2 and tg.
 static const struct
 {
   const char* obis;
@@ -516,7 +521,8 @@ static const struct
     {"1-0:1.8.1", IMPORT_FIELD_DELIVERED_1}, {"1-0:1.8.2", IMPORT_FIELD_DELIVERED_2},
     {"1-0:2.8.1", IMPORT_FIELD_RETURNED_1},  {"1-0:2.8.2", IMPORT_FIELD_RETURNED_2},
     {"0-1:24.1.0", IMPORT_FIELD_GAS},        {"0-1:24.2.1", IMPORT_FIELD_GAS},
-    {"0-1:24.2.3", IMPORT_FIELD_GAS},
+    {"0-1:24.2.3", IMPORT_FIELD_GAS},        {"t1", IMPORT_FIELD_TARIFF_1},
+    {"t2", IMPORT_FIELD_TARIFF_2},           {"tg", IMPORT_FIELD_TARIFF_GAS},
 };
 
 //-- Period key column spellings the header line may start with; the data
@@ -836,6 +842,15 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
       case IMPORT_FIELD_GAS:
         record.gasDeliveredM3 = (float)atof(fields[index]);
         break;
+      case IMPORT_FIELD_TARIFF_1:
+        record.tariffAmount1Euro = (float)atof(fields[index]);
+        break;
+      case IMPORT_FIELD_TARIFF_2:
+        record.tariffAmount2Euro = (float)atof(fields[index]);
+        break;
+      case IMPORT_FIELD_TARIFF_GAS:
+        record.tariffAmountGasEuro = (float)atof(fields[index]);
+        break;
       default:
         break;
       }
@@ -846,7 +861,7 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
     if (mode == LOGGER_POPULATE_UPDATE)
     {
       //-- Update mode never adds a period: only keys the ring already
-      // stores get their values revised, everything else is refused.
+      //-- stores get their values revised, everything else is refused.
       uint64_t usedKey = 0u;
       ringFileGranularity_t granularity = RING_FILE_GRANULARITY_NONE;
       MeterRingEntry stored;
@@ -869,9 +884,9 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
     else
     {
       //-- Overwrite mode empties the ring just before the first valid
-      // data line, so an import that never reaches one leaves the ring
-      // untouched. An empty ring accepts any bucket, which lets the whole
-      // file land without retained-window refusals.
+      //-- data line, so an import that never reaches one leaves the ring
+      //-- untouched. An empty ring accepts any bucket, which lets the whole
+      //-- file land without retained-window refusals.
       if ((mode == LOGGER_POPULATE_OVERWRITE) && !ringCleared)
       {
         ringCleared = true;
@@ -1022,16 +1037,18 @@ esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePa
 //-- the walk can never commit more records than that.
 #define STORE_EXPORT_MAX_RECORDS 64u
 
-//-- Header of an exported file: the period key column followed by the five
-//-- counter columns in the spelling the populate import maps back (the
-//-- 0-1:24.1.0 gas code is accepted for all published gas codes alike).
+//-- Header of an exported file: the period key column, the five counter
+//-- columns in the spelling the populate import maps back (the 0-1:24.1.0
+//-- gas code is accepted for all published gas codes alike) and the three
+//-- tariff amounts under the rubrics the ring print uses (t1, t2 and tg).
 #define STORE_EXPORT_HEADER                                                                        \
-  "YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255\r\n"
+  "YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255;t1;t2;tg\r\n"
 
 //-- Walks the ring newest first into a buffer (deduplicating a cursor that
 //-- is invalidated by a concurrent snapshot), then writes the file oldest
-//-- first: key as eight YYMMDDHH digits and the five counters at three
-//-- decimals. An empty ring still produces the header line.
+//-- first: key as eight YYMMDDHH digits, the five counters at three decimals
+//-- and the three tariff amounts at two. An empty ring still produces the
+//-- header line.
 static esp_err_t exportRingFile(loggerMeterRing_t ring, uint32_t* outRecords)
 {
   MeterRing* active = &rings[ring];
@@ -1083,7 +1100,7 @@ static esp_err_t exportRingFile(loggerMeterRing_t ring, uint32_t* outRecords)
     if (result == RING_FILE_STORE_ERR_ITER_INVALIDATED)
     {
       //-- A concurrent snapshot moved the cursor: collect the whole ring
-      // again from the newest.
+      //-- again from the newest.
       collected = 0u;
       lastEmittedKey = 0u;
       result = ringFileIteratorBegin(handle, &iterator, RING_FILE_ITER_NEWEST, NULL, &entry);
@@ -1120,10 +1137,11 @@ static esp_err_t exportRingFile(loggerMeterRing_t ring, uint32_t* outRecords)
     //-- digits and the century from the full timestamp.
     uint64_t key = (record->keys.timeStamp / 10000ULL) % 100000000ULL;
 
-    fprintf(file, "%08" PRIu64 ";%.3f;%.3f;%.3f;%.3f;%.3f\r\n", key,
+    fprintf(file, "%08" PRIu64 ";%.3f;%.3f;%.3f;%.3f;%.3f;%.2f;%.2f;%.2f\r\n", key,
             record->meter.energyDeliveredTariff1Kwh, record->meter.energyDeliveredTariff2Kwh,
             record->meter.energyReturnedTariff1Kwh, record->meter.energyReturnedTariff2Kwh,
-            record->meter.gasDeliveredM3);
+            record->meter.gasDeliveredM3, record->meter.tariffAmount1Euro,
+            record->meter.tariffAmount2Euro, record->meter.tariffAmountGasEuro);
   }
 
   fclose(file);

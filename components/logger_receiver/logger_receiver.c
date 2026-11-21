@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.c - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-17 · Build: 18
+//-- Date: 2026-11-21 · Build: 19
 //--
 //-- The parserDSMR adapter task owns the parser instance while it runs. The
 //-- event callback copies the complete accepted frame and the decoded fields
@@ -108,6 +108,7 @@ static const char* tag = "loggerReceiver";
 #define LOGGER_NVS_NAMESPACE "dsmrlog"
 #define LOGGER_NVS_KEY_TELEGRAM_COUNT "telegramCount"
 #define LOGGER_NVS_KEY_REJECTED_COUNT "rejectedCount"
+#define LOGGER_NVS_KEY_REJECTED_REBASE "rejectedRebase"
 
 typedef struct
 {
@@ -654,6 +655,33 @@ static void copyFieldSnapshot(const dsmrTelegramField* field, loggerFieldSnapsho
   }
 }
 
+//-- True when a parser diagnostic reports a telegram that was read in but
+//-- found faulty (a crc mismatch, a syntax error, an oversized or
+//-- incomplete frame): only these count as rejected. The timeout
+//-- diagnostics merely abandon a partial frame after the meter paused -
+//-- nothing is wrong with a telegram, the next complete one is simply
+//-- awaited. Data loss is a stream event tracked by its own counter, and an
+//-- M-Bus type mismatch annotates an already accepted telegram.
+static bool diagnosticCountsAsRejection(dsmrDiagReason reason)
+{
+  switch (reason)
+  {
+  case DSMR_DIAG_MISSING_CRC:
+  case DSMR_DIAG_MALFORMED_TRAILER:
+  case DSMR_DIAG_CRC_MISMATCH:
+  case DSMR_DIAG_MISSING_VERSION:
+  case DSMR_DIAG_INVALID_VERSION:
+  case DSMR_DIAG_SYNTAX_ERROR:
+  case DSMR_DIAG_SIZE_LIMIT:
+  case DSMR_DIAG_DUPLICATE_FIELD:
+  case DSMR_DIAG_VALUE_OVERFLOW:
+  case DSMR_DIAG_INVALID_TIMESTAMP:
+    return true;
+  default:
+    return false;
+  }
+}
+
 static void onParserEvent(const dsmrParser* parser, const dsmrParserEvent* event, void* userData)
 {
   (void)parser;
@@ -897,12 +925,22 @@ static void onParserEvent(const dsmrParser* parser, const dsmrParserEvent* event
     bool counterPersistDue = false;
 
     xSemaphoreTake(self->mutex, portMAX_DELAY);
-    self->rejectedCount++;
 
-    //-- Every 25th rejected telegram asks the counter task to write both
-    //-- running totals to NVS; the accepted counter triggers the same joint
-    //-- write in the telegram path, whichever of the two reaches +25 first.
-    counterPersistDue = ((self->rejectedCount % LOGGER_TELEGRAM_COUNTER_PERSIST_EVERY_N) == 0u);
+    //-- Only a telegram that was read in and found faulty is a rejection
+    //-- (see diagnosticCountsAsRejection): the timeout diagnostics for an
+    //-- abandoned partial frame are not errors - the next complete telegram
+    //-- is simply awaited - and data loss and M-Bus type mismatches have
+    //-- their own paths.
+    if (diagnosticCountsAsRejection(diagnostic->reason))
+    {
+      self->rejectedCount++;
+
+      //-- Every 25th rejected telegram asks the counter task to write both
+      //-- running totals to NVS; the accepted counter triggers the same
+      //-- joint write in the telegram path, whichever of the two reaches
+      //-- +25 first.
+      counterPersistDue = ((self->rejectedCount % LOGGER_TELEGRAM_COUNTER_PERSIST_EVERY_N) == 0u);
+    }
 
     if (diagnostic->reason == DSMR_DIAG_DATA_LOSS)
     {
@@ -1791,6 +1829,43 @@ esp_err_t loggerReceiverInit(void)
   else
   {
     ESP_LOGW(tag, "telegram counters could not be read from NVS: %s", esp_err_to_name(nvsResult));
+  }
+
+  //-- One-time rebase of the persisted rejected total: earlier firmware
+  //-- counted every parser diagnostic as a rejection, the timeout
+  //-- diagnostics for abandoned partial frames included, so a stored total
+  //-- holds mostly events that were never a faulty telegram. The first boot
+  //-- after this firmware zeroes the rejected counter once; the marker key
+  //-- keeps every later boot restoring the running total as usual.
+  bool rejectedRebaseNeeded = false;
+
+  if (nvsResult == ESP_OK)
+  {
+    if (nvs_open(LOGGER_NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK)
+    {
+      uint32_t rebaseMarker = 0u;
+
+      if (nvs_get_u32(handle, LOGGER_NVS_KEY_REJECTED_REBASE, &rebaseMarker) != ESP_OK)
+      {
+        rejectedRebaseNeeded = true;
+      }
+
+      nvs_close(handle);
+    }
+  }
+
+  if (rejectedRebaseNeeded)
+  {
+    if (nvs_open(LOGGER_NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK)
+    {
+      nvs_set_u32(handle, LOGGER_NVS_KEY_REJECTED_COUNT, 0u);
+      nvs_set_u32(handle, LOGGER_NVS_KEY_REJECTED_REBASE, 1u);
+      nvs_commit(handle);
+      nvs_close(handle);
+    }
+
+    self->rejectedCount = 0u;
+    ESP_LOGI(tag, "rejected counter rebased: earlier totals also counted parser timeouts");
   }
 
   //-- The console line, the telegram list and the panel number accepted

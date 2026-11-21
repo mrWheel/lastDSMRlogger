@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.h - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-17 · Build: 6
+//-- Date: 2026-11-21 · Build: 7
 //--
 //-- One receive task owns the receiver and parser state: the parserDSMR UART
 //-- adapter task feeds the parser and the event callback copies everything the
@@ -28,9 +28,10 @@
 //-- History bounds (RAM limits of the documented target configuration)
 //-- --------------------------------------------------------------------------
 
-//-- Records retained in RAM. The oldest record is evicted first. The capacity
-//-- exceeds the required minimum of two maximum-sized telegram records.
-#define LOGGER_HISTORY_CAPACITY 4
+//-- Records retained in RAM. The oldest record is evicted first. Two
+//-- complete telegrams are kept: enough for the console and the SPA to
+//-- show the newest frame while the next one is being received.
+#define LOGGER_HISTORY_CAPACITY 2
 
 //-- Total watts retained for the SPA realtime bar history: one sample per
 //-- accepted telegram, oldest first when read back. Each sample carries the

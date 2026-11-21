@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_telnet.c - telnet console server on port 23
-//-- Date: 2026-11-21 · Build: 10
+//-- Date: 2026-11-21 · Build: 12
 //--
 //-- A plain BSD-socket console task: it listens on port 23, serves exactly
 //-- one session at a time and answers a command set from the receiver,
@@ -34,8 +34,17 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "esp_chip_info.h"
+#include "esp_err.h"
+#include "esp_flash.h"
+#include "esp_heap_caps.h"
+#include "esp_image_format.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -97,8 +106,10 @@ static const char* const telnetCommands[] = {
     "showring", "ringfile", "store",   "populate",  "quit",     "exit", "ring2csv",
 };
 
-//-- The printf-style session writer is defined further down.
+//-- The printf-style session writer is defined further down, the device
+//-- state block (part of the status command) further up than its user.
 static bool telnetPrintf(int fd, const char* format, ...);
+static void printState(int fd);
 
 //-- Resolves one typed command word to the command it names: a
 //-- case-insensitive exact match always wins, otherwise the word must be an
@@ -275,7 +286,9 @@ static void printHelp(int fd)
   telnetSendText(
       fd, "\r\navailable commands:\r\n"
           "  help               this command list\r\n"
-          "  status             reception, counters, clock, Wi-Fi and control owner\r\n"
+          "  status             reception, counters, clock, Wi-Fi, control owner\r\n"
+          "                     and device state: copyright, identity, versions,\r\n"
+          "                     memory, flash\r\n"
           "  version            firmware and parser versions\r\n"
           "  telegrams          the telegrams retained in RAM\r\n"
           "  telegram <seq>     decoded fields of one retained telegram\r\n"
@@ -375,11 +388,215 @@ static void printStatus(int fd)
   telnetPrintf(fd, "control      : web %s, telnet %s\r\n",
                loggerControlGetOwner(LOGGER_CONTROL_WEB, &webOwnerFd) ? "claimed" : "free",
                loggerControlGetOwner(LOGGER_CONTROL_TELNET, &telnetOwnerFd) ? "claimed" : "free");
+
+  //-- The former separate state command is part of status now: reception
+  //-- and device identity in one answer.
+  printState(fd);
 }
 
 static void printVersion(int fd)
 {
   telnetPrintf(fd, "\r\nfirmware %s, parserDSMR %s\r\n", PROG_VERSION, dsmrParserVersion());
+}
+
+//-- --------------------------------------------------------------------------
+//-- Device state block (printed at the end of the status command)
+//-- --------------------------------------------------------------------------
+
+//-- The copyright the device states about itself.
+#define TELNET_COPYRIGHT "(c) by Willem Aandewiel"
+
+//-- Converts the compiler's __DATE__ ("Nov 21 2026") to the DD-MM-YYYY
+//-- spelling the user reads the firmware date in.
+static void formatCompileDate(char* out, size_t outSize)
+{
+  static const char* const monthNames[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  char monthText[4] = "";
+  int day = 0;
+  int year = 0;
+
+  if (sscanf(__DATE__, "%3s %d %d", monthText, &day, &year) != 3)
+  {
+    snprintf(out, outSize, "%s", __DATE__);
+    return;
+  }
+
+  unsigned month = 0u;
+
+  for (unsigned index = 0u; index < (sizeof monthNames / sizeof monthNames[0]); index++)
+  {
+    if (strcmp(monthNames[index], monthText) == 0)
+    {
+      month = index + 1u;
+      break;
+    }
+  }
+
+  snprintf(out, outSize, "%02d-%02u-%04d", day, month, year);
+}
+
+//-- Name of the image header's SPI read mode.
+static const char* spiModeName(uint8_t mode)
+{
+  switch (mode)
+  {
+  case ESP_IMAGE_SPI_MODE_QIO:
+    return "QIO";
+  case ESP_IMAGE_SPI_MODE_QOUT:
+    return "QOUT";
+  case ESP_IMAGE_SPI_MODE_DIO:
+    return "DIO";
+  case ESP_IMAGE_SPI_MODE_DOUT:
+    return "DOUT";
+  case ESP_IMAGE_SPI_MODE_FAST_READ:
+    return "FAST_READ";
+  case ESP_IMAGE_SPI_MODE_SLOW_READ:
+    return "SLOW_READ";
+  default:
+    return "unknown";
+  }
+}
+
+//-- Name of the image header's SPI clock division factor.
+static const char* spiSpeedName(uint8_t speed)
+{
+  switch (speed)
+  {
+  case ESP_IMAGE_SPI_SPEED_DIV_2:
+    return "clock div 2";
+  case ESP_IMAGE_SPI_SPEED_DIV_3:
+    return "clock div 3";
+  case ESP_IMAGE_SPI_SPEED_DIV_4:
+    return "clock div 4";
+  case ESP_IMAGE_SPI_SPEED_DIV_1:
+    return "clock div 1";
+  default:
+    return "unknown";
+  }
+}
+
+static void printState(int fd)
+{
+  char compileDate[16];
+  formatCompileDate(compileDate, sizeof compileDate);
+
+  telnetPrintf(fd, "\r\n%s\r\n", TELNET_COPYRIGHT);
+
+  //-- The hostname the station actually announces (set from the settings at
+  //-- the last join or save).
+  char hostname[LOGGER_HOSTNAME_MAX] = "?";
+  esp_netif_t* station = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+
+  if (station != NULL)
+  {
+    const char* applied = NULL;
+
+    if ((esp_netif_get_hostname(station, &applied) == ESP_OK) && (applied != NULL))
+    {
+      snprintf(hostname, sizeof hostname, "%s", applied);
+    }
+  }
+
+  telnetPrintf(fd, "hostname       : %s\r\n", hostname);
+  telnetPrintf(fd, "firmware       : %s (%s)\r\n", PROG_VERSION, compileDate);
+  telnetPrintf(fd, "compiled       : %s %s\r\n", __DATE__, __TIME__);
+  telnetPrintf(fd, "compiled with  : ESP-IDF %s, parserDSMR %s, gcc %s\r\n", esp_get_idf_version(),
+               dsmrParserVersion(), __VERSION__);
+  telnetPrintf(fd, "sdk version    : %s\r\n", esp_get_idf_version());
+
+  esp_chip_info_t chip;
+  esp_chip_info(&chip);
+  telnetPrintf(fd, "chip model     : ESP32-S3 (revision %u.%u, %d core(s))\r\n",
+               (unsigned)(chip.revision / 100), (unsigned)(chip.revision % 100), (int)chip.cores);
+
+  uint8_t mac[6];
+  uint64_t chipId = 0u;
+
+  if (esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY) == ESP_OK)
+  {
+    for (uint8_t index = 0u; index < sizeof mac; index++)
+    {
+      chipId = (chipId << 8) | mac[index];
+    }
+  }
+
+  telnetPrintf(fd, "chip ID        : %" PRIu64 " (efuse mac)\r\n", chipId);
+  telnetPrintf(fd, "CPU freq       : %d MHz (configured)\r\n", CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
+
+  telnetPrintf(fd, "free heap      : %" PRIu32 " bytes\r\n", esp_get_free_heap_size());
+  telnetPrintf(fd, "min free heap  : %" PRIu32 " bytes (lowest since boot)\r\n",
+               esp_get_minimum_free_heap_size());
+  telnetPrintf(fd, "max block      : %u bytes (largest free block)\r\n",
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  telnetPrintf(fd, "free PSRAM     : %u bytes\r\n",
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  telnetPrintf(fd, "PSRAM size     : %u bytes\r\n",
+               (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+
+  //-- The running application image: partition total, verified image length
+  //-- and the room left in the partition (the sketch space).
+  const esp_partition_t* app = esp_ota_get_running_partition();
+  uint32_t imageBytes = 0u;
+
+  if (app != NULL)
+  {
+    esp_image_metadata_t metadata;
+    esp_partition_pos_t position = {app->address, app->size};
+
+    if (esp_image_verify(ESP_IMAGE_VERIFY_SILENT, &position, &metadata) == ESP_OK)
+    {
+      imageBytes = metadata.image_len;
+    }
+
+    telnetPrintf(fd, "program size   : %" PRIu32 " bytes (running app partition)\r\n",
+                 (uint32_t)app->size);
+
+    if (imageBytes != 0u)
+    {
+      telnetPrintf(fd, "program used   : %" PRIu32 " bytes\r\n", imageBytes);
+      telnetPrintf(fd, "free sketch    : %" PRIu32 " bytes\r\n", (uint32_t)app->size - imageBytes);
+    }
+    else
+    {
+      telnetPrintf(fd, "program used   : not verified\r\n");
+    }
+
+    //-- The image header carries the SPI mode and clock factor the chip is
+    //-- read with.
+    esp_image_header_t header;
+
+    if ((esp_partition_read(app, 0, &header, sizeof header) == ESP_OK) &&
+        (header.magic == ESP_IMAGE_HEADER_MAGIC))
+    {
+      telnetPrintf(fd, "flash mode     : %s\r\n", spiModeName(header.spi_mode));
+      telnetPrintf(fd, "flash speed    : %s\r\n", spiSpeedName(header.spi_speed));
+    }
+  }
+
+  uint32_t flashBytes = 0u;
+  esp_err_t flashSizeRead = esp_flash_get_size(NULL, &flashBytes);
+
+  if (flashSizeRead == ESP_OK)
+  {
+    telnetPrintf(fd, "flash size     : %" PRIu32 " bytes\r\n", flashBytes);
+  }
+  else
+  {
+    telnetPrintf(fd, "flash size     : unreadable (%s)\r\n", esp_err_to_name(flashSizeRead));
+  }
+
+  const esp_partition_t* storage =
+      esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "storage");
+
+  if (storage != NULL)
+  {
+    telnetPrintf(fd, "littlefs size  : %" PRIu32 " kB\r\n", (uint32_t)(storage->size / 1024u));
+  }
+  else
+  {
+    telnetPrintf(fd, "littlefs size  : no storage partition\r\n");
+  }
 }
 
 static void printTelegramList(int fd)

@@ -89,6 +89,54 @@
           </div>
         </fieldset>
 
+        <fieldset>
+          <legend>MQTT</legend>
+          <label for="inpMqttBroker">Broker IP or URL</label>
+          <div class="intervalRow">
+            <input id="inpMqttBroker" type="text" maxlength="127" autocomplete="off"
+                   placeholder="192.168.1.50 or mqtt.example.com">
+          </div>
+
+          <label for="inpMqttPort">Broker port</label>
+          <div class="intervalRow">
+            <input id="inpMqttPort" type="number" min="1" max="65535" step="1" value="1883" inputmode="numeric">
+          </div>
+
+          <label for="inpMqttUser">User</label>
+          <div class="intervalRow">
+            <input id="inpMqttUser" type="text" maxlength="63" autocomplete="off">
+          </div>
+
+          <label for="inpMqttPassword">Password</label>
+          <div class="intervalRow">
+            <input id="inpMqttPassword" type="password" maxlength="63" autocomplete="new-password">
+          </div>
+
+          <label for="inpMqttTopic">Top topic</label>
+          <div class="intervalRow">
+            <input id="inpMqttTopic" type="text" maxlength="63" autocomplete="off"
+                   placeholder="lastdsmrlogger">
+          </div>
+
+          <label for="inpMqttInterval">Broadcast interval (0 = no broadcast)</label>
+          <div class="intervalRow">
+            <input id="inpMqttInterval" type="number" min="0" max="86400" step="1" value="0" inputmode="numeric">
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Network</legend>
+          <label for="inpHostname">Hostname</label>
+          <div class="intervalRow">
+            <input id="inpHostname" type="text" maxlength="32" autocomplete="off" placeholder="dsmrlogger">
+          </div>
+
+          <label for="inpFixedIp">Fixed IP (last part; empty or 0 = no fixed IP)</label>
+          <div class="intervalRow">
+            <input id="inpFixedIp" type="number" min="0" max="254" step="1" value="0" inputmode="numeric">
+          </div>
+        </fieldset>
+
         <button id="saveSettings" type="submit">Save</button>
       </form>
     </section>

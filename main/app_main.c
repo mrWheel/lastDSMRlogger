@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: app_main.c - application entry
-//-- Date: 2026-11-20 · Build: 11
+//-- Date: 2026-11-21 · Build: 14
 //--
 //-- Boot order: the board debug lines come up first, then NVS, then the P1
 //-- receiver. Reception starts as soon as a valid configuration is stored and
@@ -15,7 +15,7 @@
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
 extern const char* PROG_VERSION;
-const char* PROG_VERSION = "v0.4.18";
+const char* PROG_VERSION = "v0.4.19";
 
 #include <stdio.h>
 #include <string.h>
@@ -32,6 +32,7 @@ const char* PROG_VERSION = "v0.4.18";
 #include "dsmr_parser.h"
 #include "logger_board.h"
 #include "logger_control.h"
+#include "logger_mqtt.h"
 #include "logger_receiver.h"
 #include "logger_settings.h"
 #include "logger_store.h"
@@ -50,6 +51,141 @@ static const char* tag = "appMain";
 #define WIFI_RECONNECT_POLL_MS 2000
 
 static volatile bool wifiEverConnected = false;
+
+//-- --------------------------------------------------------------------------
+//-- Network identity and MQTT (settings fields outside the receive path)
+//-- --------------------------------------------------------------------------
+
+//-- Hostname announced to DHCP and mDNS when the settings carry none.
+#define LOGGER_HOSTNAME_DEFAULT "dsmrlogger"
+
+//-- The configuration last saved (or loaded at boot), kept here because the
+//-- network services re-apply it after every station reconnect. All-zero
+//-- (no stored settings yet) simply means: default hostname, DHCP.
+static loggerSettingsConfig activeNetworkConfig;
+
+//-- True while the station address is the fixed one from the settings.
+static bool fixedIpApplied = false;
+
+//-- Lease work requested by a settings save, performed later by the Wi-Fi
+//-- task. Re-announcing the hostname or moving the address briefly leaves
+//-- the station interface and aborts every open TCP connection on it, so it
+//-- must not run inside the save handler: the save could never send its own
+//-- reply (the browser would see a reset while the save did succeed).
+static volatile bool pendingFixedIp = false;
+static volatile bool pendingHostnameAnnounce = false;
+
+//-- Applies the stored hostname and fixed IP to the station interface. Safe
+//-- before the join (only the hostname is stored then); after the join a
+//-- changed hostname is re-announced through a DHCP re-request and the fixed
+//-- IP replaces the granted address (the network part comes from the lease).
+static void applyNetworkIdentity(const loggerSettingsConfig* config, bool connected,
+                                 bool deferLeaseWork)
+{
+  esp_netif_t* station = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+
+  if (station == NULL)
+  {
+    return;
+  }
+
+  const char* wanted = (config->hostname[0] != '\0') ? config->hostname : LOGGER_HOSTNAME_DEFAULT;
+  const char* current = NULL;
+
+  if ((esp_netif_get_hostname(station, &current) != ESP_OK) || (current == NULL))
+  {
+    current = "";
+  }
+
+  bool hostnameChanged = (strcmp(current, wanted) != 0);
+
+  if (hostnameChanged && (esp_netif_set_hostname(station, wanted) != ESP_OK))
+  {
+    ESP_LOGW(tag, "hostname '%s' could not be set", wanted);
+  }
+
+  if (!connected)
+  {
+    return;
+  }
+
+  esp_netif_ip_info_t ipInfo;
+
+  if (config->fixedIpLastOctet != 0u)
+  {
+    if (esp_netif_get_ip_info(station, &ipInfo) != ESP_OK)
+    {
+      return;
+    }
+
+    uint8_t* octets = (uint8_t*)&ipInfo.ip.addr;
+
+    if (octets[3] != config->fixedIpLastOctet)
+    {
+      if (deferLeaseWork)
+      {
+        pendingFixedIp = true;
+        return;
+      }
+
+      octets[3] = config->fixedIpLastOctet;
+      esp_netif_dhcpc_stop(station);
+
+      if (esp_netif_set_ip_info(station, &ipInfo) == ESP_OK)
+      {
+        fixedIpApplied = true;
+        ESP_LOGI(tag, "station fixed to " IPSTR " (DHCP released)", IP2STR(&ipInfo.ip));
+      }
+      else
+      {
+        ESP_LOGW(tag, "fixed IP could not be set, staying on DHCP");
+        esp_netif_dhcpc_start(station);
+        fixedIpApplied = false;
+      }
+    }
+    else
+    {
+      fixedIpApplied = true;
+    }
+  }
+  else if (fixedIpApplied)
+  {
+    if (deferLeaseWork)
+    {
+      pendingFixedIp = true;
+      return;
+    }
+
+    esp_netif_dhcpc_start(station);
+    fixedIpApplied = false;
+    ESP_LOGI(tag, "fixed IP withdrawn, the station is on DHCP again");
+  }
+  else if (hostnameChanged)
+  {
+    //-- The lease stands but the name is new: re-request so the router
+    //-- records the station under its new hostname.
+    if (deferLeaseWork)
+    {
+      pendingHostnameAnnounce = true;
+      return;
+    }
+
+    esp_netif_dhcpc_stop(station);
+    esp_netif_dhcpc_start(station);
+  }
+}
+
+//-- Notification from the settings view: the complete configuration was
+//-- applied and persisted, so the network services adopt it right away.
+static void onSettingsSaved(const loggerSettingsConfig* config)
+{
+  activeNetworkConfig = *config;
+
+  //-- The lease work is deferred to the Wi-Fi task: it would abort this
+  //-- very save's own reply along with every other open connection.
+  applyNetworkIdentity(&activeNetworkConfig, wifi_prov_is_connected(), true);
+  loggerMqttApplyConfig(config);
+}
 
 //-- Wall clock: SNTP sets the system clock once the station has joined. The
 //-- European time zone with the EU daylight-saving rules lets the SPA header
@@ -144,6 +280,16 @@ static void onWifiConnected(void)
   loggerBoardWifiConnected(ssid, ip);
   ESP_LOGI(tag, "station joined '%s' with IP %s, SPA reachable there", ssid, ip);
 
+  //-- The station now has a lease: announce the stored hostname and, when a
+  //-- fixed last octet is configured, pin the address on top of the lease.
+  //-- Nothing is answered on these sockets yet, so the work runs at once.
+  applyNetworkIdentity(&activeNetworkConfig, true, false);
+
+  //-- LWIP is up with the join: this is the moment the MQTT client may
+  //-- resolve its broker, so publication is released here (it stays off
+  //-- while the station is down).
+  loggerMqttSetNetworkReady(true);
+
   //-- The captive portal released port 80 when it stopped: serve the SPA and
   //-- open the telnet console. Each channel arbitrates its own clients: one
   //-- browser page and one telnet session may be active at the same time.
@@ -196,7 +342,41 @@ static void wifiTask(void* argument)
     if (wifiEverConnected && !wifi_prov_is_connected())
     {
       ESP_LOGW(tag, "station disconnected, requesting a reconnect");
+
+      //-- Publication goes down with the link: without a station there is
+      //-- no route to the broker. onWifiConnected releases it again.
+      loggerMqttSetNetworkReady(false);
       esp_wifi_connect();
+      continue;
+    }
+
+    //-- Deferred lease work from a settings save (see applyNetworkIdentity):
+    //-- performed here, well after the save has answered its browser.
+    if (wifiEverConnected && wifi_prov_is_connected())
+    {
+      if (pendingFixedIp)
+      {
+        pendingFixedIp = false;
+        applyNetworkIdentity(&activeNetworkConfig, true, false);
+      }
+      else if (pendingHostnameAnnounce)
+      {
+        pendingHostnameAnnounce = false;
+
+        //-- Only meaningful while the station stays on DHCP; the fixed-IP
+        //-- branch above owns the address when one is configured.
+        if (activeNetworkConfig.fixedIpLastOctet == 0u)
+        {
+          esp_netif_t* station = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+
+          if (station != NULL)
+          {
+            ESP_LOGI(tag, "re-announcing the hostname to DHCP");
+            esp_netif_dhcpc_stop(station);
+            esp_netif_dhcpc_start(station);
+          }
+        }
+      }
     }
   }
 }
@@ -251,11 +431,23 @@ void app_main(void)
     {
       ESP_LOGE(tag, "receiver could not start with stored settings: %s", esp_err_to_name(started));
     }
+
+    //-- The network identity takes the stored hostname (the fixed IP waits
+    //-- for the first lease) and the MQTT client starts when the settings
+    //-- request publication and the station has joined; both re-apply on
+    //-- every station reconnect and on every save through the settings view.
+    activeNetworkConfig = settings;
+    applyNetworkIdentity(&settings, false, false);
+    loggerMqttApplyConfig(&settings);
   }
   else
   {
     ESP_LOGI(tag, "no valid stored settings, awaiting configuration");
   }
+
+  //-- The settings view notifies this application after a complete save so
+  //-- the services outside the receive path adopt the stored values.
+  loggerWebSetSettingsSavedCallback(onSettingsSaved);
 
   //-- The meter store runs on its own task: it mounts the LittleFS storage
   //-- partition and keeps the last 49 hour, 32 day and 24 month records in

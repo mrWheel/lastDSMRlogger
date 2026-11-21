@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.h - versioned settings service
-//-- Date: 2026-11-16 · Build: 5
+//-- Date: 2026-11-21 · Build: 6
 //--
 //-- The settings service stores the complete versioned configuration in
 //-- ESP-IDF NVS, validates it against the parserDSMR built-in profiles and
@@ -70,9 +70,22 @@ typedef enum
 //-- Version 5: the P1 TX polarity (Forwarding Data) became a setting
 //-- (Normal/Inverted) for both copies of a forwarding burst; stored version 4
 //-- blobs are rejected, so one save is required after updating.
+//-- Version 5 (extended): the MQTT publication and the network identity
+//-- fields were appended at the end of the struct. Smaller stored blobs
+//-- (the five original fields) migrate on load: the appended fields get
+//-- their defaults, so no save is required after updating.
 #define LOGGER_SETTINGS_VERSION 5u
 #define LOGGER_SETTINGS_PROFILE_ID_MAX 32
 #define LOGGER_SETTINGS_COUNTRY_MAX 3
+
+//-- Bounds of the appended MQTT and network fields.
+#define LOGGER_MQTT_BROKER_MAX 128
+#define LOGGER_MQTT_USER_MAX 64
+#define LOGGER_MQTT_PASSWORD_MAX 64
+#define LOGGER_MQTT_TOPIC_MAX 64
+#define LOGGER_HOSTNAME_MAX 33
+#define LOGGER_SETTINGS_MQTT_PORT_DEFAULT 1883u
+#define LOGGER_SETTINGS_MQTT_INTERVAL_MAX_S 86400u
 
 //-- Accepted read interval bounds in seconds: only one telegram is read
 //-- (accepted into the history) per interval.
@@ -110,23 +123,59 @@ typedef struct
   //-- orientation; true turns the panel 180 degrees for enclosures that
   //-- mount the board the other way round.
   bool displayFlipped;
+
+  //-- ------------------------------------------------------------------------
+  //-- MQTT publication (appended at version 5; older blobs leave these at
+  //-- their defaults, which keeps publication disabled)
+  //-- ------------------------------------------------------------------------
+
+  //-- Broker host, IP or full mqtt:// / mqtts:// URI. Empty disables MQTT.
+  char mqttBroker[LOGGER_MQTT_BROKER_MAX];
+
+  //-- Broker port used when the broker text carries no port of its own.
+  uint16_t mqttPort;
+
+  //-- Broker credentials; both empty for an anonymous broker.
+  char mqttUser[LOGGER_MQTT_USER_MAX];
+  char mqttPassword[LOGGER_MQTT_PASSWORD_MAX];
+
+  //-- Top topic of the publication: every broadcast goes to
+  //-- "<topTopic>/telegram". Empty selects the default "lastdsmrlogger".
+  char mqttTopTopic[LOGGER_MQTT_TOPIC_MAX];
+
+  //-- Broadcast interval in seconds: every interval the most recently
+  //-- accepted telegram is published to the broker. 0 means no broadcast.
+  uint32_t mqttIntervalSeconds;
+
+  //-- ------------------------------------------------------------------------
+  //-- Network identity (appended at version 5)
+  //-- ------------------------------------------------------------------------
+
+  //-- Hostname the station announces to DHCP and mDNS. Empty selects the
+  //-- device default.
+  char hostname[LOGGER_HOSTNAME_MAX];
+
+  //-- Fixed IP: the last octet of the station address, the network part
+  //-- taken from the lease the router granted. 0 means no fixed IP (DHCP).
+  uint8_t fixedIpLastOctet;
 } loggerSettingsConfig;
 
 //-- Loads the stored configuration and validates it. Returns ESP_ERR_NOT_FOUND
 //-- on first boot or when the stored data cannot be trusted, in which case
 //-- reception shall await a valid configuration.
-esp_err_t loggerSettingsLoad(loggerSettingsConfig *config);
+esp_err_t loggerSettingsLoad(loggerSettingsConfig* config);
 
 //-- Validates a complete candidate configuration: selectable GPIO, known
 //-- profile with matching country, and per-channel M-Bus modes and types.
-bool loggerSettingsValidate(const loggerSettingsConfig *config);
+bool loggerSettingsValidate(const loggerSettingsConfig* config);
 
 //-- Validates and persists the complete configuration as one operation.
-esp_err_t loggerSettingsSave(const loggerSettingsConfig *config);
+esp_err_t loggerSettingsSave(const loggerSettingsConfig* config);
 
 //-- Copies the expected M-Bus device declarations (explicit selections only)
 //-- into outDevices and returns the number of entries written.
-uint8_t loggerSettingsBuildMbusDevices(const loggerSettingsConfig *config, dsmrMbusDevice *outDevices, uint8_t deviceCapacity);
+uint8_t loggerSettingsBuildMbusDevices(const loggerSettingsConfig* config,
+                                       dsmrMbusDevice* outDevices, uint8_t deviceCapacity);
 
 //-- --------------------------------------------------------------------------
 //-- Valid choices for the settings view, obtained from the parser profiles
@@ -144,12 +193,12 @@ typedef struct
 uint16_t loggerSettingsProfileCount(void);
 
 //-- Profile metadata at the given index; false when out of range.
-bool loggerSettingsProfileAt(uint16_t index, loggerSettingsProfileInfo *info);
+bool loggerSettingsProfileAt(uint16_t index, loggerSettingsProfileInfo* info);
 
 //-- Resolves one profile by stable identifier; false when unknown.
-bool loggerSettingsLookupProfile(const char *profileId, loggerSettingsProfileInfo *info);
+bool loggerSettingsLookupProfile(const char* profileId, loggerSettingsProfileInfo* info);
 
 //-- True when the two letter country code matches a built-in profile.
-bool loggerSettingsIsKnownCountry(const char *countryCode);
+bool loggerSettingsIsKnownCountry(const char* countryCode);
 
 #endif //-- LOGGER_SETTINGS_H
