@@ -1,11 +1,12 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_telnet.c - telnet console server on port 23
-//-- Date: 2026-11-20 · Build: 6
+//-- Date: 2026-11-21 · Build: 8
 //--
 //-- A plain BSD-socket console task: it listens on port 23, serves exactly
-//-- one session at a time and answers a read-only command set from the
-//-- receiver, store and settings APIs. The console slot is decided by the
+//-- one session at a time and answers a command set from the receiver,
+//-- store and settings APIs (read-only except populate, which imports a
+//-- LittleFS csv file into one meter ring). The console slot is decided by the
 //-- shared logger_control arbiter, which keeps one slot per channel: the
 //-- web page holds its own slot and is never displaced from here. Accepting
 //-- a telnet client claims the console slot, and when a newer telnet client
@@ -61,6 +62,12 @@ static const char* tag = "loggerTelnet";
 #define TELNET_PATH_BYTES 320
 #define TELNET_PROMPT "logger> "
 
+//-- Question the populate command asks for its input file; the next line
+//-- typed is taken as the file name (relative to the LittleFS mount point).
+#define TELNET_POPULATE_QUESTION                                                                   \
+  "input file on LittleFS (e.g. assets/RINGmonths.csv, "                                           \
+  "empty line cancels): "
+
 //-- Minimal telnet negotiation: the console echoes and is full duplex, so
 //-- the client can switch local echo off. Incoming negotiation sequences are
 //-- skipped by the input state machine.
@@ -74,6 +81,13 @@ static const char* tag = "loggerTelnet";
 
 static TaskHandle_t telnetTask;
 static volatile bool taskRunning = false;
+
+//-- Pending populate input: while awaiting the file name the next line is
+//-- taken as the answer instead of as a command. One session at a time, so
+//-- a plain pair of file-scope variables is enough; a fresh client resets
+//-- them.
+static bool populateAwaitingFile = false;
+static loggerMeterRing_t populateRing = LOGGER_RING_HOURS;
 
 //-- True while fd still holds the telnet console slot: every byte batch is
 //-- checked against the arbiter, so a session that lost the slot to a newer
@@ -209,6 +223,8 @@ static void printHelp(int fd)
           "  power              the realtime power frame of the newest telegram\r\n"
           "  showRing {month|days|hours}\r\n"
           "                     the stored records of one meter ring (default hours)\r\n"
+          "  populate {hours|days|months}\r\n"
+          "                     import a LittleFS csv file into one meter ring\r\n"
           "  store              LittleFS volume: files with sizes, capacity and free space\r\n"
           "  quit               close this session\r\n");
 }
@@ -458,10 +474,22 @@ static void printPower(int fd)
                snapshot.totalAmps, snapshot.totalVolts);
 }
 
+//-- Period key label per ring: the header spelling the import csv uses for
+//-- the same column. Its length is the width of the key column.
+static const char* const ringKeyNames[LOGGER_RING_COUNT] = {"YYMMDDHH", "YYMMDD", "YYMM"};
+
+//-- Value column labels of the ring print: the OBIS codes of the five
+//-- counters (gas under its catalogue code) and the three tariff amounts.
+//-- The tariff amounts are fictional billing figures without a code of
+//-- their own, so they keep their names.
+static const char* const ringValueLabels[] = {"1-0:1.8.1",  "1-0:1.8.2", "1-0:2.8.1", "1-0:2.8.2",
+                                              "0-1:24.1.0", "t1",        "t2",        "tg"};
+
 //-- Visitor of the ring walk: builds the answer in memory instead of writing
-//-- to the socket while the store handle is held by the walk. The key is
-//-- printed at the width of the walked ring's period key ("YYMMDDhh",
-//-- "YYMMDD" or "YYMM").
+//-- to the socket while the store handle is held by the walk. One record is
+//-- one semicolon separated line without field names: the labels live once
+//-- in the header above the records. Every value column is right aligned at
+//-- width 10, the key is zero padded to the width of the ring's key label.
 typedef struct
 {
   TelnetOut* out;
@@ -472,13 +500,11 @@ static bool appendRingFileRecord(uint64_t key, const loggerMeterRecord* record, 
 {
   RingPrint* print = (RingPrint*)userData;
 
-  outAppendFmt(print->out,
-               "%0*" PRIu64 "  edT1 %.3f  edT2 %.3f  erT1 %.3f  erT2 %.3f  gas %.3f"
-               "  t1 %.2f  t2 %.2f  tg %.2f\r\n",
-               print->keyWidth, key, record->energyDeliveredTariff1Kwh,
-               record->energyDeliveredTariff2Kwh, record->energyReturnedTariff1Kwh,
-               record->energyReturnedTariff2Kwh, record->gasDeliveredM3, record->tariffAmount1Euro,
-               record->tariffAmount2Euro, record->tariffAmountGasEuro);
+  outAppendFmt(
+      print->out, "%0*" PRIu64 ";%10.3f;%10.3f;%10.3f;%10.3f;%10.3f;%10.2f;%10.2f;%10.2f\r\n",
+      print->keyWidth, key, record->energyDeliveredTariff1Kwh, record->energyDeliveredTariff2Kwh,
+      record->energyReturnedTariff1Kwh, record->energyReturnedTariff2Kwh, record->gasDeliveredM3,
+      record->tariffAmount1Euro, record->tariffAmount2Euro, record->tariffAmountGasEuro);
   return !print->out->overflow;
 }
 
@@ -509,9 +535,15 @@ static void printRingFile(int fd, const char* periodText)
 
   RingPrint print;
   print.out = &out;
-  print.keyWidth = (ring == LOGGER_RING_HOURS) ? 8 : ((ring == LOGGER_RING_DAYS) ? 6 : 4);
+  print.keyWidth = (int)strlen(ringKeyNames[ring]);
 
   outAppendFmt(&out, "\r\n%s ring records (newest first):\r\n", loggerStoreRingName(ring));
+
+  //-- The column rubrics once, right aligned above the columns they name.
+  outAppendFmt(&out, "%*s;%10s;%10s;%10s;%10s;%10s;%10s;%10s;%10s\r\n", print.keyWidth,
+               ringKeyNames[ring], ringValueLabels[0], ringValueLabels[1], ringValueLabels[2],
+               ringValueLabels[3], ringValueLabels[4], ringValueLabels[5], ringValueLabels[6],
+               ringValueLabels[7]);
   esp_err_t walked = loggerStoreListRecords(ring, appendRingFileRecord, &print);
 
   if (walked != ESP_OK)
@@ -625,6 +657,38 @@ static void printStore(int fd)
   free(buffer);
 }
 
+//-- Runs the populate import of one csv file into the pending ring and
+//-- reports the outcome. The import runs on the console task: ring_file_store
+//-- serialises the edits against the store task on the shared handle, so the
+//-- ring keeps serving reads and snapshots while the file is imported.
+static void runPopulate(int fd, const char* fileName)
+{
+  loggerStoreImportResult result;
+  memset(&result, 0, sizeof result);
+
+  telnetPrintf(fd, "\r\nimporting '%s' into the %s ring ...", fileName,
+               loggerStoreRingName(populateRing));
+
+  esp_err_t outcome = loggerStorePopulateRing(populateRing, fileName, &result);
+
+  if (outcome != ESP_OK)
+  {
+    telnetPrintf(fd, "\r\npopulate failed: %s%s%s\r\n", esp_err_to_name(outcome),
+                 (result.firstError[0] != '\0') ? " - " : "", result.firstError);
+    return;
+  }
+
+  telnetPrintf(fd,
+               "\r\n%" PRIu32 " line(s) read, %" PRIu32 " edit(s) written, "
+               "%" PRIu32 " line(s) rejected, %" PRIu32 " refused\r\n",
+               result.rowsRead, result.bucketsWritten, result.rowsRejected, result.bucketsRefused);
+
+  if (result.firstError[0] != '\0')
+  {
+    telnetPrintf(fd, "first refusal: %s\r\n", result.firstError);
+  }
+}
+
 //-- Handles one complete command line. Returns false when the session must
 //-- close (the quit command).
 static bool handleLine(int fd, char* line)
@@ -632,6 +696,25 @@ static bool handleLine(int fd, char* line)
   while (isspace((unsigned char)*line))
   {
     line++;
+  }
+
+  //-- While a populate awaits its file name the next line is the answer,
+  //-- not a command; an empty line cancels the import.
+  if (populateAwaitingFile)
+  {
+    populateAwaitingFile = false;
+
+    if (*line == '\0')
+    {
+      telnetPrintf(fd, "populate cancelled\r\n");
+    }
+    else
+    {
+      runPopulate(fd, line);
+    }
+
+    telnetSendText(fd, TELNET_PROMPT);
+    return true;
   }
 
   if (*line == '\0')
@@ -706,6 +789,29 @@ static bool handleLine(int fd, char* line)
   else if (strcasecmp(line, "store") == 0)
   {
     printStore(fd);
+  }
+  else if (strcasecmp(line, "populate") == 0)
+  {
+    //-- The selector picks the ring (no default: importing is a write);
+    //-- the ring's name then asks for the csv file to import.
+    loggerMeterRing_t ring = LOGGER_RING_HOURS;
+
+    if ((arguments == NULL) || (arguments[0] == '\0'))
+    {
+      telnetPrintf(fd, "usage: populate {hours|days|months}\r\n");
+    }
+    else if (!loggerStoreRingFromName(arguments, &ring))
+    {
+      telnetPrintf(fd, "unknown ring '%s' - use month, days or hours\r\n", arguments);
+    }
+    else
+    {
+      populateRing = ring;
+      populateAwaitingFile = true;
+      telnetPrintf(fd, "\r\nimporting into the %s ring.\r\n%s", loggerStoreRingName(ring),
+                   TELNET_POPULATE_QUESTION);
+      return true; //-- the file name replaces the next prompt
+    }
   }
   else if ((strcasecmp(line, "quit") == 0) || (strcasecmp(line, "exit") == 0))
   {
@@ -801,6 +907,7 @@ static void telnetTaskLoop(void* argument)
   char line[TELNET_LINE_MAX];
   size_t linePos = 0u;
   uint8_t iacState = 0u;
+  bool pendingCr = false;
 
   for (;;)
   {
@@ -909,7 +1016,19 @@ static void telnetTaskLoop(void* argument)
 
           if ((byte == '\r') || (byte == '\n'))
           {
-            if (linePos > 0u)
+            //-- A CR LF pair ends one line: the LF of a just-flushed CR is
+            //-- skipped, so the pair never reads as an extra (empty) line.
+            if ((byte == '\n') && pendingCr)
+            {
+              pendingCr = false;
+              continue;
+            }
+
+            pendingCr = (byte == '\r');
+
+            //-- An empty line normally does nothing; while a populate
+            //-- awaits its file name it is the cancel answer.
+            if ((linePos > 0u) || populateAwaitingFile)
             {
               line[linePos] = '\0';
               telnetSendText(clientFd, "\r\n");
@@ -926,6 +1045,8 @@ static void telnetTaskLoop(void* argument)
           }
           else if ((byte == '\b') || (byte == 127u))
           {
+            pendingCr = false;
+
             if (linePos > 0u)
             {
               linePos--;
@@ -934,6 +1055,8 @@ static void telnetTaskLoop(void* argument)
           }
           else if (isprint((int)byte))
           {
+            pendingCr = false;
+
             if (linePos + 1u < sizeof line)
             {
               line[linePos++] = (char)byte;
@@ -970,6 +1093,8 @@ static void telnetTaskLoop(void* argument)
         clientFd = newFd;
         linePos = 0u;
         iacState = 0u;
+        pendingCr = false;
+        populateAwaitingFile = false;
 
         const uint8_t willEcho[3] = {TELNET_IAC, TELNET_WILL, TELNET_OPT_ECHO};
         const uint8_t willSga[3] = {TELNET_IAC, TELNET_WILL, TELNET_OPT_SGA};

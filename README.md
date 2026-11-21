@@ -1,7 +1,7 @@
 # lastDSMRlogger
 
-Buildnumber: 23
-Last update-date: 2026-11-20
+Buildnumber: 26
+Last update-date: 2026-11-21
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -49,7 +49,7 @@ automatically.
 |parserDSMR                |`https://github.com/mrWheel/parserDSMR` checkout at `../parserDSMR`                                         |revision `686a3aeefb5c4b107ce9884023fab4014b184b31` (v0.9.1, includes the raw-frame API and `dsmrParserVersion()`; `PROG_VERSION` now has internal linkage, so it no longer clashes with the application's own symbol) |
 |esp32_s3_piggyback        |`https://github.com/mrWheel/esp32-s3-Piggyback`, component directory `components/esp32_s3_piggyback`       |commit `912fa25b86fdb62d8f1005ae57e227c5803db373` (v1.3.0), vendored under `components/` |
 |esp-idf-wifi-provisioner  |ESP Component Registry `michmich/esp-idf-wifi-provisioner`                                                  |version `0.4.0` (upstream commit `2c7aaa6aa0e319a429186ee470e137b8579f632f`) |
-|ring_file_store           |ESP Component Registry `mrwheel/ring_file_store`                                                            |`^0.1.2` |
+|ring_file_store           |`https://github.com/mrWheel/ringFileStore` checkout at `../ringFileStore`, component directory `components/ring_file_store` (for now instead of the registry release `mrwheel/ring_file_store: ^0.1.2`) |local working copy (v0.1.3 in the checkout's `idf_component.yml`) |
 |littlefs                  |ESP Component Registry `joltwallet/littlefs`                                                                |`^1.23.1` |
 |smb_server                |ESP Component Registry `mrwheel/smb_server`                                                                 |`^0.3.0` (GPL-3.0, guest-only SMB2/SMB3 file server) |
 
@@ -357,7 +357,7 @@ operators.
   session is not disturbed.
 
 The console greets with the firmware version and the peer address and answers
-these read-only commands:
+these commands (read-only except `populate`, which writes one ring file):
 
 |Command          |Shows                                                            |
 |-----------------|-----------------------------------------------------------------|
@@ -369,6 +369,8 @@ these read-only commands:
 |`raw <seq>`      |exact accepted bytes of one retained telegram                    |
 |`power`          |the realtime power frame of the newest accepted telegram         |
 |`showRing <ring>`|stored records of one meter ring: `month`, `days` or `hours`       |
+|`populate <ring>`|imports a LittleFS csv file into one meter ring: `hours`, `days` or `months` (see below) |
+|`store`          |LittleFS volume: files with sizes, capacity and free space       |
 |`quit`           |close the session                                                |
 
 ### SMB network share
@@ -390,6 +392,66 @@ The server is guest-only and never signs or encrypts traffic: there are no
 user accounts and no transport security, so only trusted local networks
 should reach the device. When the storage volume could not be mounted the
 share stays off and the console logs the reason.
+
+The share stays read-only by design, so import files (next subsection) land
+on the volume through the storage partition image, not through the share.
+
+### Importing historical periods (`populate`)
+
+The console command `populate {hours|days|months}` imports historical
+periods from a semicolon separated csv file on the LittleFS volume into one
+meter ring. After the ring selector the command asks for the input file,
+relative to the volume root (typically `assets/RINGmonths.csv`); an empty
+line cancels.
+
+The file starts with a header line. Its first column names the period key
+(`YYMMDDHH`, `YYMMDD` or `YYMM`); the value columns are OBIS codes, with or
+without the `*255` method suffix:
+
+|OBIS code                          |Ring field                |Unit|
+|-----------------------------------|--------------------------|----|
+|`1-0:1.8.1`                        |energy delivered tariff 1 |kWh |
+|`1-0:1.8.2`                        |energy delivered tariff 2 |kWh |
+|`1-0:2.8.1`                        |energy returned tariff 1  |kWh |
+|`1-0:2.8.2`                        |energy returned tariff 2  |kWh |
+|`0-1:24.1.0` (or `0-1:24.2.1`/`.3`)|gas delivered             |m³  |
+
+Unknown columns — including the `#` and the empty trailing columns that
+exported files carry — are skipped. Every data line starts with the period
+key (8, 6 or 4 digits) and carries its values in header order; **a blank or
+missing value becomes 0**, and the tariff amount fields never appear in a
+file, so they stay 0 too. Records are edited into the ring, so historical
+periods backfill the retained window; periods older than the ring capacity
+(49 hours, 32 days, 24 months) are refused and reported. Several lines of
+one period update the same record: the last line wins.
+
+```
+logger> populate months
+importing into the months ring.
+input file on LittleFS (e.g. assets/RINGmonths.csv, empty line cancels): assets/RINGmonths.csv
+
+7 line(s) read, 7 edit(s) written, 0 line(s) rejected, 0 refused
+logger> showRing months
+```
+
+Input files land on the device through the storage partition image: drop
+them into `storageImage/assets/` (the sample `RINGhours.csv`, `RINGdays.csv`
+and `RINGmonths.csv` ship there),
+rebuild and write `build/storage.bin` to the device:
+
+```
+python $IDF_PATH/components/partition_table/parttool.py \
+  -p PORT write_partition --partition-name storage --input build/storage.bin
+```
+
+Note: listing a nearly full ring — `showRing` or the web pages — makes the
+`ring_file_store` iterator inspect every slot on every step, which costs a
+very large number of flash reads once a ring is full; a listing of the
+49-hour ring can then run for minutes and the task watchdog will report the
+busy task while it walks. The minute store keeps running: its upsert simply
+waits for the listing to release the ring. The cost sits in the component's
+iterator (no slot cache: `rfsRankGreater` re-reads every slot per candidate);
+a maintainer-side fix would make full-ring listings fast again.
 
 ## 7. RAM limits (documented target configuration)
 

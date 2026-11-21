@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.c - hour, day and month smart meter ring file store
-//-- Date: 2026-11-20 · Build: 5
+//-- Date: 2026-11-20 · Build: 7
 //--
 //-- The store task owns all ring_file_store work: it mounts the LittleFS
 //-- storage partition, removes the ring file of the retired minute store,
@@ -15,15 +15,22 @@
 //-- the same period updates the active record instead of failing, which
 //-- keeps reboots and clock nudges harmless. At every hour change the task
 //-- synchronizes all three files so the staged records reach storage.
+//-- The console's populate command feeds historical periods in through
+//-- loggerStorePopulateRing(): a semicolon separated csv file from the
+//-- volume's "assets" drop folder, keyed by period and columned by OBIS
+//-- code, is edited into one ring with missing values becoming 0.0.
 //-- ==========================================================================
 
 #include "logger_store.h"
 
+#include <ctype.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -31,6 +38,7 @@
 #include "esp_littlefs.h"
 #include "esp_random.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "logger_receiver.h"
 #include "ring_file_store.h"
@@ -355,6 +363,16 @@ static bool openMeterRings(void)
 
   ESP_LOGI(tag, "mounted LittleFS partition '%s' at %s", STORE_PARTITION_LABEL, STORE_MOUNT_POINT);
 
+  //-- The documented drop folder for populate import files (SMB share):
+  //-- LittleFS needs the directory to exist before a file can land in it.
+  char assetsPath[64];
+  snprintf(assetsPath, sizeof assetsPath, "%s/assets", STORE_MOUNT_POINT);
+
+  if ((mkdir(assetsPath, 0777) != 0) && (errno != EEXIST))
+  {
+    ESP_LOGW(tag, "could not create the import folder %s: errno %d", assetsPath, errno);
+  }
+
   //-- The temporary per-minute store is retired: its ring file and a lock
   //-- it may have left behind no longer belong on the volume.
   (void)ringFileBreakStaleLock(STORE_LEGACY_RING_PATH);
@@ -447,6 +465,12 @@ esp_err_t loggerStoreListRecords(loggerMeterRing_t ring, loggerStoreRecordVisito
       return ESP_FAIL;
     }
 
+    //-- A full ring walk is flash-read heavy: the component inspects every
+    //-- slot per step. Hand the cpu to the idle task after each record so
+    //-- the task watchdog keeps its reset while a console or web listing
+    //-- walks all buckets.
+    vTaskDelay(1);
+
     result = ringFileIteratorPrevious(handle, &iterator, &entry);
 
     if (result == RING_FILE_STORE_ERR_ITER_INVALIDATED)
@@ -463,6 +487,464 @@ esp_err_t loggerStoreListRecords(loggerMeterRing_t ring, loggerStoreRecordVisito
   }
 
   return ESP_OK;
+}
+
+//-- --------------------------------------------------------------------------
+//-- Populate import
+//-- --------------------------------------------------------------------------
+
+//-- Import limits: one hand-edited csv line stays far below these bounds;
+//-- a longer line is reported as rejected instead of half-imported.
+#define STORE_IMPORT_LINE_BYTES 256
+#define STORE_IMPORT_MAX_COLUMNS 40
+#define STORE_IMPORT_PATH_BYTES 320
+
+//-- The payload field a value column feeds.
+typedef enum
+{
+  IMPORT_FIELD_NONE = -1,
+  IMPORT_FIELD_DELIVERED_1 = 0,
+  IMPORT_FIELD_DELIVERED_2,
+  IMPORT_FIELD_RETURNED_1,
+  IMPORT_FIELD_RETURNED_2,
+  IMPORT_FIELD_GAS
+} ImportField;
+
+//-- Header column name (an OBIS code without method suffix) to payload
+//-- field. The gas counter is accepted under the catalogue code 0-1:24.1.0
+//-- and under the Dutch and Belgian publishing codes alike.
+static const struct
+{
+  const char* obis;
+  ImportField field;
+} importObisMap[] = {
+    {"1-0:1.8.1", IMPORT_FIELD_DELIVERED_1}, {"1-0:1.8.2", IMPORT_FIELD_DELIVERED_2},
+    {"1-0:2.8.1", IMPORT_FIELD_RETURNED_1},  {"1-0:2.8.2", IMPORT_FIELD_RETURNED_2},
+    {"0-1:24.1.0", IMPORT_FIELD_GAS},        {"0-1:24.2.1", IMPORT_FIELD_GAS},
+    {"0-1:24.2.3", IMPORT_FIELD_GAS},
+};
+
+//-- Period key column spellings the header line may start with; the data
+//-- line keys may then carry 8, 6 or 4 digits.
+static const char* const importKeyNames[] = {"YYMMDDHH", "YYMMDD", "YYMM"};
+
+//-- Trims leading and trailing blanks and tabs (and a surviving line
+//-- ending) in place; returns the new start of the text.
+static char* trimText(char* text)
+{
+  while ((text[0] == ' ') || (text[0] == '\t'))
+  {
+    text++;
+  }
+
+  size_t length = strlen(text);
+
+  while ((length > 0u) && ((text[length - 1u] == ' ') || (text[length - 1u] == '\t') ||
+                           (text[length - 1u] == '\r') || (text[length - 1u] == '\n')))
+  {
+    text[--length] = '\0';
+  }
+
+  return text;
+}
+
+//-- Splits a line on ';' into at most STORE_IMPORT_MAX_COLUMNS fields (the
+//-- separators become terminators). Empty fields are kept: a missing value
+//-- is a blank field, not a missing separator. Columns beyond the maximum
+//-- are consumed but not captured. Returns the captured field count.
+static uint8_t splitCsvLine(char* line, char** fields, uint8_t maxFields)
+{
+  uint8_t count = 1u;
+  fields[0] = line;
+  char* separator = strchr(line, ';');
+
+  while (separator != NULL)
+  {
+    *separator++ = '\0';
+
+    if (count < maxFields)
+    {
+      fields[count++] = separator;
+    }
+
+    separator = strchr(separator, ';');
+  }
+
+  return count;
+}
+
+//-- Builds the 14-digit ring timestamp from a period key text: 8 digits
+//-- "YYMMDDhh", 6 digits "YYMMDD" (hour 00) or 4 digits "YYMM" (day 01,
+//-- hour 00); minutes and seconds are always zero padding. False for any
+//-- other spelling, non-digits or plainly out-of-range date parts (the
+//-- component refuses such timestamps at the edit anyway).
+static bool importKeyToTimeStamp(const char* keyText, uint64_t* outTimeStamp)
+{
+  size_t length = strlen(keyText);
+
+  if ((length != 4u) && (length != 6u) && (length != 8u))
+  {
+    return false;
+  }
+
+  for (size_t index = 0u; index < length; index++)
+  {
+    if (!isdigit((unsigned char)keyText[index]))
+    {
+      return false;
+    }
+  }
+
+  uint64_t digits = strtoull(keyText, NULL, 10);
+  unsigned hour = 0u;
+  unsigned day = 1u;
+
+  if (length == 8u)
+  {
+    hour = (unsigned)(digits % 100u);
+    digits /= 100u;
+  }
+
+  if (length >= 6u)
+  {
+    day = (unsigned)(digits % 100u);
+    digits /= 100u;
+  }
+
+  unsigned month = (unsigned)(digits % 100u);
+  unsigned year2 = (unsigned)(digits / 100u);
+
+  if ((month < 1u) || (month > 12u) || (day < 1u) || (day > 31u) || (hour > 23u))
+  {
+    return false;
+  }
+
+  uint64_t timeStamp = 20u;
+  timeStamp = (timeStamp * 100u) + year2;
+  timeStamp = (timeStamp * 100u) + month;
+  timeStamp = (timeStamp * 100u) + day;
+  timeStamp = (timeStamp * 100u) + hour;
+  timeStamp = timeStamp * 10000u; //-- zero-padded minutes and seconds
+
+  *outTimeStamp = timeStamp;
+  return true;
+}
+
+//-- Maps one trimmed header column name to the payload field it feeds. An
+//-- "*255" method suffix is cut off before the comparison; unknown names -
+//-- including the export files' "#" and empty trailing columns - feed
+//-- nothing.
+static ImportField importFieldForColumn(char* columnName)
+{
+  char* methodSuffix = strchr(columnName, '*');
+
+  if (methodSuffix != NULL)
+  {
+    *methodSuffix = '\0';
+  }
+
+  for (size_t index = 0u; index < (sizeof importObisMap / sizeof importObisMap[0]); index++)
+  {
+    if (strcasecmp(columnName, importObisMap[index].obis) == 0)
+    {
+      return importObisMap[index].field;
+    }
+  }
+
+  return IMPORT_FIELD_NONE;
+}
+
+//-- True when the trimmed header text names one of the accepted period key
+//-- columns.
+static bool isImportKeyName(const char* text)
+{
+  for (size_t index = 0u; index < (sizeof importKeyNames / sizeof importKeyNames[0]); index++)
+  {
+    if (strcasecmp(text, importKeyNames[index]) == 0)
+    {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+//-- Readable name for the ring_file_store result codes (esp_err_to_name
+//-- knows only the standard ESP codes, the custom ones come out "ERROR").
+static const char* importErrName(esp_err_t err)
+{
+  switch (err)
+  {
+  case RING_FILE_STORE_ERR_BUCKET_OUT_OF_RANGE:
+    return "outside the retained window";
+  case RING_FILE_STORE_ERR_NOT_NEWER:
+    return "not newer than the newest bucket";
+  case RING_FILE_STORE_ERR_READONLY:
+    return "the ring is open read-only";
+  case RING_FILE_STORE_ERR_IO:
+  case RING_FILE_STORE_ERR_IO_FAULTED:
+    return "storage I/O failure";
+  case RING_FILE_STORE_ERR_CORRUPT:
+    return "the ring file is corrupt";
+  case RING_FILE_STORE_ERR_STORAGE_FULL:
+    return "the volume is full";
+  default:
+    return esp_err_to_name(err);
+  }
+}
+
+//-- Work item of one import; the calling task waits on done.
+typedef struct
+{
+  loggerMeterRing_t ring;
+  const char* relativePath;
+  loggerStoreImportResult* result;
+  SemaphoreHandle_t done;
+  esp_err_t outcome;
+} ImportJob;
+
+//-- The import itself, executed on the dedicated import task with the
+//-- arguments validated by the public wrapper.
+static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath,
+                                loggerStoreImportResult* result)
+{
+  char path[STORE_IMPORT_PATH_BYTES];
+  snprintf(path, sizeof path, "%s/%s", STORE_MOUNT_POINT, relativePath);
+
+  FILE* file = fopen(path, "r");
+
+  if (file == NULL)
+  {
+    ESP_LOGW(tag, "populate could not open %s: errno %d", path, errno);
+    snprintf(result->firstError, sizeof result->firstError, "cannot open '%.60s' (errno %d)",
+             relativePath, errno);
+    return ESP_ERR_NOT_FOUND;
+  }
+
+  ImportField fieldOfColumn[STORE_IMPORT_MAX_COLUMNS];
+
+  //-- 0xFF fills every enum-sized entry with -1 (IMPORT_FIELD_NONE).
+  memset(fieldOfColumn, 0xFF, sizeof fieldOfColumn);
+
+  bool headerRead = false;
+  esp_err_t outcome = ESP_OK;
+  char line[STORE_IMPORT_LINE_BYTES];
+
+  while (fgets(line, sizeof line, file) != NULL)
+  {
+    //-- A line that did not fit the reader is malformed: its tail is
+    //-- dropped and the line is rejected instead of half-imported.
+    size_t lineLength = strlen(line);
+    bool truncated = (lineLength == (sizeof line - 1u)) && (line[lineLength - 1u] != '\n');
+
+    if (truncated)
+    {
+      int dropped = 0;
+
+      while (((dropped = fgetc(file)) != EOF) && (dropped != '\n'))
+      {
+      }
+    }
+
+    char copy[STORE_IMPORT_LINE_BYTES];
+    snprintf(copy, sizeof copy, "%s", line);
+    char* text = trimText(copy);
+
+    if (text[0] == '\0')
+    {
+      continue;
+    }
+
+    char* fields[STORE_IMPORT_MAX_COLUMNS];
+    uint8_t columnCount = splitCsvLine(text, fields, STORE_IMPORT_MAX_COLUMNS);
+
+    //-- Keep the pointer trimText returns: it also skips leading blanks.
+    for (uint8_t index = 0u; index < columnCount; index++)
+    {
+      fields[index] = trimText(fields[index]);
+    }
+
+    if (!headerRead)
+    {
+      headerRead = true;
+
+      if (!isImportKeyName(fields[0]))
+      {
+        outcome = ESP_ERR_INVALID_ARG;
+        snprintf(result->firstError, sizeof result->firstError,
+                 "header must start with YYMMDDHH, YYMMDD or YYMM (found '%.24s')", fields[0]);
+        break;
+      }
+
+      for (uint8_t index = 1u; index < columnCount; index++)
+      {
+        fieldOfColumn[index] = importFieldForColumn(fields[index]);
+      }
+
+      continue;
+    }
+
+    result->rowsRead++;
+
+    uint64_t timeStamp = 0u;
+
+    if (truncated || !importKeyToTimeStamp(fields[0], &timeStamp))
+    {
+      result->rowsRejected++;
+
+      if (result->firstError[0] == '\0')
+      {
+        snprintf(result->firstError, sizeof result->firstError, "line %lu rejected: no usable key",
+                 (unsigned long)result->rowsRead);
+      }
+
+      continue;
+    }
+
+    loggerMeterRecord record;
+    memset(&record, 0, sizeof record);
+
+    for (uint8_t index = 1u; index < columnCount; index++)
+    {
+      switch (fieldOfColumn[index])
+      {
+      case IMPORT_FIELD_DELIVERED_1:
+        record.energyDeliveredTariff1Kwh = (float)atof(fields[index]);
+        break;
+      case IMPORT_FIELD_DELIVERED_2:
+        record.energyDeliveredTariff2Kwh = (float)atof(fields[index]);
+        break;
+      case IMPORT_FIELD_RETURNED_1:
+        record.energyReturnedTariff1Kwh = (float)atof(fields[index]);
+        break;
+      case IMPORT_FIELD_RETURNED_2:
+        record.energyReturnedTariff2Kwh = (float)atof(fields[index]);
+        break;
+      case IMPORT_FIELD_GAS:
+        record.gasDeliveredM3 = (float)atof(fields[index]);
+        break;
+      default:
+        break;
+      }
+    }
+
+    //-- ringFileEdit backfills historical periods (ringFileAdd would refuse
+    //-- anything older than the newest stored bucket) and keeps its
+    //-- position when the period is already active.
+    esp_err_t edited = ringFileEdit(rings[ring].handle, timeStamp, &record);
+
+    if (edited == ESP_OK)
+    {
+      result->bucketsWritten++;
+    }
+    else
+    {
+      result->bucketsRefused++;
+
+      if (result->firstError[0] == '\0')
+      {
+        snprintf(result->firstError, sizeof result->firstError, "key %.20s refused: %s", fields[0],
+                 importErrName(edited));
+      }
+    }
+  }
+
+  fclose(file);
+
+  if (headerRead && (outcome == ESP_OK))
+  {
+    esp_err_t synced = ringFileSync(rings[ring].handle);
+
+    if (synced != ESP_OK)
+    {
+      outcome = synced;
+      snprintf(result->firstError, sizeof result->firstError, "could not synchronize: %s",
+               importErrName(synced));
+    }
+  }
+
+  if (!headerRead && (outcome == ESP_OK))
+  {
+    outcome = ESP_ERR_INVALID_ARG;
+    snprintf(result->firstError, sizeof result->firstError, "file has no header line");
+  }
+
+  ESP_LOGI(tag,
+           "populate %s ring from %s: %lu line(s) read, %lu written, %lu rejected, %lu refused",
+           rings[ring].name, path, (unsigned long)result->rowsRead,
+           (unsigned long)result->bucketsWritten, (unsigned long)result->rowsRejected,
+           (unsigned long)result->bucketsRefused);
+
+  return outcome;
+}
+
+//-- The import drives ring_file_store (LittleFS writes included), and the
+//-- component asks every driving task for at least 8 KB of stack on top of
+//-- its own locals: the console task (8 KB total) overflowed when it ran
+//-- the import itself, so a one-shot task of its own does the work.
+#define STORE_IMPORT_TASK_STACK_BYTES 10240
+#define STORE_IMPORT_TASK_PRIORITY 4
+
+static void importRingTask(void* argument)
+{
+  ImportJob* job = (ImportJob*)argument;
+
+  job->outcome = importRingFile(job->ring, job->relativePath, job->result);
+  xSemaphoreGive(job->done);
+  vTaskDelete(NULL);
+}
+
+esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePath,
+                                  loggerStoreImportResult* result)
+{
+  if ((ring < LOGGER_RING_HOURS) || (ring >= LOGGER_RING_COUNT) || (relativePath == NULL) ||
+      (relativePath[0] == '\0') || (result == NULL))
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  memset(result, 0, sizeof *result);
+
+  if (rings[ring].handle == NULL)
+  {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  //-- The import never leaves the mounted volume: no absolute path and no
+  //-- parent traversal.
+  if ((relativePath[0] == '/') || (strstr(relativePath, "..") != NULL))
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  SemaphoreHandle_t done = xSemaphoreCreateBinary();
+
+  if (done == NULL)
+  {
+    return ESP_ERR_NO_MEM;
+  }
+
+  ImportJob job;
+  job.ring = ring;
+  job.relativePath = relativePath;
+  job.result = result;
+  job.done = done;
+  job.outcome = ESP_FAIL;
+
+  if (xTaskCreate(importRingTask, "ringImport", STORE_IMPORT_TASK_STACK_BYTES, &job,
+                  STORE_IMPORT_TASK_PRIORITY, NULL) != pdPASS)
+  {
+    vSemaphoreDelete(done);
+    ESP_LOGE(tag, "could not create the ring import task");
+    return ESP_ERR_NO_MEM;
+  }
+
+  //-- One small csv lands in milliseconds; the wait only ever lasts as long
+  //-- as the LittleFS writes of the imported periods take.
+  xSemaphoreTake(done, portMAX_DELAY);
+  vSemaphoreDelete(done);
+
+  return job.outcome;
 }
 
 //-- --------------------------------------------------------------------------

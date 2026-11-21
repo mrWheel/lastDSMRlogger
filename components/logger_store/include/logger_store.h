@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.h - hour, day and month smart meter ring file store
-//-- Date: 2026-11-20 · Build: 5
+//-- Date: 2026-11-20 · Build: 6
 //--
 //-- Three fixed-capacity ring files land on the LittleFS storage partition,
 //-- written through mrwheel's ring_file_store component: the hours ring
@@ -12,6 +12,10 @@
 //-- hour change. The component prepends its two automatic key fields
 //-- (timeStamp and the period usedKey) to every record, so the caller's
 //-- payload struct carries only the measurements.
+//--
+//-- The console's populate command imports historical periods from a
+//-- semicolon separated csv file on the volume (drop folder "assets/") into
+//-- one ring through ringFileEdit(), missing values becoming 0.0.
 //-- ==========================================================================
 
 #ifndef LOGGER_STORE_H
@@ -100,6 +104,42 @@ typedef bool (*loggerStoreRecordVisitor)(uint64_t key, const loggerMeterRecord* 
 //-- visitor).
 esp_err_t loggerStoreListRecords(loggerMeterRing_t ring, loggerStoreRecordVisitor visitor,
                                  void* userData);
+
+//-- --------------------------------------------------------------------------
+//-- Populate import
+//-- --------------------------------------------------------------------------
+
+//-- Outcome counters of one populate import.
+typedef struct
+{
+  uint32_t rowsRead;       //-- data lines seen after the header line
+  uint32_t rowsRejected;   //-- lines without a usable period key
+  uint32_t bucketsWritten; //-- edits the ring file accepted (insert or update)
+  uint32_t bucketsRefused; //-- edits the ring file refused (e.g. out of window)
+  char firstError[96];     //-- first refusal or failure, empty when none
+} loggerStoreImportResult;
+
+//-- Imports one semicolon separated csv file from the LittleFS volume into
+//-- one meter ring (the console's populate command). The first non-blank
+//-- line is the header: its first column names the period key ("YYMMDDHH",
+//-- "YYMMDD" or "YYMM"), the remaining columns are OBIS codes. Values are
+//-- collected for 1-0:1.8.1, 1-0:1.8.2, 1-0:2.8.1 and 1-0:2.8.2 (kWh) and
+//-- for the gas counter 0-1:24.1.0 (also accepted as 0-1:24.2.1 or
+//-- 0-1:24.2.3), all case-insensitive and with an optional "*255" method
+//-- suffix. Unknown columns - including the "#" and empty trailing columns
+//-- of exported files - are skipped. Every data line starts with the period
+//-- key and carries its values in header order; a blank or missing value
+//-- becomes 0.0, and the tariff amount fields never appear in a file and
+//-- therefore stay 0.0. Records reach the ring through ringFileEdit(), so
+//-- historical periods backfill the retained window; periods older than the
+//-- ring capacity are refused and counted. The path is relative to the
+//-- LittleFS mount point ("assets/RINGmonths.csv") and may not climb out of
+//-- the volume. Returns ESP_ERR_INVALID_ARG for a missing argument or a bad
+//-- header, ESP_ERR_NOT_FOUND when the file does not exist,
+//-- ESP_ERR_INVALID_STATE while the store is not running, and ESP_OK when
+//-- the file was processed (per-line outcomes land in result).
+esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePath,
+                                  loggerStoreImportResult* result);
 
 //-- VFS mount point of the LittleFS storage volume, published for the SMB
 //-- network share (the component exposes an already mounted VFS path and
