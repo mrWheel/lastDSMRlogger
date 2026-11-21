@@ -1,12 +1,13 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-21 · Build: 17
+//-- Date: 2026-11-21 · Build: 18
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
 //-- form-urlencoded commands (cmd=config, cmd=save, cmd=telegrams,
-//-- cmd=telegram, cmd=raw, cmd=power, cmd=ringfile, cmd=hoursgraph,
+//-- cmd=telegram, cmd=raw, cmd=power, cmd=ringfile, cmd=graph,
+//-- cmd=actualgraph, cmd=hoursgraph (alias of graph&ring=hours),
 //-- cmd=view);
 //-- raw telegram bytes travel as a binary frame behind their JSON header so
 //-- no client ever interprets telegram text as HTML. Browser to device
@@ -75,6 +76,10 @@ extern const char styleCssEnd[] asm("_binary_style_css_end");
 //-- (forty-nine at most: key plus three deltas), well within the same
 //-- headroom.
 #define WEB_HOURSGRAPH_JSON_BYTES 8192
+
+//-- The Actual Graph frame carries up to the full receiver power history
+//-- (a hundred samples) with six phase figures and the gas rate each.
+#define WEB_ACTUALGRAPH_JSON_BYTES 12288
 
 //-- --------------------------------------------------------------------------
 //-- WebSocket transport
@@ -1316,17 +1321,18 @@ static void appendRingFileJson(stringBuilder* sb, loggerMeterRing_t ring)
 //-- Hours graph (Hours Graph view)
 //-- --------------------------------------------------------------------------
 
-//-- Hourly usage for the Hours Graph view. The hours ring stores the
-//-- cumulative counters of every retained hour, so the amount of one hour
-//-- is the difference between two consecutive retained records. The ring
-//-- walk hands its records newest first; they are collected into this small
-//-- array (the full capacity of the hours ring) and rendered oldest first
-//-- so the graph reads left to right. The oldest record has no predecessor
-//-- and is left out. A difference below zero (a replaced meter resets its
-//-- counters) is clamped to zero. A record that does not name the hour
-//-- directly after its retained predecessor (imported history that ends in
-//-- the past, hours the ring no longer holds) would credit that whole gap
-//-- to one bar, so such records are left out and the graph shows a hole.
+//-- Period usage for the Hours, Days and Months Graph views. The ring
+//-- stores the cumulative counters of every retained period, so the amount
+//-- of one period is the difference between two consecutive retained
+//-- records. The ring walk hands its records newest first; they are
+//-- collected into this small array (the full capacity of the largest ring)
+//-- and rendered oldest first so the graph reads left to right. The oldest
+//-- record has no predecessor and is left out. A difference below zero (a
+//-- replaced meter resets its counters) is clamped to zero. A record that
+//-- does not name the period directly after its retained predecessor
+//-- (imported history that ends in the past, periods the ring no longer
+//-- holds) would credit that whole gap to one bar, so such records are left
+//-- out and the graph shows a hole.
 #define WEB_HOURSGRAPH_MAX_RECORDS 49u
 
 typedef struct
@@ -1334,14 +1340,14 @@ typedef struct
   uint64_t keys[WEB_HOURSGRAPH_MAX_RECORDS];
   loggerMeterRecord records[WEB_HOURSGRAPH_MAX_RECORDS];
   uint32_t collected;
-} HourGraphCollect;
+} PeriodGraphCollect;
 
-//-- Visitor of the hours ring walk: stores each record newest first, the
+//-- Visitor of the period ring walk: stores each record newest first, the
 //-- order the walk hands them. The walk stops once the ring capacity is
 //-- reached; anything beyond would be a broken ring anyway.
-static bool collectHoursGraphRecord(uint64_t key, const loggerMeterRecord* record, void* userData)
+static bool collectPeriodGraphRecord(uint64_t key, const loggerMeterRecord* record, void* userData)
 {
-  HourGraphCollect* collect = (HourGraphCollect*)userData;
+  PeriodGraphCollect* collect = (PeriodGraphCollect*)userData;
 
   if (collect->collected >= WEB_HOURSGRAPH_MAX_RECORDS)
   {
@@ -1412,21 +1418,89 @@ static uint64_t nextHourKey(uint64_t key)
   return ((uint64_t)(year2 * 100u + month) * 100u + day) * 100u + hour;
 }
 
-//-- Builds the hours graph frame: one line per retained hour (except the
-//-- oldest) with the per-hour used/returned kWh and gas m³, oldest first.
-static void appendHoursGraphJson(stringBuilder* sb)
+//-- The day key that follows a YYMMDD key (calendar carry over day, month
+//-- and year), so two retained records can be recognised as naming directly
+//-- consecutive days.
+static uint64_t nextDayKey(uint64_t key)
 {
-  HourGraphCollect* collect = calloc(1u, sizeof *collect);
+  unsigned day = (unsigned)(key % 100u);
+  key /= 100u;
+  unsigned month = (unsigned)(key % 100u);
+  unsigned year2 = (unsigned)(key / 100u);
+
+  day++;
+
+  if (day > daysInMonth2000(year2, month))
+  {
+    day = 1u;
+    month++;
+
+    if (month > 12u)
+    {
+      month = 1u;
+      year2 = (year2 + 1u) % 100u;
+    }
+  }
+
+  return ((uint64_t)year2 * 100u + month) * 100u + day;
+}
+
+//-- The month key that follows a YYMM key (calendar carry over year), so
+//-- two retained records can be recognised as naming directly consecutive
+//-- months.
+static uint64_t nextMonthKey(uint64_t key)
+{
+  unsigned month = (unsigned)(key % 100u);
+  unsigned year2 = (unsigned)(key / 100u);
+
+  month++;
+
+  if (month > 12u)
+  {
+    month = 1u;
+    year2 = (year2 + 1u) % 100u;
+  }
+
+  return (uint64_t)year2 * 100u + month;
+}
+
+//-- The key of the period that follows a retained key of one ring: the
+//-- calendar successor in the ring's own key shape (YYMMDDhh, YYMMDD or
+//-- YYMM).
+static uint64_t nextPeriodKey(loggerMeterRing_t ring, uint64_t key)
+{
+  if (ring == LOGGER_RING_DAYS)
+  {
+    return nextDayKey(key);
+  }
+
+  if (ring == LOGGER_RING_MONTHS)
+  {
+    return nextMonthKey(key);
+  }
+
+  return nextHourKey(key);
+}
+
+//-- Emits one period graph frame under a caller-chosen type name: one line
+//-- per retained period (except the oldest) with the per-period
+//-- used/returned kWh and gas m³, oldest first, plus the ring's selector
+//-- name as the walk echoed it.
+static void appendPeriodGraphFrame(stringBuilder* sb, loggerMeterRing_t ring, const char* typeName)
+{
+  PeriodGraphCollect* collect = calloc(1u, sizeof *collect);
 
   if (collect == NULL)
   {
-    sbAppend(sb, "{\"type\":\"hoursgraph\",\"records\":[],\"available\":false}");
+    sbAppendFmt(sb, "{\"type\":\"%s\",\"ring\":\"%s\",\"records\":[],\"available\":false}",
+                typeName, loggerStoreRingName(ring));
     return;
   }
 
-  esp_err_t walked = loggerStoreListRecords(LOGGER_RING_HOURS, collectHoursGraphRecord, collect);
+  esp_err_t walked = loggerStoreListRecords(ring, collectPeriodGraphRecord, collect);
 
-  sbAppend(sb, "{\"type\":\"hoursgraph\",\"records\":[");
+  sbAppendFmt(sb, "{\"type\":\"%s\",\"ring\":\"%s\",\"records\":[", typeName,
+              loggerStoreRingName(ring));
 
   uint32_t emitted = 0u;
 
@@ -1437,10 +1511,10 @@ static void appendHoursGraphJson(stringBuilder* sb)
   {
     index--;
 
-    //-- Only subtract when the two records name directly consecutive hours:
-    //-- a retained gap (imported history ending in the past, hours aged out
-    //-- of the ring) would credit the whole gap to one bar.
-    if (nextHourKey(collect->keys[index]) != collect->keys[index - 1u])
+    //-- Only subtract when the two records name directly consecutive
+    //-- periods: a retained gap (imported history ending in the past,
+    //-- periods aged out of the ring) would credit the whole gap to one bar.
+    if (nextPeriodKey(ring, collect->keys[index]) != collect->keys[index - 1u])
     {
       continue;
     }
@@ -1464,6 +1538,61 @@ static void appendHoursGraphJson(stringBuilder* sb)
   sbAppendFmt(sb, "%s}", (walked == ESP_OK) ? "true" : "false");
 
   free(collect);
+}
+
+//-- Period graph frames of the SPA: cmd=graph&ring=<hours|days|months>
+//-- answers under type "graph" with the ring echoed.
+static void appendPeriodGraphJson(stringBuilder* sb, loggerMeterRing_t ring)
+{
+  appendPeriodGraphFrame(sb, ring, "graph");
+}
+
+//-- Legacy spelling of the hours ring graph frame (cmd=hoursgraph and
+//-- GET /api/hoursgraph): the same frame as graph&ring=hours, answering
+//-- under the original type name so existing clients keep working.
+static void appendHoursGraphJson(stringBuilder* sb)
+{
+  appendPeriodGraphFrame(sb, LOGGER_RING_HOURS, "hoursgraph");
+}
+
+//-- Actual Graph frame: the rolling table of the newest accepted telegrams
+//-- kept by the receiver (about a hundred samples). Each record carries the
+//-- sample's "HH:MM:SS" time, the unsigned delivered and returned watts per
+//-- phase and the held gas m³/h rate, oldest sample first: the SPA draws
+//-- them left to right, newest at the right edge, so the graph fills from
+//-- the right and scrolls left once the table is full. The sample array is
+//-- heap-allocated: this runs on the small wsPush and httpd task stacks
+//-- too, where a hundred samples do not fit. Out of memory sends an empty
+//-- table.
+static void appendActualGraphJson(stringBuilder* sb)
+{
+  sbAppend(sb, "{\"type\":\"actualgraph\",\"records\":[");
+
+  uint16_t count = 0u;
+  loggerPowerHistorySample* history = malloc(sizeof *history * LOGGER_POWER_HISTORY_CAPACITY);
+
+  if (history != NULL)
+  {
+    count = loggerReceiverGetPowerHistory(history, LOGGER_POWER_HISTORY_CAPACITY);
+
+    for (uint16_t index = 0u; index < count; index++)
+    {
+      sbAppend(sb, (index > 0u) ? "," : "");
+      sbAppend(sb, "{\"time\":");
+      sbAppendJsonString(sb, history[index].timeText);
+      sbAppendFmt(
+          sb, ",\"used\":[%.1f,%.1f,%.1f],\"returned\":[%.1f,%.1f,%.1f],\"gas\":%.3f}",
+          (double)history[index].phaseUsedWatts[0], (double)history[index].phaseUsedWatts[1],
+          (double)history[index].phaseUsedWatts[2], (double)history[index].phaseReturnedWatts[0],
+          (double)history[index].phaseReturnedWatts[1],
+          (double)history[index].phaseReturnedWatts[2], (double)history[index].gasM3h);
+    }
+
+    free(history);
+  }
+
+  sbAppend(sb, "],\"available\":");
+  sbAppendFmt(sb, "%s}", (count > 0u) ? "true" : "false");
 }
 
 //-- Callback of appendTelegramDetailJson: renders one retained record in
@@ -1768,6 +1897,65 @@ static esp_err_t handleHoursGraphGet(httpd_req_t* req)
   return result;
 }
 
+static esp_err_t handleGraphGet(httpd_req_t* req)
+{
+  //-- The usage series of one ring for the Hours, Days and Months Graph
+  //-- views for diagnostics: the same frame the cmd=graph answer sends. The
+  //-- optional ?ring= query selects the ring (hours by default).
+  loggerMeterRing_t ring = LOGGER_RING_HOURS;
+  const char* query = strchr(req->uri, '?');
+
+  if ((query != NULL) && !ringFromParameters(query + 1, &ring))
+  {
+    return sendError(req, 400, "unknown ring");
+  }
+
+  char* buffer = malloc(WEB_HOURSGRAPH_JSON_BYTES);
+
+  if (buffer == NULL)
+  {
+    return sendError(req, 500, "out of memory");
+  }
+
+  stringBuilder sb;
+  sbInit(&sb, buffer, WEB_HOURSGRAPH_JSON_BYTES);
+  appendPeriodGraphJson(&sb, ring);
+
+  if (sb.overflow)
+  {
+    ESP_LOGE(tag, "period graph json overflow");
+  }
+
+  esp_err_t result = sendJson(req, buffer);
+  free(buffer);
+  return result;
+}
+
+static esp_err_t handleActualGraphGet(httpd_req_t* req)
+{
+  //-- The rolling per-phase table of the Actual Graph view for diagnostics:
+  //-- the same frame the cmd=actualgraph answer sends.
+  char* buffer = malloc(WEB_ACTUALGRAPH_JSON_BYTES);
+
+  if (buffer == NULL)
+  {
+    return sendError(req, 500, "out of memory");
+  }
+
+  stringBuilder sb;
+  sbInit(&sb, buffer, WEB_ACTUALGRAPH_JSON_BYTES);
+  appendActualGraphJson(&sb);
+
+  if (sb.overflow)
+  {
+    ESP_LOGE(tag, "actual graph json overflow");
+  }
+
+  esp_err_t result = sendJson(req, buffer);
+  free(buffer);
+  return result;
+}
+
 static esp_err_t handleViewReport(httpd_req_t* req)
 {
   char body[WEB_BODY_MAX];
@@ -1886,6 +2074,45 @@ static void wsHandleCommand(httpd_req_t* req, const char* body)
     return;
   }
 
+  if (strcmp(command, "graph") == 0)
+  {
+    //-- The usage series of one ring for the Hours, Days and Months Graph
+    //-- views: the optional ring selector picks the ring (hours default).
+    loggerMeterRing_t ring = LOGGER_RING_HOURS;
+
+    if (!ringFromParameters(body, &ring))
+    {
+      wsSendReply(req, "{\"type\":\"error\",\"request\":\"graph\",\"error\":\"unknown ring\"}");
+      return;
+    }
+
+    char* buffer = malloc(WEB_HOURSGRAPH_JSON_BYTES);
+
+    if (buffer == NULL)
+    {
+      char oom[96];
+      snprintf(oom, sizeof oom,
+               "{\"type\":\"error\",\"request\":\"graph\",\"ring\":\"%s\","
+               "\"error\":\"out of memory\"}",
+               loggerStoreRingName(ring));
+      wsSendReply(req, oom);
+      return;
+    }
+
+    stringBuilder sb;
+    sbInit(&sb, buffer, WEB_HOURSGRAPH_JSON_BYTES);
+    appendPeriodGraphJson(&sb, ring);
+
+    if (sb.overflow)
+    {
+      ESP_LOGE(tag, "period graph json overflow");
+    }
+
+    wsSendReply(req, buffer);
+    free(buffer);
+    return;
+  }
+
   if (strcmp(command, "hoursgraph") == 0)
   {
     char* buffer = malloc(WEB_HOURSGRAPH_JSON_BYTES);
@@ -1904,6 +2131,31 @@ static void wsHandleCommand(httpd_req_t* req, const char* body)
     if (sb.overflow)
     {
       ESP_LOGE(tag, "hours graph json overflow");
+    }
+
+    wsSendReply(req, buffer);
+    free(buffer);
+    return;
+  }
+
+  if (strcmp(command, "actualgraph") == 0)
+  {
+    char* buffer = malloc(WEB_ACTUALGRAPH_JSON_BYTES);
+
+    if (buffer == NULL)
+    {
+      wsSendReply(req,
+                  "{\"type\":\"error\",\"request\":\"actualgraph\",\"error\":\"out of memory\"}");
+      return;
+    }
+
+    stringBuilder sb;
+    sbInit(&sb, buffer, WEB_ACTUALGRAPH_JSON_BYTES);
+    appendActualGraphJson(&sb);
+
+    if (sb.overflow)
+    {
+      ESP_LOGE(tag, "actual graph json overflow");
     }
 
     wsSendReply(req, buffer);
@@ -2341,6 +2593,8 @@ esp_err_t loggerWebStart(void)
   registerUri(server, "/api/power", HTTP_GET, false, handlePowerGet);
   registerUri(server, "/api/ringfile", HTTP_GET, false, handleRingFileGet);
   registerUri(server, "/api/hoursgraph", HTTP_GET, false, handleHoursGraphGet);
+  registerUri(server, "/api/graph", HTTP_GET, false, handleGraphGet);
+  registerUri(server, "/api/actualgraph", HTTP_GET, false, handleActualGraphGet);
   registerUri(server, "/api/view", HTTP_POST, false, handleViewReport);
   registerUri(server, "/ws", HTTP_GET, true, handleWebSocket);
 

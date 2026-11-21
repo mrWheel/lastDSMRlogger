@@ -174,7 +174,7 @@
            for the total on the same 100..3800 W ladder with one head line
            per bar (phase name left, the coloured measured watt centred,
            ampere and volt chips right), plus a vertical-bar history
-           of the total power across the last 90 accepted measurements kept
+           of the total power across the last 100 accepted measurements kept
            by the device. The name bar prints Phase Load left and a test
            data note right. Hovering a history bar pops up its meter time
            and total watts (app.js). Rows are built by app.js. -->
@@ -235,10 +235,77 @@
            used kWh (red) growing upwards and the returned kWh (green)
            hanging below the line, with a legend above them, and below a
            blue line of the gas m³ per hour with its own legend. Hovering a
-           slot pops up its net kWh (upper panel) or gas m³ (lower panel),
-           without date or time (app.js). -->
+           slot pops up separate chips for the used kWh and the returned
+           kWh (upper panel) or the gas m³ (lower panel); the state line
+           names the API the records come from (/api/ringfile?ring=hours).
+           (app.js). -->
       <div class="hoursGraphWrap">
-        <canvas id="hoursGraphCanvas"></canvas>
+        <canvas id="hoursGraphCanvas" class="graphCanvas"></canvas>
+      </div>
+    </section>
+
+    <section id="viewDaysGraph" class="card" hidden>
+      <h2>Days Graph</h2>
+      <div id="daysGraphState" class="message"></div>
+      <div class="listToolbar">
+        <button id="refreshDaysGraph" type="button">Refresh</button>
+      </div>
+      <!-- The daily usage overview of the days ring (see app.js): the same
+           two stacked panels as the Hours Graph on a shared day axis,
+           rotated weekday labels ("Thursday 22-10") and the API named in
+           the state line (/api/ringfile?ring=days). -->
+      <div class="hoursGraphWrap">
+        <canvas id="daysGraphCanvas" class="graphCanvas"></canvas>
+      </div>
+    </section>
+
+    <section id="viewMonthsGraph" class="card" hidden>
+      <h2>Months Graph</h2>
+      <div id="monthsGraphState" class="message"></div>
+      <div class="listToolbar">
+        <button id="refreshMonthsGraph" type="button">Refresh</button>
+      </div>
+      <!-- The monthly overview of the months ring (see app.js), styled
+           after the monthsGraph mockup: every month is paired with its
+           retained predecessor — used (this period) red next to used
+           (previous) orange above the zero line, returned (this period)
+           dark green next to returned (previous) light green below it —
+           and the gas panel draws this and the previous months' lines. The
+           state line names the API (/api/ringfile?ring=months). -->
+      <div class="hoursGraphWrap">
+        <canvas id="monthsGraphCanvas" class="graphCanvas"></canvas>
+      </div>
+    </section>
+
+    <section id="viewActualGraph" class="card" hidden>
+      <h2>Actual Graph</h2>
+      <div id="actualGraphState" class="message"></div>
+      <div class="listToolbar">
+        <!-- Six checkboxes switch the per-phase series of the stacked bars
+             on and off (see app.js); the watt scale follows the visible
+             series only. -->
+        <div class="ringRadioGroup" id="actualGraphChecks">
+          <label><span class="phaseSwatch" style="background:#ffc2c2"></span><input type="checkbox" data-series="used" data-phase="0" checked> Used L1</label>
+          <label><span class="phaseSwatch" style="background:#ff453a"></span><input type="checkbox" data-series="used" data-phase="1" checked> Used L2</label>
+          <label><span class="phaseSwatch" style="background:#b4000e"></span><input type="checkbox" data-series="used" data-phase="2" checked> Used L3</label>
+          <label><span class="phaseSwatch" style="background:#a7f3c0"></span><input type="checkbox" data-series="returned" data-phase="0" checked> Returned L1</label>
+          <label><span class="phaseSwatch" style="background:#34c759"></span><input type="checkbox" data-series="returned" data-phase="1" checked> Returned L2</label>
+          <label><span class="phaseSwatch" style="background:#0a7d2c"></span><input type="checkbox" data-series="returned" data-phase="2" checked> Returned L3</label>
+        </div>
+        <button id="refreshActualGraph" type="button">Refresh</button>
+      </div>
+      <!-- The realtime per-phase overview (see app.js): the device keeps an
+           internal rolling table of the newest ~100 accepted telegrams
+           (delivered and returned watts per phase plus the held gas m³/h),
+           served by cmd=actualgraph or GET /api/actualgraph. The canvas
+           holds the stacked phase bars on a zero line (three shades of red
+           upwards, three of green downwards, toggled per phase by the
+           checkboxes) and a blue gas line below; the newest sample always
+           sits at the right edge, so the graph fills from the right and
+           shifts left once the table is full. The view polls on the Phase
+           Load timer. -->
+      <div class="hoursGraphWrap">
+        <canvas id="actualGraphCanvas" class="graphCanvas"></canvas>
       </div>
     </section>
   </main>

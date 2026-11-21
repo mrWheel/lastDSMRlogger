@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.c - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-21 · Build: 19
+//-- Date: 2026-11-21 · Build: 20
 //--
 //-- The parserDSMR adapter task owns the parser instance while it runs. The
 //-- event callback copies the complete accepted frame and the decoded fields
@@ -149,6 +149,16 @@ typedef struct
   loggerPowerHistorySample powerHistory[LOGGER_POWER_HISTORY_CAPACITY];
   uint16_t powerHistoryCount;
   uint16_t powerHistoryNext;
+
+  //-- Gas rate tracking behind the Actual Graph's held m³/h figure: the
+  //-- last published gas counter value with the uptime it was seen at, and
+  //-- the rate of its last increase (held until the counter moves again,
+  //-- because the gas field only rides along with every tenth telegram or
+  //-- so). Guarded by the same mutex as the power history ring.
+  bool hasGasBase;
+  float gasLastM3;
+  uint32_t gasLastUptimeMs;
+  float gasRateM3h;
 
   //-- True while a burst was selected and waits for the forwarding task.
   //-- The burst sends the exact bytes from the dedicated forward buffer
@@ -549,6 +559,56 @@ static void extractPowerSnapshot(const loggerTelegramRecord* record, bool testDa
 //-- Time label of one bar history sample: the meter time of OBIS 0-0:1.0.0
 //-- ("HH:MM:SS"), or the device wall clock when the frame published none.
 //-- Empty when neither source is available; the SPA then shows a dash.
+//-- Refreshes the held gas rate from the frame's gas counter (OBIS
+//-- 0-1:24.1.0, with the 0-1:24.2.x readings accepted as fallbacks like on
+//-- the populate import): an increase since the last observation becomes
+//-- its rate per hour, an unchanged counter keeps the previous rate and a
+//-- decrease (a replaced meter) resets the base. The rate is held between
+//-- gas arrivals so the Actual Graph line does not collapse to zero on
+//-- every telegram without a gas reading. Runs on the accepted path under
+//-- the receiver mutex.
+static void updateGasRate(const loggerTelegramRecord* record, uint32_t receiveTimeMs)
+{
+  LoggerReceiver* self = &instance;
+  float gasM3 = 0.0f;
+
+  if (!findNumericField(record, "0-1:24.1.0", &gasM3) &&
+      !findNumericField(record, "0-1:24.2.1", &gasM3) &&
+      !findNumericField(record, "0-1:24.2.3", &gasM3))
+  {
+    return;
+  }
+
+  if (!self->hasGasBase)
+  {
+    self->hasGasBase = true;
+    self->gasLastM3 = gasM3;
+    self->gasLastUptimeMs = receiveTimeMs;
+    return;
+  }
+
+  if (gasM3 == self->gasLastM3)
+  {
+    return;
+  }
+
+  uint32_t deltaMs = receiveTimeMs - self->gasLastUptimeMs;
+
+  if ((deltaMs > 0u) && (gasM3 > self->gasLastM3))
+  {
+    self->gasRateM3h = (gasM3 - self->gasLastM3) / ((float)deltaMs / 3600000.0f);
+  }
+  else
+  {
+    //-- Counter reset (or two readings in the same millisecond): drop the
+    // held rate instead of crediting a whole counter lifetime to one frame.
+    self->gasRateM3h = 0.0f;
+  }
+
+  self->gasLastM3 = gasM3;
+  self->gasLastUptimeMs = receiveTimeMs;
+}
+
 static void fillPowerHistoryTime(const loggerTelegramRecord* record, char* out, size_t outSize)
 {
   if (record->meta.meterTimeText[0] != '\0')
@@ -894,12 +954,23 @@ static void onParserEvent(const dsmrParser* parser, const dsmrParserEvent* event
     self->hasLastPower = true;
 
     //-- One bar history sample per accepted telegram: the ring keeps the
-    //-- newest totals (with the meter time they belong to) for the SPA
-    //-- realtime view across reloads and view switches, independent of what
-    //-- any browser is watching.
-    self->powerHistory[self->powerHistoryNext].watts = powerSnapshot.totalWatts;
-    fillPowerHistoryTime(stagingRecord, self->powerHistory[self->powerHistoryNext].timeText,
-                         sizeof self->powerHistory[self->powerHistoryNext].timeText);
+    //-- newest totals, per-phase magnitudes and held gas rate (with the
+    //-- meter time they belong to) for the SPA realtime views across
+    //-- reloads and view switches, independent of what any browser is
+    //-- watching. The Actual Graph reads its rolling phase table from the
+    //-- very same ring.
+    loggerPowerHistorySample* historySample = &self->powerHistory[self->powerHistoryNext];
+    updateGasRate(stagingRecord, result->receiveTimeMs);
+    historySample->watts = powerSnapshot.totalWatts;
+
+    for (uint8_t phase = 0u; phase < 3u; phase++)
+    {
+      historySample->phaseUsedWatts[phase] = powerSnapshot.phaseDeliveredWatts[phase];
+      historySample->phaseReturnedWatts[phase] = powerSnapshot.phaseReturnedWatts[phase];
+    }
+
+    historySample->gasM3h = self->gasRateM3h;
+    fillPowerHistoryTime(stagingRecord, historySample->timeText, sizeof historySample->timeText);
     self->powerHistoryNext =
         (uint16_t)((self->powerHistoryNext + 1u) % LOGGER_POWER_HISTORY_CAPACITY);
 

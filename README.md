@@ -1,14 +1,15 @@
 # lastDSMRlogger
 
-Buildnumber: 34
+Buildnumber: 36
 Last update-date: 2026-11-21
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
-shows recent telegrams in a single-page web application with five views:
+shows recent telegrams in a single-page web application with eight views:
 Settings, Telegrams, Phase Load (a web replica of the on-device power
-panel), Show RingFile and Hours Graph. Configuration is stored in NVS and survives a power
-cycle; the recent telegram history lives in RAM.
+panel), Show RingFile, Hours Graph, Days Graph, Months Graph and Actual
+Graph. Configuration is stored in NVS and survives a power cycle; the recent
+telegram history lives in RAM.
 
 ## 1. Project layout
 
@@ -200,7 +201,7 @@ the device.
   sends it), each row carrying its current and voltage chips and its
   signed watt value centred above the bar with animated fills. Below
   the bars a vertical-bar history follows the total power across the last
-  90 accepted measurements kept by the device (one sample per accepted
+  100 accepted measurements kept by the device (one sample per accepted
   telegram, so the history survives page reloads, reconnects and view
   switches): one centre-zero bar per telegram with a brighter cap at the
   value end, drawn over very thin scale division lines every quarter step
@@ -215,20 +216,56 @@ the device.
   meter counters (kWh and m³) and the three fictional tariff amounts (EUR).
   `cmd=ringfile&ring=<period>` on the WebSocket, `GET /api/ringfile` with
   the optional `?ring=` query serve the same JSON.
-- **Hours Graph**: the hourly usage overview of the hours ring, styled after
-  the `assets/hoursGraph.jpeg` mockup: two stacked panels on one shared hour
-  axis (oldest hour left, newest right). The upper panel carries grouped
-  bars per hour for the used (red) and returned (green) kWh with a centred
-  legend; the lower panel a blue line of the gas m³ per hour with its own
-  legend. Each panel has grid lines with y labels, a unit label and rotated
-  hour labels; hovering a slot pops up the hour with its three amounts. The
-  device turns the retained cumulative counters into per-hour differences
-  (`cmd=hoursgraph`, or `GET /api/hoursgraph`): the oldest record has no
-  predecessor and is left out, a counter reset is clamped to zero, an hour
-  that does not directly follow its retained predecessor (imported history
-  ending in the past, hours aged out of the ring) is left out so the gap
-  shows as a hole instead of one giant bar, and a Refresh button
-  re-requests the series (switching to the view requests it too).
+- **Hours Graph / Days Graph / Months Graph**: the usage overview of one
+  meter ring, styled after the `assets/hoursGraph.png`,
+  `assets/daysGraph.png` and `assets/monthsGraph.png` mockups: two stacked
+  panels on one shared period axis (oldest period left, newest right). The
+  upper panel carries bars for the used (red) and returned (green) kWh on a
+  zero line with a centred legend; the lower panel a blue line of the gas
+  m³ per period with its own legend. On the months view every period is
+  paired with its retained predecessor (like the monthsGraph mockup): the
+  used pair — red this period, orange previous — stands side by side above
+  the zero line, the returned pair — dark green this period, light green
+  previous — below it, and the gas panel draws both lines (blue this
+  period, light blue previous). Each panel has grid lines with y labels, a
+  unit label and rotated period labels (hours `19-11 16:00`, days
+  `Thursday 22-10`, months `November`, January carrying the year); the
+  label band is sized to the slanted text, so nothing is cut off and no
+  dead space survives between the panels. Hovering a slot pops up separate
+  chips: one for the used kWh and one for the returned kWh riding along
+  their bar on the energy panel, one for the gas m³ over the gas panel; the
+  state line names the API the records come from
+  (`/api/ringfile?ring=hours|days|months`). The device turns the retained
+  cumulative counters into per-period differences
+  (`cmd=graph&ring=<period>`, or `GET /api/graph?ring=<period>`;
+  `cmd=hoursgraph` and `GET /api/hoursgraph` remain as the hours spelling):
+  the oldest record has no predecessor and is left out, a counter reset is
+  clamped to zero, a period that does not directly follow its retained
+  predecessor (imported history ending in the past, periods aged out of the
+  ring) is left out so the gap shows as a hole instead of one giant bar,
+  and a Refresh button re-requests the series (switching to the view
+  requests it too). Note the P1 telegram publishes energy counters only as
+  totals — the days and months graphs therefore aggregate all three phases
+  (the per-phase mockup bars are not derivable from stored data).
+- **Actual Graph**: the realtime per-phase power overview, styled after the
+  `assets/actualGraph.png` mockup. The device keeps an internal rolling
+  table of the newest ~100 accepted telegrams in RAM: per sample the
+  unsigned delivered and returned watts of each phase (OBIS
+  `1-0:21/41/61.7.0` and `1-0:22/42/62.7.0`), the gas m³/h rate of the last
+  observed gas-counter increase (held between gas arrivals) and the sample
+  time. `cmd=actualgraph` (or `GET /api/actualgraph`) hands the table over
+  oldest first. The upper panel stacks the used watts upwards (light red
+  L1, red L2, dark red L3) and the returned watts downwards (light green
+  L1, green L2, dark green L3), every phase keeping its own colour and its
+  own slab with a white hairline on each phase boundary; six checkboxes
+  switch each phase series on and off and the watt scale follows the
+  visible series only. The lower panel carries the blue gas line. The
+  rotated time labels hang under the plotted bars, not under the empty
+  left of the plot. The newest sample always sits at the
+  right edge of the 100-slot plot: the graph fills from the right and
+  shifts one slot left with every accepted telegram once the table is
+  full. The view polls on the Phase Load timer; hovering a slot pops up a
+  chip with the sample time, the per-phase kW and the gas m³/h.
 
 On-device TFT debug lines show the active browser screen, the last accepted
 telegram, and the Wi-Fi portal/connected state. With the first accepted
@@ -292,16 +329,18 @@ firmware boots.
 
 |Method |Path                        |Purpose                                                       |
 |-------|----------------------------|--------------------------------------------------------------|
-|WS     |`/ws`                       |SPA transport: status/telegram/power pushes + `cmd=config\|save\|status\|telegrams\|telegram\|raw\|power\|ringfile\|hoursgraph\|view`, raw bytes as binary frame |
+|WS     |`/ws`                       |SPA transport: status/telegram/power pushes + `cmd=config\|save\|status\|telegrams\|telegram\|raw\|power\|ringfile\|graph\|actualgraph\|hoursgraph\|view`, raw bytes as binary frame |
 |GET    |`/api/config`               |NVS settings + active state + valid choices (data sources, interval bounds, countries, profiles) |
 |POST   |`/api/config`               |Save form-urlencoded settings incl. `rxGpio`, `rxInverted` (0/1) and `interval` (interval clamped to 2..600; one atomic operation) |
 |GET    |`/api/status`               |Reception state, counters, last diagnostic, uptime            |
 |GET    |`/api/telegrams`            |Metadata of retained records (incl. `meterTimeText` from OBIS `0-0:1.0.0`), newest first |
 |GET    |`/api/telegram/<seq>`       |Decoded detail of one record                                  |
 |GET    |`/api/telegram/<seq>/raw`   |Exact accepted frame bytes as `text/plain`                    |
-|GET    |`/api/power`                |Realtime power frame of the newest accepted telegram (phases and total watts/amps/volts, meter time, scale ladder step, history of the newest 90 accepted total watts) |
+|GET    |`/api/power`                |Realtime power frame of the newest accepted telegram (phases and total watts/amps/volts, meter time, scale ladder step, history of the newest 100 accepted total watts) |
 |GET    |`/api/ringfile`             |Records of one meter ring (`?ring=hours\|days\|months`, hours by default), newest first |
-|GET    |`/api/hoursgraph`           |Per-hour used/returned kWh and gas m³ of the hours ring (differences of consecutive counters), oldest first |
+|GET    |`/api/graph`                |Per-period used/returned kWh and gas m³ of one ring (`?ring=hours\|days\|months`, hours by default; differences of consecutive counters), oldest first |
+|GET    |`/api/hoursgraph`           |Legacy spelling of `/api/graph?ring=hours` (answers under type `hoursgraph`) |
+|GET    |`/api/actualgraph`          |Rolling table of the newest ~100 accepted telegrams: delivered and returned watts per phase, held gas m³/h and sample time, oldest first |
 |POST   |`/api/view`                 |Reports the active browser screen name to the device display  |
 
 ### Test data mode

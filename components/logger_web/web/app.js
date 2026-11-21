@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-21 · Build: 25
+// Date: 2026-11-21 · Build: 27
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -9,7 +9,7 @@
 // device pushes status, the telegram list and the realtime power frame, the
 // browser sends form-urlencoded commands (cmd=config, cmd=save,
 // cmd=telegram, cmd=raw, cmd=view, cmd=telegrams, cmd=power,
-// cmd=ringfile, cmd=hoursgraph). Raw telegram
+// cmd=ringfile, cmd=graph&ring=hours|days|months, cmd=actualgraph). Raw telegram
 // bytes arrive as a binary frame
 // behind their JSON header. Every rendering path uses textContent so
 // telegram text is never interpreted as HTML. The active screen name is
@@ -69,7 +69,13 @@ const VIEWS =
   {id: "ringfile", label: "Show RingFile", section: "viewRingFile",
    command: () => "cmd=ringfile&ring=" + selectedRing()},
   {id: "hoursGraph", label: "Hours Graph", section: "viewHoursGraph",
-   command: "cmd=hoursgraph"},
+   command: "cmd=graph&ring=hours"},
+  {id: "daysGraph", label: "Days Graph", section: "viewDaysGraph",
+   command: "cmd=graph&ring=days"},
+  {id: "monthsGraph", label: "Months Graph", section: "viewMonthsGraph",
+   command: "cmd=graph&ring=months"},
+  {id: "actualGraph", label: "Actual Graph", section: "viewActualGraph",
+   command: "cmd=actualgraph"},
 ];
 
 // Resolves a view's command: either a fixed string or a function evaluated
@@ -102,7 +108,11 @@ function bindElements()
                "powerScaleLabel", "powerSpark",
                "ringFileState", "refreshRingFile", "ringFileTable", "ringFileKeyHeader",
                "hoursGraphState", "refreshHoursGraph", "hoursGraphCanvas",
+               "daysGraphState", "refreshDaysGraph", "daysGraphCanvas",
+               "monthsGraphState", "refreshMonthsGraph", "monthsGraphCanvas",
+               "actualGraphState", "refreshActualGraph", "actualGraphCanvas", "actualGraphChecks",
                "viewSettings", "viewTelegrams", "viewPower", "viewRingFile", "viewHoursGraph",
+               "viewDaysGraph", "viewMonthsGraph", "viewActualGraph",
                "takeoverModal", "takeoverMessage", "takeoverTakeBack"];
 
   ids.forEach((id) =>
@@ -283,8 +293,19 @@ function handleTextMessage(message)
       renderRingFileList(message);
       break;
 
+    case "graph":
+      handleGraphMessage(message);
+      break;
+
     case "hoursgraph":
-      renderHoursGraph(message);
+      // Legacy frame (the old cmd=hoursgraph spelling answers under the
+      // original type name): route it to the hours view.
+      handleGraphMessage({ring: message.ring || "hours", records: message.records,
+                          available: message.available});
+      break;
+
+    case "actualgraph":
+      renderActualGraph(message);
       break;
 
     case "raw":
@@ -360,7 +381,24 @@ function handleServerError(message)
   }
   else if (message.request === "hoursgraph")
   {
-    setHoursGraphState(message.error || "Hours graph unavailable.");
+    setPeriodGraphState("hoursGraph", message.error || "Hours graph unavailable.");
+  }
+  else if (message.request === "graph")
+  {
+    // The frame echoes the ring when the device knew it; without it (the
+    // error came before the selector was parsed) report on the open graph
+    // view, since only that one requests series.
+    const viewId = graphViewByRing(message.ring) ||
+                   ((state.screen in PERIOD_GRAPHS) ? state.screen : null);
+
+    if (viewId !== null)
+    {
+      setPeriodGraphState(viewId, message.error || "Graph unavailable.");
+    }
+  }
+  else if (message.request === "actualgraph")
+  {
+    setActualGraphState(message.error || "Actual graph unavailable.");
   }
   else
   {
@@ -953,7 +991,7 @@ function renderDetail(detail)
 // the phase name left, the measured watt centred (the only coloured text:
 // red consumption, green feed-in) and the ampere and volt chips right.
 // Below the bars a vertical-bar history follows the total power
-// across the last 90 accepted measurements kept by the device: one
+// across the last 100 accepted measurements kept by the device: one
 // centre-zero bar per accepted telegram on hairline scale division lines.
 const POWER_ROWS =
 [
@@ -963,10 +1001,10 @@ const POWER_ROWS =
   {label: "Total"},
 ];
 
-// The device keeps and sends the newest 90 accepted total watts for the
+// The device keeps and sends the newest 100 accepted total watts for the
 // bar history (one sample per accepted telegram, oldest first); this cap
 // also guards the local fallback of older firmware without the array.
-const POWER_HISTORY_MAX = 90;
+const POWER_HISTORY_MAX = 100;
 
 const powerRowRefs = [];
 let powerTimer = null;
@@ -1117,8 +1155,8 @@ function renderPower(message)
     row.voltsChip.classList.toggle("dim", volts <= 0);
   });
 
-  // The device keeps the last 90 accepted total watts and sends them with
-  // every frame, oldest first: the history then always shows the last 90
+  // The device keeps the last 100 accepted total watts and sends them with
+  // every frame, oldest first: the history then always shows the last 100
   // accepted measurements, across reloads, reconnects and view switches.
   // Without the array (older firmware) fall back to sampling the pushed
   // frames locally: one sample per newly accepted telegram.
@@ -1461,96 +1499,78 @@ function renderRingFileList(message)
 }
 
 //-- --------------------------------------------------------------------------
-//-- Hours Graph view
+//-- Period Graph views (Hours, Days and Months)
 //-- --------------------------------------------------------------------------
 
-// The device turns the retained cumulative counters of the hours ring into
-// per-hour amounts (cmd=hoursgraph) and sends them oldest first, so the
-// graph reads left to right like the hoursGraph mockup: two stacked panels
-// on one shared hour axis. The upper panel carries one bar per hour on a
-// zero line in the middle of the panel: the used kWh (red) grow upwards and
-// the returned kWh (green) hang below the zero line, with a centred legend;
-// the lower panel carries a blue line of the gas m³ per hour with its own
-// legend. Each panel has grid lines, y labels and rotated hour labels.
-// Hovering a slot pops up the net kWh (upper) or the gas m³ (lower) of that
-// hour, without date or time. Everything is drawn straight from the frame's
-// numbers, nothing is interpreted.
+// The device turns the retained cumulative counters of one meter ring into
+// per-period amounts (cmd=graph&ring=<hours|days|months>) and sends them
+// oldest first, so every graph reads left to right like its mockup: two
+// stacked panels on one shared period axis. The upper panel carries one bar
+// per period on a zero line: the used kWh (red) grow upwards and the
+// returned kWh (green) hang below the zero line, with a centred legend; the
+// lower panel carries a blue line of the gas m³ per period with its own
+// legend. The months view pairs every period with its retained predecessor:
+// the used pair (red this period, orange previous) stands side by side
+// above the zero line, the returned pair (dark green this period, light
+// green previous) below it, and the gas panel draws both lines (blue this
+// period, light blue previous). Each panel has grid lines, y labels and
+// rotated period labels; the label band reserves exactly the room the
+// slanted text needs, so nothing is cut off and no dead space is left
+// between the panels. Hovering a slot pops up a separate chip per series:
+// the used kWh and the returned kWh each get their own chip riding along
+// their bar on the energy panel, the gas m³ gets one over the gas panel.
+// The state line names the on-device API that serves the underlying ring
+// records. Everything is drawn straight from the frame's numbers, nothing
+// is interpreted.
 
-const HOURS_GRAPH =
+const PERIOD_GRAPHS =
 {
-  height: 356,
+  hoursGraph: {ring: "hours", unitWord: "hour", api: "/api/ringfile?ring=hours", labelsHeight: 46},
+  daysGraph: {ring: "days", unitWord: "day", api: "/api/ringfile?ring=days", labelsHeight: 68},
+  monthsGraph: {ring: "months", unitWord: "month", api: "/api/ringfile?ring=months", labelsHeight: 40},
+};
+
+const GRAPH_COLORS =
+{
+  used: "#ff3b30",
+  returned: "#34c759",
+  usedPrevious: "#ff9500",
+  returnedPrevious: "#8ce99a",
+  gas: "#007aff",
+  gasPrevious: "#a5d8ff",
+};
+
+const GRAPH_LAYOUT =
+{
   marginLeft: 46,
   marginRight: 10,
   legendHeight: 16,
   panelHeight: 140,
   gasPanelHeight: 100,
-  labelsHeight: 32,
-  panelGap: 12,
+  panelGap: 14,
+  bottomPad: 8,
 };
 
-const HOURS_GRAPH_COLORS =
+// Grid ladders: the smallest step whose fifth grid line still reaches the
+// panel's maximum (an empty panel keeps the given plain scale).
+const KWH_STEPS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
+const WATT_STEPS = [50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000];
+
+// Per-view rendering state: the newest frame's records, the drawing
+// geometry of the newest canvas frame (for the hover popup), the mouse
+// position inside the canvas (null: outside) and the popup chips.
+const periodGraphs = {};
+
+Object.keys(PERIOD_GRAPHS).forEach((viewId) =>
 {
-  used: "#ff3b30",
-  returned: "#34c759",
-  gas: "#007aff",
-};
+  periodGraphs[viewId] = {records: [], layout: null, hoverX: null, hoverY: null, tips: null};
+});
 
-// Newest frame and the drawing geometry of the newest canvas frame (for
-// the hover popup), plus the mouse position inside the canvas (null:
-// outside). The popup follows the panel the cursor is over: the kWh panel
-// shows the net consumption of the hour, the gas panel the gas m³.
-let hoursGraphRecords = [];
-let hoursGraphLayout = null;
-let hoursGraphHoverX = null;
-let hoursGraphHoverY = null;
-let hoursGraphTip = null;
-
-function setHoursGraphState(message)
+function graphStep(maxValue, steps, emptyStep)
 {
-  el.hoursGraphState.textContent = message;
-}
-
-function renderHoursGraph(message)
-{
-  hoursGraphRecords = Array.isArray(message.records) ? message.records : [];
-
-  if (hoursGraphRecords.length === 0)
-  {
-    setHoursGraphState(message.available
-                       ? "No complete hour records stored yet (is the clock synchronised?)."
-                       : "The meter store is not running on the device.");
-  }
-  else
-  {
-    setHoursGraphState(hoursGraphRecords.length + " hour(s) plotted, oldest first" +
-                       (message.available ? "" : " (the device walk did not finish)"));
-  }
-
-  drawHoursGraph();
-}
-
-// Wall-clock hour key as the axis reads it: 26111916 becomes "19-11 16:00".
-function hoursGraphHourLabel(key)
-{
-  const text = String(key).padStart(8, "0");
-
-  if (!/^\d{8}$/.test(text))
-  {
-    return text;
-  }
-
-  return text.slice(4, 6) + "-" + text.slice(2, 4) + " " + text.slice(6, 8) + ":00";
-}
-
-// Grid step of a panel: the smallest ladder step whose fifth grid line
-// still reaches the panel's maximum; an empty panel keeps a plain 1-scale.
-function hoursGraphStep(maxValue)
-{
-  const steps = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
-
   if (!(maxValue > 0))
   {
-    return 1;
+    return emptyStep;
   }
 
   for (const step of steps)
@@ -1564,9 +1584,222 @@ function hoursGraphStep(maxValue)
   return steps[steps.length - 1];
 }
 
-function hoursGraphScale(maxValue, step)
+function graphScale(maxValue, step)
 {
   return Math.max(step, Math.ceil(maxValue / step) * step);
+}
+
+function graphViewByRing(ring)
+{
+  const found = Object.keys(PERIOD_GRAPHS).find((viewId) => PERIOD_GRAPHS[viewId].ring === ring);
+
+  return found || null;
+}
+
+function setPeriodGraphState(viewId, message)
+{
+  el[viewId + "State"].textContent = message;
+}
+
+function handleGraphMessage(message)
+{
+  const viewId = graphViewByRing(message.ring);
+
+  if (viewId !== null)
+  {
+    renderPeriodGraph(viewId, message);
+  }
+}
+
+function renderPeriodGraph(viewId, message)
+{
+  const config = PERIOD_GRAPHS[viewId];
+  const graph = periodGraphs[viewId];
+  graph.records = Array.isArray(message.records) ? message.records : [];
+
+  if (graph.records.length === 0)
+  {
+    setPeriodGraphState(viewId, message.available
+                                ? "No complete " + config.unitWord +
+                                  " records stored yet (is the clock synchronised?)."
+                                : "The meter store is not running on the device.");
+  }
+  else
+  {
+    setPeriodGraphState(viewId, graph.records.length + " " + config.unitWord + "(s) plotted · " +
+                                config.api +
+                                (message.available ? "" : " (the device walk did not finish)"));
+  }
+
+  drawPeriodGraph(viewId);
+}
+
+const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August",
+                     "September", "October", "November", "December"];
+
+// Days of a 2-digit year (20YY): the calendar the period keys need to ask
+// whether two keys name directly consecutive periods.
+function daysInMonth2000(year2, month)
+{
+  const daysPerMonth = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+  if ((month === 2) && (((2000 + year2) % 4) === 0) &&
+      (((2000 + year2) % 100) !== 0 || ((2000 + year2) % 400) === 0))
+  {
+    return 29;
+  }
+
+  return (month >= 1 && month <= 12) ? daysPerMonth[month - 1] : 31;
+}
+
+// Weekday of a 20YY calendar day (Zeller's congruence), as DAY_NAMES index.
+function dayNameOf2000(year2, month, day)
+{
+  let year = 2000 + year2;
+  let monthIndex = month;
+
+  if (monthIndex < 3)
+  {
+    monthIndex += 12;
+    year -= 1;
+  }
+
+  const century = Math.floor(year / 100);
+  const yearOfCentury = year % 100;
+  const zeller = (day + Math.floor((13 * (monthIndex + 1)) / 5) + yearOfCentury +
+                  Math.floor(yearOfCentury / 4) + Math.floor(century / 4) + (5 * century)) % 7;
+
+  return DAY_NAMES[(zeller + 6) % 7];
+}
+
+// The key of the period that follows a period key, calendar carry over in
+// the ring's own key shape (YYMMDDhh, YYMMDD or YYMM): the same adjacency
+// check the device applied when it built the series, so the months view can
+// recognise a true predecessor across a hole in the ring.
+function nextPeriodKey(ring, key)
+{
+  const value = Number(key);
+
+  if (!Number.isFinite(value) || value < 0)
+  {
+    return -1;
+  }
+
+  let rest = Math.floor(value);
+  let hour = 0;
+  let day = 1;
+  let month = 1;
+
+  if (ring === "hours")
+  {
+    hour = rest % 100;
+    rest = Math.floor(rest / 100);
+  }
+
+  if (ring !== "months")
+  {
+    day = rest % 100;
+    rest = Math.floor(rest / 100);
+  }
+
+  month = rest % 100;
+  let year2 = Math.floor(rest / 100);
+
+  if (ring === "hours")
+  {
+    hour += 1;
+
+    if (hour > 23)
+    {
+      hour = 0;
+      day += 1;
+    }
+
+    if (day > daysInMonth2000(year2, month))
+    {
+      day = 1;
+      month += 1;
+    }
+  }
+  else if (ring === "days")
+  {
+    day += 1;
+
+    if (day > daysInMonth2000(year2, month))
+    {
+      day = 1;
+      month += 1;
+    }
+  }
+  else
+  {
+    month += 1;
+  }
+
+  if (month > 12)
+  {
+    month = 1;
+    year2 = (year2 + 1) % 100;
+  }
+
+  let result = year2 * 100 + month;
+
+  if (ring !== "months")
+  {
+    result = result * 100 + day;
+  }
+
+  if (ring === "hours")
+  {
+    result = result * 100 + hour;
+  }
+
+  return result;
+}
+
+// The period key as the axis reads it: 26111916 becomes "19-11 16:00" on
+// the hours ring, 261119 becomes "Thursday 22-10" on the days ring and 2611
+// becomes "November" on the months ring (January carries the two-digit
+// year, so every year opens under a named month).
+function periodGraphLabel(ring, key)
+{
+  const digits = (ring === "hours") ? 8 : ((ring === "days") ? 6 : 4);
+  const text = String(key).padStart(digits, "0");
+
+  if (!new RegExp("^\\d{" + digits + "}$").test(text))
+  {
+    return String(key);
+  }
+
+  const year2 = Number(text.slice(0, 2));
+  const month = Number(text.slice(2, 4));
+
+  if (ring === "months")
+  {
+    if (month < 1 || month > 12)
+    {
+      return text;
+    }
+
+    return (month === 1) ? (MONTH_NAMES[0] + " " + text.slice(0, 2)) : MONTH_NAMES[month - 1];
+  }
+
+  const day = Number(text.slice(4, 6));
+
+  if (ring === "days")
+  {
+    const name = dayNameOf2000(year2, month, day);
+
+    if (day < 1 || day > daysInMonth2000(year2, month) || month < 1 || month > 12)
+    {
+      return text;
+    }
+
+    return name + " " + text.slice(4, 6) + "-" + text.slice(2, 4);
+  }
+
+  return text.slice(4, 6) + "-" + text.slice(2, 4) + " " + text.slice(6, 8) + ":00";
 }
 
 // One panel's furniture: the centred legend row above it, the horizontal
@@ -1575,7 +1808,7 @@ function hoursGraphScale(maxValue, step)
 // shared step; scaleBottom is negative when the panel hangs bars below the
 // zero line, zero for a plain 0-based panel). The bars or line of the panel
 // are drawn by the caller on top of this.
-function drawHoursPanelFrame(ctx, panel, step, scaleTop, scaleBottom, unit, legendEntries, plotLeft, plotWidth)
+function drawGraphPanelFrame(ctx, panel, step, scaleTop, scaleBottom, unit, legendEntries, plotLeft, plotWidth)
 {
   const gridColor = cssVar("--separator", "rgba(60, 60, 67, 0.12)");
   const axisColor = cssVar("--hairline", "rgba(60, 60, 67, 0.29)");
@@ -1661,9 +1894,15 @@ function drawHoursPanelFrame(ctx, panel, step, scaleTop, scaleBottom, unit, lege
   return yOf;
 }
 
-// Rotated hour labels under a panel; every k-th slot gets one so the
-// slanted text never collides at narrow pitches.
-function drawHoursTimeLabels(ctx, records, belowY, slot, plotLeft)
+// Rotated period labels under a panel, hung from their tick to the lower
+// left like the mockups. Every k-th slot gets one: k is picked from the
+// widest label (its slant runs 0.707 of its width down and as far to the
+// left), so the slanted text never collides at narrow pitches and never
+// needs more than the panel's labelsHeight reserve. firstSlot shifts the
+// ticks right, so a right-aligned series (the Actual Graph's newest sample
+// in the last slot) gets its labels under its bars and not under the empty
+// left of the plot.
+function drawGraphTimeLabels(ctx, records, belowY, slot, plotLeft, labelOf, firstSlot)
 {
   ctx.save();
   ctx.font = "9px " + cssVar("--mono", "monospace");
@@ -1671,7 +1910,14 @@ function drawHoursTimeLabels(ctx, records, belowY, slot, plotLeft)
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
 
-  const labelEvery = Math.max(1, Math.ceil(26 / slot));
+  let widest = 0;
+
+  records.forEach((record) =>
+  {
+    widest = Math.max(widest, ctx.measureText(String(labelOf(record))).width);
+  });
+
+  const labelEvery = Math.max(1, Math.ceil((widest * Math.SQRT1_2 + 8) / slot));
 
   records.forEach((record, index) =>
   {
@@ -1681,27 +1927,176 @@ function drawHoursTimeLabels(ctx, records, belowY, slot, plotLeft)
     }
 
     ctx.save();
-    ctx.translate(plotLeft + (index + 0.5) * slot, belowY + 26);
+    ctx.translate(plotLeft + ((firstSlot || 0) + index + 0.5) * slot, belowY + 6);
     ctx.rotate(-Math.PI / 4);
-    ctx.fillText(hoursGraphHourLabel(record.key), 0, 0);
+    ctx.fillText(String(labelOf(record)), 0, 0);
     ctx.restore();
   });
 
   ctx.restore();
 }
 
-function drawHoursGraph()
+// Blue line of a panel value with a dot per record (the gas series of the
+// period graphs and the Actual Graph). Null values start a new segment, so
+// the previous-period line of the months graph simply breaks where the
+// ring holds no predecessor.
+function drawGraphLine(ctx, values, firstSlot, slot, plotLeft, yOf, color)
 {
-  const canvas = el.hoursGraphCanvas;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+
+  let open = false;
+
+  values.forEach((value, index) =>
+  {
+    if (value === null)
+    {
+      open = false;
+      return;
+    }
+
+    const x = plotLeft + (firstSlot + index + 0.5) * slot;
+    const y = yOf(value);
+
+    if (open)
+    {
+      ctx.lineTo(x, y);
+    }
+    else
+    {
+      ctx.moveTo(x, y);
+      open = true;
+    }
+  });
+
+  ctx.stroke();
+
+  ctx.fillStyle = color;
+
+  values.forEach((value, index) =>
+  {
+    if (value === null)
+    {
+      return;
+    }
+
+    ctx.beginPath();
+    ctx.arc(plotLeft + (firstSlot + index + 0.5) * slot, yOf(value), 1.8, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+
+// The record that pairs with the one at index as its direct predecessor:
+// only the array entry just before it, and only when the two keys name
+// directly consecutive periods (the series can hold a hole).
+function periodPreviousRecord(records, index, ring)
+{
+  if (index === 0)
+  {
+    return null;
+  }
+
+  const previous = records[index - 1];
+
+  return (nextPeriodKey(ring, previous.key) === Number(records[index].key)) ? previous : null;
+}
+
+// Used/returned bars on the energy panel: one bar pair per record (red
+// upwards from the zero line, green hanging below it).
+function drawPeriodBars(ctx, records, slot, plotLeft, yOfEnergy)
+{
+  const barWidth = Math.max(2, slot * 0.6);
+  const zeroY = yOfEnergy(0);
+
+  records.forEach((record, index) =>
+  {
+    const centre = plotLeft + (index + 0.5) * slot;
+    const barX = centre - barWidth / 2;
+
+    const entries =
+    [
+      {value: record.used || 0, color: GRAPH_COLORS.used, to: yOfEnergy(record.used || 0)},
+      {value: record.returned || 0, color: GRAPH_COLORS.returned, to: yOfEnergy(-(record.returned || 0))},
+    ];
+
+    entries.forEach((bar) =>
+    {
+      if (bar.value <= 0)
+      {
+        return;
+      }
+
+      const top = Math.min(zeroY, bar.to);
+      const bottom = Math.max(zeroY, bar.to);
+      ctx.fillStyle = bar.color;
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(barX, top, barWidth, bottom - top);
+      ctx.globalAlpha = 1;
+    });
+  });
+}
+
+// Months view: every period stands next to its retained predecessor, used
+// pair above the zero line (red this period, orange previous), returned
+// pair below it (dark green this period, light green previous). A period
+// without a retained predecessor draws its pair alone, like the mockup's
+// first months.
+function drawPeriodBarsPaired(ctx, records, slot, plotLeft, yOfEnergy, ring)
+{
+  const pairWidth = Math.max(4, slot * 0.7);
+  const barWidth = Math.max(1, (pairWidth - 1) / 2);
+  const zeroY = yOfEnergy(0);
+
+  records.forEach((record, index) =>
+  {
+    const centre = plotLeft + (index + 0.5) * slot;
+    const leftX = centre - pairWidth / 2;
+    const rightX = leftX + barWidth + 1;
+    const previous = periodPreviousRecord(records, index, ring);
+
+    const bars =
+    [
+      {x: leftX, value: record.used || 0, color: GRAPH_COLORS.used, above: true},
+      {x: rightX, value: previous ? (previous.used || 0) : 0, color: GRAPH_COLORS.usedPrevious, above: true},
+      {x: leftX, value: record.returned || 0, color: GRAPH_COLORS.returned, above: false},
+      {x: rightX, value: previous ? (previous.returned || 0) : 0, color: GRAPH_COLORS.returnedPrevious, above: false},
+    ];
+
+    bars.forEach((bar) =>
+    {
+      if (bar.value <= 0)
+      {
+        return;
+      }
+
+      const end = bar.above ? yOfEnergy(bar.value) : yOfEnergy(-bar.value);
+      const top = Math.min(zeroY, end);
+      const bottom = Math.max(zeroY, end);
+      ctx.fillStyle = bar.color;
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(bar.x, top, barWidth, bottom - top);
+      ctx.globalAlpha = 1;
+    });
+  });
+}
+
+function drawPeriodGraph(viewId)
+{
+  const canvas = el[viewId + "Canvas"];
 
   if (canvas === null)
   {
     return;
   }
 
+  const config = PERIOD_GRAPHS[viewId];
+  const graph = periodGraphs[viewId];
   const wrap = canvas.parentElement;
   const cssWidth = Math.max(320, wrap.clientWidth - 16);
-  const cssHeight = HOURS_GRAPH.height;
+  const cssHeight = GRAPH_LAYOUT.legendHeight + GRAPH_LAYOUT.panelHeight + config.labelsHeight +
+                    GRAPH_LAYOUT.panelGap + GRAPH_LAYOUT.legendHeight +
+                    GRAPH_LAYOUT.gasPanelHeight + config.labelsHeight + GRAPH_LAYOUT.bottomPad;
   const dpr = window.devicePixelRatio || 1;
 
   canvas.width = Math.round(cssWidth * dpr);
@@ -1713,23 +2108,25 @@ function drawHoursGraph()
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, cssWidth, cssHeight);
 
-  const records = hoursGraphRecords;
-  const plotLeft = HOURS_GRAPH.marginLeft;
-  const plotWidth = Math.max(10, cssWidth - plotLeft - HOURS_GRAPH.marginRight);
+  const records = graph.records;
+  const plotLeft = GRAPH_LAYOUT.marginLeft;
+  const plotWidth = Math.max(10, cssWidth - plotLeft - GRAPH_LAYOUT.marginRight);
   const slot = (records.length > 0) ? (plotWidth / records.length) : plotWidth;
 
-  // Both panels share the hour axis; the lower one sits under the rotated
-  // labels of the upper panel with its own legend row in between.
+  // Both panels share the period axis; the lower one sits under the rotated
+  // labels of the upper panel with its own legend row in between. The label
+  // band is exactly as tall as the slanted text needs (see
+  // drawGraphTimeLabels), so no dead space survives between the panels.
   const panel1 =
   {
-    y: HOURS_GRAPH.legendHeight,
-    height: HOURS_GRAPH.panelHeight,
+    y: GRAPH_LAYOUT.legendHeight,
+    height: GRAPH_LAYOUT.panelHeight,
   };
   const panel2 =
   {
-    y: panel1.y + panel1.height + HOURS_GRAPH.labelsHeight + HOURS_GRAPH.panelGap +
-       HOURS_GRAPH.legendHeight,
-    height: HOURS_GRAPH.gasPanelHeight,
+    y: panel1.y + panel1.height + config.labelsHeight + GRAPH_LAYOUT.panelGap +
+       GRAPH_LAYOUT.legendHeight,
+    height: GRAPH_LAYOUT.gasPanelHeight,
   };
 
   let maxUsed = 0;
@@ -1746,98 +2143,73 @@ function drawHoursGraph()
   //-- One kWh scale serves both directions so a red and a green bar of the
   // same value have the same length; the zero line ends up between the
   // scaled used span above and the scaled returned span below.
-  const kwhStep = hoursGraphStep(Math.max(maxUsed, maxReturned));
-  const kwhTop = (maxUsed > 0) ? hoursGraphScale(maxUsed, kwhStep) : 0;
-  const kwhBottom = (maxReturned > 0) ? -hoursGraphScale(maxReturned, kwhStep) : 0;
+  const kwhStep = graphStep(Math.max(maxUsed, maxReturned), KWH_STEPS, 1);
+  const kwhTop = (maxUsed > 0) ? graphScale(maxUsed, kwhStep) : 0;
+  const kwhBottom = (maxReturned > 0) ? -graphScale(maxReturned, kwhStep) : 0;
 
   // An empty panel still needs a scale to sit its zero line on.
   if ((kwhTop === 0) && (kwhBottom === 0))
   {
     kwhTop = kwhStep;
   }
-  const gasStep = hoursGraphStep(maxGas);
-  const gasMax = hoursGraphScale(maxGas, gasStep);
+  const gasStep = graphStep(maxGas, KWH_STEPS, 1);
+  const gasMax = graphScale(maxGas, gasStep);
 
-  //-- Upper panel: one bar per hour on the zero line, the used kWh (red)
-  // growing upwards and the returned kWh (green) hanging below it.
-  const yOfEnergy = drawHoursPanelFrame(ctx, panel1, kwhStep, kwhTop, kwhBottom, "kWh",
-                                        [{color: HOURS_GRAPH_COLORS.used, label: "Used"},
-                                         {color: HOURS_GRAPH_COLORS.returned, label: "Returned"}],
+  const paired = (viewId === "monthsGraph");
+
+  //-- Upper panel: the used/returned bars (grouped per period on the months
+  // view) on the zero line.
+  const yOfEnergy = drawGraphPanelFrame(ctx, panel1, kwhStep, kwhTop, kwhBottom, "kWh",
+                                        paired
+                                        ? [{color: GRAPH_COLORS.used, label: "Used (this period)"},
+                                           {color: GRAPH_COLORS.usedPrevious, label: "Used (previous)"},
+                                           {color: GRAPH_COLORS.returned, label: "Returned (this period)"},
+                                           {color: GRAPH_COLORS.returnedPrevious, label: "Returned (previous)"}]
+                                        : [{color: GRAPH_COLORS.used, label: "Used"},
+                                           {color: GRAPH_COLORS.returned, label: "Returned"}],
                                         plotLeft, plotWidth);
 
-  const barWidth = Math.max(2, slot * 0.6);
-  const zeroY = yOfEnergy(0);
-
-  records.forEach((record, index) =>
+  if (paired)
   {
-    const centre = plotLeft + (index + 0.5) * slot;
-    const barX = centre - barWidth / 2;
+    drawPeriodBarsPaired(ctx, records, slot, plotLeft, yOfEnergy, config.ring);
+  }
+  else
+  {
+    drawPeriodBars(ctx, records, slot, plotLeft, yOfEnergy);
+  }
 
-    const entries =
-    [
-      {value: record.used || 0, color: HOURS_GRAPH_COLORS.used, from: zeroY, to: yOfEnergy(record.used || 0)},
-      {value: record.returned || 0, color: HOURS_GRAPH_COLORS.returned, from: zeroY, to: yOfEnergy(-(record.returned || 0))},
-    ];
+  drawGraphTimeLabels(ctx, records, panel1.y + panel1.height, slot, plotLeft,
+                      (record) => periodGraphLabel(config.ring, record.key));
 
-    entries.forEach((bar) =>
-    {
-      if (bar.value <= 0)
-      {
-        return;
-      }
-
-      const top = Math.min(bar.from, bar.to);
-      const bottom = Math.max(bar.from, bar.to);
-      ctx.fillStyle = bar.color;
-      ctx.globalAlpha = 0.85;
-      ctx.fillRect(barX, top, barWidth, bottom - top);
-      ctx.globalAlpha = 1;
-    });
-  });
-
-  drawHoursTimeLabels(ctx, records, panel1.y + panel1.height, slot, plotLeft);
-
-  //-- Lower panel: the gas m³ per hour as a blue line with a dot per hour.
-  const yOfGas = drawHoursPanelFrame(ctx, panel2, gasStep, gasMax, 0, "m³",
-                                     [{color: HOURS_GRAPH_COLORS.gas, label: "Gas used"}],
+  //-- Lower panel: the gas m³ per period as a blue line (the months view
+  // adds the light blue line of the previous periods).
+  const yOfGas = drawGraphPanelFrame(ctx, panel2, gasStep, gasMax, 0, "m³",
+                                     paired
+                                     ? [{color: GRAPH_COLORS.gas, label: "Gas (this period)"},
+                                        {color: GRAPH_COLORS.gasPrevious, label: "Gas (previous)"}]
+                                     : [{color: GRAPH_COLORS.gas, label: "Gas used"}],
                                      plotLeft, plotWidth);
 
   if (records.length > 0)
   {
-    ctx.strokeStyle = HOURS_GRAPH_COLORS.gas;
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
+    drawGraphLine(ctx, records.map((record) => record.gas || 0), 0, slot, plotLeft, yOfGas,
+                  GRAPH_COLORS.gas);
 
-    records.forEach((record, index) =>
+    if (paired)
     {
-      const x = plotLeft + (index + 0.5) * slot;
-      const y = yOfGas(record.gas || 0);
-
-      if (index === 0)
+      drawGraphLine(ctx, records.map((record, index) =>
       {
-        ctx.moveTo(x, y);
-      }
-      else
-      {
-        ctx.lineTo(x, y);
-      }
-    });
+        const previous = periodPreviousRecord(records, index, config.ring);
 
-    ctx.stroke();
-
-    ctx.fillStyle = HOURS_GRAPH_COLORS.gas;
-
-    records.forEach((record, index) =>
-    {
-      ctx.beginPath();
-      ctx.arc(plotLeft + (index + 0.5) * slot, yOfGas(record.gas || 0), 1.8, 0, Math.PI * 2);
-      ctx.fill();
-    });
+        return previous ? (previous.gas || 0) : null;
+      }), 0, slot, plotLeft, yOfGas, GRAPH_COLORS.gasPrevious);
+    }
   }
 
-  drawHoursTimeLabels(ctx, records, panel2.y + panel2.height, slot, plotLeft);
+  drawGraphTimeLabels(ctx, records, panel2.y + panel2.height, slot, plotLeft,
+                      (record) => periodGraphLabel(config.ring, record.key));
 
-  hoursGraphLayout =
+  graph.layout =
   {
     records: records,
     slot: slot,
@@ -1846,52 +2218,471 @@ function drawHoursGraph()
     panelEnergy: panel1,
     panelGas: panel2,
     // Cursor above this y belongs to the kWh panel, below it to the gas
-    // panel (the rotated hour labels in between stay with the kWh panel).
+    // panel (the rotated period labels in between stay with the kWh panel).
     panelSplitY: (panel1.y + panel1.height + panel2.y) / 2,
+    yOfEnergy: yOfEnergy,
+    yOfGas: yOfGas,
   };
-  updateHoursGraphTooltip();
+  updatePeriodGraphTooltip(viewId);
 }
 
-// Hover popup: the amount of the hour under the cursor, without date or
-// time — the net consumption (used minus returned) in kWh while the cursor
-// is over the upper panel, the gas m³ while it is over the lower panel —
-// centred above the hovered slot (same chip style as the power history
-// popup).
-function updateHoursGraphTooltip()
+// Hover popups: separate chips per series (same chip style as the power
+// history popup). While the cursor is over the energy panel the used kWh
+// and the returned kWh each get their own chip, one riding above the top
+// of the red bar and one just under the tip of the green bar, so the two
+// amounts are read apart instead of merged into a net figure; over the gas
+// panel a single chip shows the gas m³. All chips centre on the hovered
+// slot and stay inside the plot.
+function updatePeriodGraphTooltip(viewId)
 {
-  if (hoursGraphTip === null)
+  const graph = periodGraphs[viewId];
+  const canvas = el[viewId + "Canvas"];
+
+  if (canvas === null)
   {
-    hoursGraphTip = document.createElement("div");
-    hoursGraphTip.className = "hoursGraphTooltip";
-    hoursGraphTip.hidden = true;
-    el.hoursGraphCanvas.parentElement.appendChild(hoursGraphTip);
+    return;
   }
 
-  const layout = hoursGraphLayout;
+  if (graph.tips === null)
+  {
+    graph.tips = {};
+
+    [["used", "tipUsed"], ["returned", "tipReturned"], ["gas", "tipGas"]].forEach((pair) =>
+    {
+      const tip = document.createElement("div");
+      tip.className = "hoursGraphTooltip " + pair[1];
+      tip.hidden = true;
+      canvas.parentElement.appendChild(tip);
+      graph.tips[pair[0]] = tip;
+    });
+  }
+
+  const tips = graph.tips;
+
+  Object.keys(tips).forEach((name) =>
+  {
+    tips[name].hidden = true;
+  });
+
+  const layout = graph.layout;
 
   if ((layout === null) || (layout.records.length === 0) ||
-      (hoursGraphHoverX === null) || (hoursGraphHoverY === null))
+      (graph.hoverX === null) || (graph.hoverY === null))
   {
-    hoursGraphTip.hidden = true;
     return;
   }
 
   const index = Math.min(layout.records.length - 1,
-                         Math.max(0, Math.floor((hoursGraphHoverX - layout.plotLeft) / layout.slot)));
+                         Math.max(0, Math.floor((graph.hoverX - layout.plotLeft) / layout.slot)));
   const record = layout.records[index];
-  const overGas = hoursGraphHoverY >= layout.panelSplitY;
-  const panel = overGas ? layout.panelGas : layout.panelEnergy;
-
-  hoursGraphTip.textContent = overGas
-                              ? ((record.gas || 0).toFixed(3) + " m³")
-                              : (((record.used || 0) - (record.returned || 0)).toFixed(3) + " kWh");
-  hoursGraphTip.hidden = false;
-
   const centre = layout.plotLeft + (index + 0.5) * layout.slot;
-  const half = hoursGraphTip.offsetWidth / 2;
+
+  function place(tip, top)
+  {
+    tip.hidden = false;
+
+    const half = tip.offsetWidth / 2;
+    const left = Math.min(layout.cssWidth - half, Math.max(half, centre));
+    tip.style.left = (canvas.offsetLeft + left) + "px";
+    tip.style.top = (canvas.offsetTop + top) + "px";
+  }
+
+  if (graph.hoverY >= layout.panelSplitY)
+  {
+    tips.gas.textContent = (record.gas || 0).toFixed(3) + " m³";
+    place(tips.gas, layout.panelGas.y + 2);
+    return;
+  }
+
+  const energy = layout.panelEnergy;
+  const usedValue = record.used || 0;
+  const returnedValue = record.returned || 0;
+
+  tips.used.textContent = "Used " + usedValue.toFixed(3) + " kWh";
+  tips.returned.textContent = "Returned " + returnedValue.toFixed(3) + " kWh";
+
+  // Each chip rides along its own bar (clamped inside the panel), so the
+  // used chip reads with the red series and the returned chip with the
+  // green one.
+  const usedTop = Math.max(energy.y + 2,
+                           Math.min(layout.yOfEnergy(usedValue) - 22, energy.y + energy.height - 22));
+  const returnedTop = Math.max(energy.y + 2,
+                               Math.min(layout.yOfEnergy(-returnedValue) + 3,
+                                        energy.y + energy.height - 22));
+
+  place(tips.used, usedTop);
+  place(tips.returned, returnedTop);
+}
+
+//-- --------------------------------------------------------------------------
+//-- Actual Graph view
+//-- --------------------------------------------------------------------------
+
+// The device keeps an internal rolling table of the newest ~100 accepted
+// telegrams (the receiver power history): per sample the unsigned delivered
+// and returned watts of each phase, the held gas m³/h rate and the
+// "HH:MM:SS" time. cmd=actualgraph hands the table over oldest sample
+// first; the view draws it right aligned in the full 100-slot plot, so the
+// newest measurements fill the graph at the right edge and a full table
+// shifts one slot to the left with every accepted telegram. Three used
+// (L1..L3) and three returned (L1..L3) checkboxes switch each phase's
+// stacked series on and off; the watt scale follows the visible series
+// only. The lower panel carries the gas line, like the actualGraph mockup.
+// The view follows the telegram cadence: the device pushes nothing here, so
+// the SPA polls cmd=actualgraph on the Phase Load timer while it is open.
+
+const ACTUAL_GRAPH =
+{
+  capacity: 100,
+  marginLeft: 46,
+  marginRight: 10,
+  legendHeight: 16,
+  panelHeight: 150,
+  gasPanelHeight: 90,
+  labelsHeight: 40,
+  panelGap: 14,
+  bottomPad: 8,
+};
+
+// Three shades per direction like the actualGraph mockup: light L1, mid
+// L2, dark L3, so the stacked series stay readable on top of each other.
+const ACTUAL_COLORS =
+{
+  used: ["#ffc2c2", "#ff453a", "#b4000e"],
+  returned: ["#a7f3c0", "#34c759", "#0a7d2c"],
+  gas: "#007aff",
+};
+
+const actualGraph = {records: [], layout: null, hoverX: null, hoverY: null, tip: null};
+let actualGraphTimer = null;
+
+function setActualGraphState(message)
+{
+  el.actualGraphState.textContent = message;
+}
+
+function renderActualGraph(message)
+{
+  actualGraph.records = Array.isArray(message.records) ? message.records : [];
+
+  if (actualGraph.records.length === 0)
+  {
+    setActualGraphState("No measurements retained yet (is a telegram arriving?).");
+  }
+  else
+  {
+    setActualGraphState(actualGraph.records.length + " of ~" + ACTUAL_GRAPH.capacity +
+                        " measurements plotted · /api/actualgraph");
+  }
+
+  drawActualGraph();
+}
+
+// The six checkboxes of the toolbar: which phase series currently take
+// part in the stacked bars and the scale.
+function actualGraphVisible()
+{
+  const visible = {used: [true, true, true], returned: [true, true, true]};
+
+  el.actualGraphChecks.querySelectorAll('input[type="checkbox"]').forEach((box) =>
+  {
+    const series = box.dataset.series;
+    const phase = Number(box.dataset.phase);
+
+    if ((series in visible) && (phase >= 0) && (phase < 3))
+    {
+      visible[series][phase] = box.checked;
+    }
+  });
+
+  return visible;
+}
+
+function drawActualGraph()
+{
+  const canvas = el.actualGraphCanvas;
+
+  if (canvas === null)
+  {
+    return;
+  }
+
+  const wrap = canvas.parentElement;
+  const cssWidth = Math.max(320, wrap.clientWidth - 16);
+  const cssHeight = ACTUAL_GRAPH.legendHeight + ACTUAL_GRAPH.panelHeight + ACTUAL_GRAPH.labelsHeight +
+                    ACTUAL_GRAPH.panelGap + ACTUAL_GRAPH.legendHeight +
+                    ACTUAL_GRAPH.gasPanelHeight + ACTUAL_GRAPH.labelsHeight + ACTUAL_GRAPH.bottomPad;
+  const dpr = window.devicePixelRatio || 1;
+
+  canvas.width = Math.round(cssWidth * dpr);
+  canvas.height = Math.round(cssHeight * dpr);
+  canvas.style.width = cssWidth + "px";
+  canvas.style.height = cssHeight + "px";
+
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+  const records = actualGraph.records;
+  const visible = actualGraphVisible();
+  const plotLeft = ACTUAL_GRAPH.marginLeft;
+  const plotWidth = Math.max(10, cssWidth - plotLeft - ACTUAL_GRAPH.marginRight);
+
+  // Steady 100-slot pitch: the newest sample always sits in the rightmost
+  // slot, so a filling table grows in from the right edge and a full one
+  // shifts left with every new sample.
+  const slot = plotWidth / ACTUAL_GRAPH.capacity;
+  const firstSlot = ACTUAL_GRAPH.capacity - records.length;
+
+  const panel1 =
+  {
+    y: ACTUAL_GRAPH.legendHeight,
+    height: ACTUAL_GRAPH.panelHeight,
+  };
+  const panel2 =
+  {
+    y: panel1.y + panel1.height + ACTUAL_GRAPH.labelsHeight + ACTUAL_GRAPH.panelGap +
+       ACTUAL_GRAPH.legendHeight,
+    height: ACTUAL_GRAPH.gasPanelHeight,
+  };
+
+  let maxUsed = 0;
+  let maxReturned = 0;
+  let maxGas = 0;
+
+  records.forEach((record) =>
+  {
+    const used = Array.isArray(record.used) ? record.used : [];
+    const returned = Array.isArray(record.returned) ? record.returned : [];
+    let usedSum = 0;
+    let returnedSum = 0;
+
+    for (let phase = 0; phase < 3; phase++)
+    {
+      if (visible.used[phase])
+      {
+        usedSum += Math.max(0, used[phase] || 0);
+      }
+
+      if (visible.returned[phase])
+      {
+        returnedSum += Math.max(0, returned[phase] || 0);
+      }
+    }
+
+    maxUsed = Math.max(maxUsed, usedSum);
+    maxReturned = Math.max(maxReturned, returnedSum);
+    maxGas = Math.max(maxGas, record.gas || 0);
+  });
+
+  const wattStep = graphStep(Math.max(maxUsed, maxReturned), WATT_STEPS, 100);
+  const wattTop = (maxUsed > 0) ? graphScale(maxUsed, wattStep) : 0;
+  const wattBottom = (maxReturned > 0) ? -graphScale(maxReturned, wattStep) : 0;
+
+  // An empty panel still needs a scale to sit its zero line on.
+  if ((wattTop === 0) && (wattBottom === 0))
+  {
+    wattTop = wattStep;
+  }
+  const gasStep = graphStep(maxGas, KWH_STEPS, 1);
+  const gasMax = graphScale(maxGas, gasStep);
+
+  //-- Upper panel: one bar per sample in which every phase keeps its own
+  // colour and its own slab — the used watts stack upwards from the zero
+  // line (light L1 at the bottom, mid L2, dark L3 on top) and the returned
+  // watts stack downwards the same way; a white hairline at each phase
+  // boundary keeps neighbouring slabs clearly separated.
+  const yOfEnergy = drawGraphPanelFrame(ctx, panel1, wattStep, wattTop, wattBottom, "W",
+                                        [{color: ACTUAL_COLORS.used[0], label: "Used L1"},
+                                         {color: ACTUAL_COLORS.used[1], label: "Used L2"},
+                                         {color: ACTUAL_COLORS.used[2], label: "Used L3"},
+                                         {color: ACTUAL_COLORS.returned[0], label: "Returned L1"},
+                                         {color: ACTUAL_COLORS.returned[1], label: "Returned L2"},
+                                         {color: ACTUAL_COLORS.returned[2], label: "Returned L3"}],
+                                        plotLeft, plotWidth);
+
+  const barWidth = Math.max(2, slot * 0.7);
+
+  records.forEach((record, index) =>
+  {
+    const centre = plotLeft + (firstSlot + index + 0.5) * slot;
+    const barX = centre - barWidth / 2;
+    const used = Array.isArray(record.used) ? record.used : [];
+    const returned = Array.isArray(record.returned) ? record.returned : [];
+    let stackedUsed = 0;
+    let stackedReturned = 0;
+
+    for (let phase = 0; phase < 3; phase++)
+    {
+      const usedValue = visible.used[phase] ? Math.max(0, used[phase] || 0) : 0;
+
+      if (usedValue > 0)
+      {
+        ctx.fillStyle = ACTUAL_COLORS.used[phase];
+        ctx.globalAlpha = 0.9;
+        ctx.fillRect(barX, yOfEnergy(stackedUsed + usedValue), barWidth,
+                     yOfEnergy(stackedUsed) - yOfEnergy(stackedUsed + usedValue));
+        ctx.globalAlpha = 1;
+
+        //-- Hairline on the boundary to the phase stacked below, so each
+        // phase slab of the bar reads as its own bar.
+        if (stackedUsed > 0)
+        {
+          ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+          ctx.fillRect(barX, yOfEnergy(stackedUsed) - 0.5, barWidth, 1);
+        }
+
+        stackedUsed += usedValue;
+      }
+
+      const returnedValue = visible.returned[phase] ? Math.max(0, returned[phase] || 0) : 0;
+
+      if (returnedValue > 0)
+      {
+        ctx.fillStyle = ACTUAL_COLORS.returned[phase];
+        ctx.globalAlpha = 0.9;
+        ctx.fillRect(barX, yOfEnergy(-stackedReturned), barWidth,
+                     yOfEnergy(-(stackedReturned + returnedValue)) - yOfEnergy(-stackedReturned));
+        ctx.globalAlpha = 1;
+
+        //-- Hairline on the boundary to the phase stacked further down.
+        if (stackedReturned > 0)
+        {
+          ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+          ctx.fillRect(barX, yOfEnergy(-stackedReturned) - 0.5, barWidth, 1);
+        }
+
+        stackedReturned += returnedValue;
+      }
+    }
+  });
+
+  drawGraphTimeLabels(ctx, records, panel1.y + panel1.height, slot, plotLeft,
+                      (record) => record.time || "--:--:--", firstSlot);
+
+  //-- Lower panel: the held gas rate as a blue line.
+  const yOfGas = drawGraphPanelFrame(ctx, panel2, gasStep, gasMax, 0, "m³/h",
+                                     [{color: ACTUAL_COLORS.gas, label: "Gas used"}],
+                                     plotLeft, plotWidth);
+
+  if (records.length > 0)
+  {
+    drawGraphLine(ctx, records.map((record) => record.gas || 0), firstSlot, slot, plotLeft,
+                  yOfGas, ACTUAL_COLORS.gas);
+  }
+
+  drawGraphTimeLabels(ctx, records, panel2.y + panel2.height, slot, plotLeft,
+                      (record) => record.time || "--:--:--", firstSlot);
+
+  actualGraph.layout =
+  {
+    records: records,
+    slot: slot,
+    firstSlot: firstSlot,
+    plotLeft: plotLeft,
+    cssWidth: cssWidth,
+    panelEnergy: panel1,
+    panelGas: panel2,
+    panelSplitY: (panel1.y + panel1.height + panel2.y) / 2,
+    visible: visible,
+  };
+  updateActualGraphTooltip();
+}
+
+// Hover popup: one chip over the hovered slot listing the sample's time,
+// the per-phase watts of the visible series and the gas m³/h.
+function updateActualGraphTooltip()
+{
+  const canvas = el.actualGraphCanvas;
+
+  if (canvas === null)
+  {
+    return;
+  }
+
+  if (actualGraph.tip === null)
+  {
+    actualGraph.tip = document.createElement("div");
+    actualGraph.tip.className = "hoursGraphTooltip";
+    actualGraph.tip.style.whiteSpace = "pre";
+    actualGraph.tip.hidden = true;
+    canvas.parentElement.appendChild(actualGraph.tip);
+  }
+
+  const tip = actualGraph.tip;
+  const layout = actualGraph.layout;
+
+  if ((layout === null) || (layout.records.length === 0) ||
+      (actualGraph.hoverX === null) || (actualGraph.hoverY === null))
+  {
+    tip.hidden = true;
+    return;
+  }
+
+  const index = Math.min(layout.records.length - 1,
+                         Math.max(0, Math.floor((actualGraph.hoverX - layout.plotLeft) / layout.slot) -
+                                       layout.firstSlot));
+  const record = layout.records[index];
+  const used = Array.isArray(record.used) ? record.used : [];
+  const returned = Array.isArray(record.returned) ? record.returned : [];
+  const lines = [record.time || "--:--:--"];
+  const usedParts = [];
+  const returnedParts = [];
+
+  for (let phase = 0; phase < 3; phase++)
+  {
+    if (layout.visible.used[phase])
+    {
+      usedParts.push("L" + (phase + 1) + " " + ((used[phase] || 0) / 1000).toFixed(2));
+    }
+
+    if (layout.visible.returned[phase])
+    {
+      returnedParts.push("L" + (phase + 1) + " " + ((returned[phase] || 0) / 1000).toFixed(2));
+    }
+  }
+
+  if (usedParts.length > 0)
+  {
+    lines.push("used kW   " + usedParts.join("  "));
+  }
+
+  if (returnedParts.length > 0)
+  {
+    lines.push("ret   kW  " + returnedParts.join("  "));
+  }
+
+  lines.push("gas  m³/h  " + (record.gas || 0).toFixed(3));
+
+  tip.textContent = lines.join("\n");
+  tip.hidden = false;
+
+  const centre = layout.plotLeft + (layout.firstSlot + index + 0.5) * layout.slot;
+  const half = tip.offsetWidth / 2;
   const left = Math.min(layout.cssWidth - half, Math.max(half, centre));
-  hoursGraphTip.style.left = (el.hoursGraphCanvas.offsetLeft + left) + "px";
-  hoursGraphTip.style.top = (el.hoursGraphCanvas.offsetTop + panel.y + 2) + "px";
+  const panel = (actualGraph.hoverY >= layout.panelSplitY) ? layout.panelGas : layout.panelEnergy;
+  tip.style.left = (canvas.offsetLeft + left) + "px";
+  tip.style.top = (canvas.offsetTop + panel.y + 2) + "px";
+}
+
+// The realtime table refreshes at least every five seconds; with a shorter
+// read interval it follows that cadence instead (same timer rules as the
+// Phase Load view, own handle so both views poll independently).
+function updateActualGraphPolling()
+{
+  clearTimeout(actualGraphTimer);
+  actualGraphTimer = null;
+
+  if (state.screen !== "actualGraph")
+  {
+    return;
+  }
+
+  actualGraphTimer = setTimeout(() =>
+  {
+    wsSend("cmd=actualgraph");
+    updateActualGraphPolling();
+  }, powerPollDelayMs());
 }
 
 //-- --------------------------------------------------------------------------
@@ -1938,6 +2729,7 @@ function showScreen(name)
   wsSend(viewCommand(view));
   reportActiveScreen();
   updatePowerPolling();
+  updateActualGraphPolling();
 }
 
 function boot()
@@ -1986,12 +2778,29 @@ function boot()
     });
   });
 
-  // The hour records follow the ring: the view does not poll, this button
-  // re-requests the hourly usage series on demand (switching to the view
+  // The period records follow the ring: the period views do not poll, these
+  // buttons re-request the usage series on demand (switching to a view
   // requests it as well, like every other view command).
-  el.refreshHoursGraph.addEventListener("click", () =>
+  Object.keys(PERIOD_GRAPHS).forEach((viewId) =>
   {
-    wsSend("cmd=hoursgraph");
+    el["refresh" + viewId.charAt(0).toUpperCase() + viewId.slice(1)]
+      .addEventListener("click", () =>
+      {
+        wsSend("cmd=graph&ring=" + PERIOD_GRAPHS[viewId].ring);
+      });
+  });
+
+  // The Actual Graph polls while it is open; this button re-requests the
+  // rolling per-phase table right away, and the six phase checkboxes
+  // restyle the stacked series (and the scale) without a device round trip.
+  el.refreshActualGraph.addEventListener("click", () =>
+  {
+    wsSend("cmd=actualgraph");
+  });
+
+  el.actualGraphChecks.addEventListener("change", () =>
+  {
+    drawActualGraph();
   });
 
   // Take over control again after another browser page evicted this page:
@@ -2012,9 +2821,14 @@ function boot()
       drawPowerSpark(lastPowerScale);
     }
 
-    if (state.screen === "hoursGraph")
+    if (state.screen in periodGraphs)
     {
-      drawHoursGraph();
+      drawPeriodGraph(state.screen);
+    }
+
+    if (state.screen === "actualGraph")
+    {
+      drawActualGraph();
     }
   });
 
@@ -2033,22 +2847,42 @@ function boot()
     updatePowerTooltip();
   });
 
-  // Hovering the hours graph pops up the net kWh (upper panel) or the gas
-  // m³ (lower panel) of the hour under the cursor; leaving the plot hides
-  // the popup.
-  el.hoursGraphCanvas.addEventListener("mousemove", (event) =>
+  // Hovering a graph pops up its chips for the slot under the cursor (the
+  // period graphs separate chips for used, returned and gas, the Actual
+  // Graph one per-phase chip); leaving the plot hides them again.
+  Object.keys(periodGraphs).forEach((viewId) =>
   {
-    const rect = el.hoursGraphCanvas.getBoundingClientRect();
-    hoursGraphHoverX = event.clientX - rect.left;
-    hoursGraphHoverY = event.clientY - rect.top;
-    updateHoursGraphTooltip();
+    const canvas = el[viewId + "Canvas"];
+
+    canvas.addEventListener("mousemove", (event) =>
+    {
+      const rect = canvas.getBoundingClientRect();
+      periodGraphs[viewId].hoverX = event.clientX - rect.left;
+      periodGraphs[viewId].hoverY = event.clientY - rect.top;
+      updatePeriodGraphTooltip(viewId);
+    });
+
+    canvas.addEventListener("mouseleave", () =>
+    {
+      periodGraphs[viewId].hoverX = null;
+      periodGraphs[viewId].hoverY = null;
+      updatePeriodGraphTooltip(viewId);
+    });
   });
 
-  el.hoursGraphCanvas.addEventListener("mouseleave", () =>
+  el.actualGraphCanvas.addEventListener("mousemove", (event) =>
   {
-    hoursGraphHoverX = null;
-    hoursGraphHoverY = null;
-    updateHoursGraphTooltip();
+    const rect = el.actualGraphCanvas.getBoundingClientRect();
+    actualGraph.hoverX = event.clientX - rect.left;
+    actualGraph.hoverY = event.clientY - rect.top;
+    updateActualGraphTooltip();
+  });
+
+  el.actualGraphCanvas.addEventListener("mouseleave", () =>
+  {
+    actualGraph.hoverX = null;
+    actualGraph.hoverY = null;
+    updateActualGraphTooltip();
   });
 
   wsConnect();

@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-21 · Build: 20 */
+   Date: 2026-11-21 · Build: 22 */
 
 :root
 {
@@ -71,16 +71,38 @@ header
   border-bottom: 1px solid var(--separator);
 }
 
+/* Two header rows: the program name on the left with the version and the
+   device wall clock right aligned on the same row, the tab bar on the row
+   below. A grid keeps that pairing intact even when the eight tabs wrap. */
 .headerInner
 {
   max-width: 960px;
   margin: 0 auto;
   padding: 10px 20px;
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
+  column-gap: 16px;
+  row-gap: 8px;
+}
+
+.headerInner > h1
+{
+  grid-row: 1;
+  grid-column: 1;
+}
+
+.headerInner > .headerInfo
+{
+  grid-row: 1;
+  grid-column: 2;
+}
+
+.headerInner > .segmented
+{
+  grid-row: 2;
+  grid-column: 1 / -1;
+  justify-self: start;
 }
 
 header h1
@@ -91,8 +113,8 @@ header h1
   margin: 0;
 }
 
-/* Program version above the device wall clock, stacked right aligned in the
-   header. Both are filled by the status push. */
+/* Program version above the device wall clock, stacked right aligned next
+   to the program name in the header. Both are filled by the status push. */
 .headerInfo
 {
   display: flex;
@@ -820,9 +842,11 @@ footer
 }
 
 /* --------------------------------------------------------------------------
-   Hours Graph view: the hourly usage overview of the hours ring (drawn by
-   app.js on a single canvas with two stacked panels). The wrap reuses the
-   sparkline frame styling; the hover chip reuses the powerTooltip look.
+   Period Graph views (Hours, Days, Months) and the Actual Graph: usage
+   overviews drawn by app.js on a single canvas with two stacked panels.
+   The wrap reuses the sparkline frame styling; the hover chips reuse the
+   powerTooltip look. The canvas height follows the ring's label band, so
+   app.js sizes it per view (the width stays fluid).
    ------------------------------------------------------------------------ */
 .hoursGraphWrap
 {
@@ -834,11 +858,10 @@ footer
   background: var(--controlFill);
 }
 
-#hoursGraphCanvas
+.graphCanvas
 {
   display: block;
   width: 100%;
-  height: 356px;
 }
 
 .hoursGraphTooltip
@@ -856,6 +879,36 @@ footer
   transform: translateX(-50%);
   box-shadow: var(--shadow);
   z-index: 5;
+}
+
+/* The period graphs show a chip per series: the coloured left border ties
+   each chip to its series (red used, green returned, blue gas). */
+.hoursGraphTooltip.tipUsed
+{
+  border-left: 3px solid #ff3b30;
+}
+
+.hoursGraphTooltip.tipReturned
+{
+  border-left: 3px solid #34c759;
+}
+
+.hoursGraphTooltip.tipGas
+{
+  border-left: 3px solid #007aff;
+}
+
+/* Colour chip in front of every Actual Graph phase checkbox, matching the
+   stacked bar shades (see ACTUAL_COLORS in app.js). */
+.phaseSwatch
+{
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  margin-right: 4px;
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  vertical-align: -1px;
 }
 
 /* --------------------------------------------------------------------------

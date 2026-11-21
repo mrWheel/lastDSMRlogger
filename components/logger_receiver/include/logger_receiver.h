@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.h - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-21 · Build: 7
+//-- Date: 2026-11-21 · Build: 8
 //--
 //-- One receive task owns the receiver and parser state: the parserDSMR UART
 //-- adapter task feeds the parser and the event callback copies everything the
@@ -33,15 +33,32 @@
 //-- show the newest frame while the next one is being received.
 #define LOGGER_HISTORY_CAPACITY 2
 
-//-- Total watts retained for the SPA realtime bar history: one sample per
-//-- accepted telegram, oldest first when read back. Each sample carries the
-//-- time it belongs to as "HH:MM:SS" so the SPA can label a hovered bar.
-#define LOGGER_POWER_HISTORY_CAPACITY 90u
+//-- Measurements retained for the SPA realtime views: one sample per
+//-- accepted telegram, oldest first when read back. The total watts feed
+//-- the Phase Load bar history, the per-phase delivered/returned watts and
+//-- the held gas rate feed the Actual Graph rolling table (about a hundred
+//-- measurements). Each sample carries the time it belongs to as
+//-- "HH:MM:SS" so the SPA can label a hovered bar.
+#define LOGGER_POWER_HISTORY_CAPACITY 100u
 #define LOGGER_POWER_HISTORY_TIME_MAX 12
 
 typedef struct
 {
+  //-- Signed net total watts: negative is consumption, positive feed-in
+  //-- (the Phase Load bar history reads this figure).
   float watts;
+
+  //-- Unsigned magnitudes per phase (always >= 0) as published on the
+  //-- delivered 1-0:21/41/61.7.0 and returned 1-0:22/42/62.7.0 readings:
+  //-- the two stacked series rows of the Actual Graph.
+  float phaseUsedWatts[3];
+  float phaseReturnedWatts[3];
+
+  //-- Gas consumption rate in m³/h: the rate of the last observed increase
+  //-- of the gas counter, held until the counter moves again (the gas field
+  //-- only arrives with every tenth telegram or so, so a per-telegram
+  //-- difference would be a row of zeros with one spike).
+  float gasM3h;
 
   //-- "HH:MM:SS": the meter time of OBIS 0-0:1.0.0, or the device wall clock
   //-- when the frame published none. Empty when neither source is available.
@@ -210,8 +227,9 @@ bool loggerReceiverGetPowerSnapshot(loggerPowerSnapshot* snapshot, uint32_t* cap
 //-- Copies the newest retained power history samples (one per accepted
 //-- telegram, oldest first) into outSamples, at most maxSamples of them:
 //-- when fewer are asked than retained, the newest ones are copied. Each
-//-- sample carries the total watts plus its "HH:MM:SS" time text. Returns
-//-- the number of samples written. Safe from any task.
+//-- sample carries the total watts, the per-phase delivered and returned
+//-- watts, the held gas rate and its "HH:MM:SS" time text. Returns the
+//-- number of samples written. Safe from any task.
 uint16_t loggerReceiverGetPowerHistory(loggerPowerHistorySample* outSamples, uint16_t maxSamples);
 
 //-- Copies metadata of the retained records, newest first. Returns the
