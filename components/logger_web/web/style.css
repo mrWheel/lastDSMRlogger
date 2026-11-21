@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-21 · Build: 22 */
+   Date: 2026-11-21 · Build: 23 */
 
 :root
 {
@@ -422,6 +422,102 @@ legend
   gap: 10px;
   align-items: center;
   margin: 6px 0;
+}
+
+/* --------------------------------------------------------------------------
+   MQTT and Network settings groups: iOS Settings style list. The legend
+   becomes a small uppercase section header, every field is one row with the
+   label left and a borderless right aligned value, hairline separators
+   between rows and a soft highlight around the row being edited — like the
+   rows in the iOS Settings app.
+   ------------------------------------------------------------------------ */
+fieldset.iosGroup
+{
+  border: none;
+  border-radius: 0;
+  min-inline-size: 0;
+  margin: 16px 0 0;
+  padding: 0;
+}
+
+fieldset.iosGroup legend
+{
+  padding: 0 2px 0 14px;
+  margin: 0 0 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--secondary);
+}
+
+.iosRow
+{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--separator);
+  border-radius: 9px;
+  transition: background 0.15s ease;
+}
+
+.iosRow:last-child
+{
+  border-bottom: none;
+}
+
+.iosRow > label
+{
+  flex: none;
+  font-size: 0.92rem;
+  color: var(--fg);
+}
+
+.iosRow > input
+{
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: inherit;
+  font-size: 0.92rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+  background: transparent;
+  border: none;
+  padding: 2px 0;
+  text-align: right;
+  caret-color: var(--accent);
+}
+
+.iosRow > input::placeholder
+{
+  color: var(--secondary);
+  opacity: 1;
+}
+
+.iosRow:focus-within
+{
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.iosRow > input:focus-visible
+{
+  outline: none;
+}
+
+/* No spinner buttons on the numeric rows (port, intervals, fixed IP): the
+   iOS look keeps the value plain, the step arrows would clutter it. */
+.iosRow input[type="number"]::-webkit-outer-spin-button,
+.iosRow input[type="number"]::-webkit-inner-spin-button
+{
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.iosRow input[type="number"]
+{
+  appearance: textfield;
+  -moz-appearance: textfield;
 }
 
 #saveSettings
@@ -1016,6 +1112,26 @@ footer
   #inpInterval
   {
     width: 100%;
+  }
+
+  /* Settings list rows on a phone: no room side by side, so the label
+     takes its own line and the value sits underneath it left aligned. */
+  .iosRow
+  {
+    flex-wrap: wrap;
+    row-gap: 4px;
+    padding: 10px 12px;
+  }
+
+  .iosRow > label
+  {
+    flex: 1 1 100%;
+  }
+
+  .iosRow > input
+  {
+    flex: 1 1 100%;
+    text-align: left;
   }
 
   th, td
