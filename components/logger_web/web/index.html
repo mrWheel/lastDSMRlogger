@@ -311,6 +311,21 @@
         <canvas id="actualGraphCanvas" class="graphCanvas"></canvas>
       </div>
     </section>
+
+    <section id="viewApi" class="card" hidden>
+      <h2>API documentation</h2>
+      <div id="apiState" class="message"></div>
+      <!-- The published v3 endpoints, listed from the device's own index at
+           GET /api/v3 (see renderApiList in app.js): one row per endpoint
+           with a blue button carrying its URI and the description beside
+           it. Pressing a GET button opens the endpoint result in a new
+           browser tab as a readable page (JSON indented and coloured,
+           plain-text and csv answers kept verbatim); templated URIs open
+           with the device defaults (the newest telegram, the hours ring).
+           POST buttons are listed greyed out: a browser tab cannot send
+           them. Rows are built by app.js. -->
+      <div id="apiList"></div>
+    </section>
   </main>
 
   <footer id="footerInfo"></footer>

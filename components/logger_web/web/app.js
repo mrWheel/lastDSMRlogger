@@ -1,10 +1,12 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-21 · Build: 27
+// Date: 2026-11-21 · Build: 29
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
 // needs one registry entry plus a matching section in index.html and a
-// command on the device. The Telegrams view opens first.
+// command on the device (the API view needs no device command: it fetches
+// the published endpoint index over plain HTTP instead — see its refresh
+// hook). The Telegrams view opens first.
 // All dynamic data travels over one WebSocket at /ws: the
 // device pushes status, the telegram list and the realtime power frame, the
 // browser sends form-urlencoded commands (cmd=config, cmd=save,
@@ -81,6 +83,11 @@ const VIEWS =
    command: "cmd=graph&ring=months"},
   {id: "actualGraph", label: "Actual Graph", section: "viewActualGraph",
    command: "cmd=actualgraph"},
+  // The API view needs no WebSocket command: it fetches the device's own
+  // endpoint index from GET /api/v3 (see refreshApiList), so it carries a
+  // refresh hook instead of a command.
+  {id: "api", label: "API", section: "viewApi", command: null,
+   refresh: refreshApiList},
 ];
 
 // Resolves a view's command: either a fixed string or a function evaluated
@@ -117,7 +124,8 @@ function bindElements()
                "monthsGraphState", "refreshMonthsGraph", "monthsGraphCanvas",
                "actualGraphState", "refreshActualGraph", "actualGraphCanvas", "actualGraphChecks",
                "viewSettings", "viewTelegrams", "viewPower", "viewRingFile", "viewHoursGraph",
-               "viewDaysGraph", "viewMonthsGraph", "viewActualGraph",
+               "viewDaysGraph", "viewMonthsGraph", "viewActualGraph", "viewApi",
+               "apiState", "apiList",
                "takeoverModal", "takeoverMessage", "takeoverTakeBack"];
 
   ids.forEach((id) =>
@@ -160,7 +168,10 @@ function requestCurrentView()
 
   if (view !== undefined)
   {
-    wsSend(viewCommand(view));
+    if (view.command !== null)
+    {
+      wsSend(viewCommand(view));
+    }
   }
 }
 
@@ -2741,6 +2752,275 @@ function updateActualGraphPolling()
 }
 
 //-- --------------------------------------------------------------------------
+//-- API view
+//-- --------------------------------------------------------------------------
+
+function setApiState(message)
+{
+  el.apiState.textContent = message;
+}
+
+// Self-contained styling for the result tab (see openApiResult): the tab
+// is its own blank document, so it cannot rely on style.css; the palette
+// follows the SPA (light iOS look, dark mode variant) and the JSON token
+// colours are used by appendHighlightedJson.
+const API_RESULT_CSS =
+  "body{margin:0;background:#f2f2f7;color:#1c1c1e;" +
+  "font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;}" +
+  "header{padding:14px 18px;background:#fff;border-bottom:1px solid #d1d1d6;" +
+  "font-size:0.95rem;font-weight:600;word-break:break-all;}" +
+  "main{padding:16px 18px;}" +
+  "pre{margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;" +
+  "font-size:0.85rem;white-space:pre-wrap;word-break:break-word;}" +
+  ".json .key{color:#0a3d91}.json .str{color:#0a7d2c}.json .num{color:#7a3eb5}" +
+  ".json .bool{color:#c2410c}.json .nullt{color:#6e6e73;font-style:italic}" +
+  ".error{color:#c0392b;font-weight:600}" +
+  "@media (prefers-color-scheme:dark){body{background:#1c1c1e;color:#f2f2f7}" +
+  "header{background:#2c2c2e;border-bottom-color:#3a3a3c}" +
+  ".json .key{color:#7fb3ff}.json .str{color:#6fe08a}.json .num{color:#c9a0ff}" +
+  ".json .bool{color:#ffb366}.json .nullt{color:#9a9aa0}.error{color:#ff6961}}";
+
+// Appends an already indented JSON document to a <pre> in the result tab,
+// one coloured <span> per token (key, string, number, boolean, null). The
+// text only ever travels through textContent — like every other rendering
+// path in this app, so telegram bytes are never interpreted as HTML.
+function appendHighlightedJson(doc, pre, text)
+{
+  const tokenPattern =
+    /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(?:true|false)\b|\bnull\b|-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/g;
+
+  let lastEnd = 0;
+  let match = tokenPattern.exec(text);
+
+  while (match !== null)
+  {
+    if (match.index > lastEnd)
+    {
+      pre.appendChild(doc.createTextNode(text.slice(lastEnd, match.index)));
+    }
+
+    const token = doc.createElement("span");
+    let cls = "num";
+
+    if (match[0].startsWith("\""))
+    {
+      cls = match[0].trimEnd().endsWith(":") ? "key" : "str";
+    }
+    else if ((match[0] === "true") || (match[0] === "false"))
+    {
+      cls = "bool";
+    }
+    else if (match[0] === "null")
+    {
+      cls = "nullt";
+    }
+
+    token.className = cls;
+    token.textContent = match[0];
+    pre.appendChild(token);
+
+    lastEnd = tokenPattern.lastIndex;
+    match = tokenPattern.exec(text);
+  }
+
+  if (lastEnd < text.length)
+  {
+    pre.appendChild(doc.createTextNode(text.slice(lastEnd)));
+  }
+}
+
+// Opens the result of one GET endpoint in a new browser tab as a readable
+// page: the tab is created inside the click gesture (a later window.open
+// after the await would be popup-blocked), filled once the fetch settles.
+// JSON answers arrive indented and token-coloured; the plain-text (raw
+// telegram) and csv answers keep their exact bytes in a <pre>.
+function openApiResult(url)
+{
+  const tab = window.open("", "_blank");
+
+  if (tab === null)
+  {
+    setApiState("The browser blocked the result tab: allow pop-ups for this page.");
+    return;
+  }
+
+  const doc = tab.document;
+  doc.title = url;
+
+  const style = doc.createElement("style");
+  style.textContent = API_RESULT_CSS;
+
+  const header = doc.createElement("header");
+  header.textContent = "Loading " + url + " ...";
+
+  const main = doc.createElement("main");
+
+  doc.head.appendChild(style);
+  doc.body.appendChild(header);
+  doc.body.appendChild(main);
+
+  fetch(url, {cache: "no-store"})
+    .then((response) =>
+    {
+      const contentType = response.headers.get("content-type") || "";
+
+      return response.text().then((text) =>
+      {
+        return {status: response.status, contentType: contentType, text: text};
+      });
+    })
+    .then((result) =>
+    {
+      header.textContent = url + "  —  HTTP " + result.status;
+      main.textContent = "";
+
+      const pre = doc.createElement("pre");
+
+      if (result.contentType.indexOf("application/json") >= 0)
+      {
+        let formatted = result.text;
+
+        try
+        {
+          formatted = JSON.stringify(JSON.parse(result.text), null, 2);
+        }
+        catch (error)
+        {
+          //-- Not parseable after all: show the bytes as they arrived.
+        }
+
+        pre.className = "json";
+        appendHighlightedJson(doc, pre, formatted);
+      }
+      else
+      {
+        pre.textContent = result.text;
+      }
+
+      main.appendChild(pre);
+    })
+    .catch((error) =>
+    {
+      header.textContent = url;
+      main.textContent = "Could not load the endpoint: " + error.message;
+      main.className = "error";
+    });
+}
+
+// Turns a listed endpoint URI into one a browser tab can actually open:
+// templated entries drop their placeholders, and the device then answers
+// with its documented defaults (the newest accepted telegram, the hours
+// ring), so every GET row is openable as listed.
+function apiOpenUrl(uri)
+{
+  let url = String(uri);
+  const queryStart = url.indexOf("?");
+
+  if (queryStart >= 0)
+  {
+    url = url.slice(0, queryStart);
+  }
+
+  const placeholderStart = url.indexOf("<");
+
+  if (placeholderStart >= 0)
+  {
+    url = url.slice(0, placeholderStart);
+  }
+
+  if (url.endsWith("/"))
+  {
+    url = url.slice(0, -1);
+  }
+
+  return url;
+}
+
+// Fetches the device's own published index (GET /api/v3, served straight
+// from the same table the console and handlers use), so the documentation
+// can never drift from the endpoints that are really registered.
+function refreshApiList()
+{
+  setApiState("Loading the endpoint index from /api/v3...");
+
+  fetch("/api/v3", {cache: "no-store"})
+    .then((response) =>
+    {
+      if (!response.ok)
+      {
+        throw new Error("HTTP " + response.status);
+      }
+
+      return response.json();
+    })
+    .then((data) =>
+    {
+      renderApiList(data);
+    })
+    .catch((error) =>
+    {
+      setApiState("Could not load the endpoint index: " + error.message + ".");
+    });
+}
+
+// Builds one row per endpoint, mirroring the classic API documentation
+// page: a blue button with the URI on the left and the description beside
+// it. A GET button opens its result in a new browser tab; POST entries
+// cannot be opened that way, so their button is greyed out and the
+// description names the method. All text goes in through textContent.
+function renderApiList(data)
+{
+  el.apiList.textContent = "";
+
+  const endpoints = (data && Array.isArray(data.endpoints)) ? data.endpoints : [];
+
+  if (endpoints.length === 0)
+  {
+    setApiState("The device reported no endpoints.");
+    return;
+  }
+
+  endpoints.forEach((endpoint) =>
+  {
+    const row = document.createElement("div");
+    row.className = "apiRow";
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "apiButton";
+    button.textContent = endpoint.uri;
+
+    if (endpoint.method === "GET")
+    {
+      const openUrl = apiOpenUrl(endpoint.uri);
+      button.title = "Open " + openUrl + " in a new browser tab";
+      button.addEventListener("click", () =>
+      {
+        openApiResult(openUrl);
+      });
+    }
+    else
+    {
+      button.disabled = true;
+      button.title = endpoint.method + " endpoint: it cannot be opened in a browser tab";
+    }
+
+    const description = document.createElement("span");
+    description.className = "apiDescription";
+    description.textContent = (endpoint.method === "GET")
+      ? endpoint.description
+      : "[" + endpoint.method + "] " + endpoint.description;
+
+    row.appendChild(button);
+    row.appendChild(description);
+    el.apiList.appendChild(row);
+  });
+
+  setApiState(endpoints.length + " endpoints published under /api/v3: a GET button " +
+              "opens its result in a new browser tab.");
+}
+
+//-- --------------------------------------------------------------------------
 //-- View switching and boot
 //-- --------------------------------------------------------------------------
 
@@ -2781,7 +3061,18 @@ function showScreen(name)
     tabButtons[entry.id].setAttribute("aria-selected", String(entry.id === view.id));
   });
 
-  wsSend(viewCommand(view));
+  if (view.command !== null)
+  {
+    wsSend(viewCommand(view));
+  }
+
+  // Views backed by a plain HTTP source (the API view fetches its endpoint
+  // index) reload through their refresh hook instead of a WebSocket command.
+  if (typeof view.refresh === "function")
+  {
+    view.refresh();
+  }
+
   reportActiveScreen();
   updatePowerPolling();
   updateActualGraphPolling();

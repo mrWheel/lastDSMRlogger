@@ -15,7 +15,7 @@
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
 extern const char* PROG_VERSION;
-const char* PROG_VERSION = "v0.5.2";
+const char* PROG_VERSION = "v0.5.3";
 
 #include <stdio.h>
 #include <string.h>
