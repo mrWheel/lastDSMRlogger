@@ -103,7 +103,11 @@ typedef struct
 static MeterRing rings[LOGGER_RING_COUNT] = {
     {"hours", STORE_MOUNT_POINT "/hours.rfs", RING_FILE_SCHEMA_YYMMDDHH, 49u, 100000000ULL, NULL},
     {"days", STORE_MOUNT_POINT "/days.rfs", RING_FILE_SCHEMA_YYMMDD, 32u, 1000000ULL, NULL},
-    {"months", STORE_MOUNT_POINT "/months.rfs", RING_FILE_SCHEMA_YYMM, 24u, 10000ULL, NULL},
+    //-- Twenty-five months: the Months Graph shows the newest twelve, each
+    //-- paired with the same month of the year before, and the oldest of
+    //-- those year-ago months still needs its own predecessor in the ring
+    //-- for the graph to compute its per-period amounts.
+    {"months", STORE_MOUNT_POINT "/months.rfs", RING_FILE_SCHEMA_YYMM, 25u, 10000ULL, NULL},
 };
 
 const char* loggerStoreRingName(loggerMeterRing_t ring)
@@ -342,6 +346,37 @@ static bool openMeterRing(MeterRing* ring)
   {
     ESP_LOGI(tag, "ring file %s ready: file type '%s', %" PRIu32 " of %" PRIu32 " records retained",
              ring->path, info.schemaId, info.count, info.capacity);
+  }
+
+  //-- A ring file keeps the capacity it was created with in its header, so
+  //-- a ring whose configured capacity grew would silently stay on the old
+  //-- table. Rebuild such a file empty once (the console's populate command
+  //-- fills it again) instead of ignoring the new capacity.
+  if ((info.capacity != 0u) && (info.capacity != ring->maxRecords))
+  {
+    ESP_LOGW(tag,
+             "ring file %s was built for %" PRIu32 " records but the ring now retains %" PRIu32
+             ": rebuilding it empty (re-run populate to fill it)",
+             ring->path, info.capacity, ring->maxRecords);
+    ringFileClose(handle);
+    (void)unlink(ring->path);
+    (void)ringFileBreakStaleLock(ring->path);
+    handle = NULL;
+
+    result = ringFileCreate(ring->path, &config, &handle);
+
+    if (result != ESP_OK)
+    {
+      ESP_LOGE(tag, "could not rebuild ring file %s: %s", ring->path, esp_err_to_name(result));
+      return false;
+    }
+
+    if (ringFileGetInfo(handle, &info) == ESP_OK)
+    {
+      ESP_LOGI(tag,
+               "ring file %s rebuilt: file type '%s', %" PRIu32 " of %" PRIu32 " records retained",
+               ring->path, info.schemaId, info.count, info.capacity);
+    }
   }
 
   ring->handle = handle;

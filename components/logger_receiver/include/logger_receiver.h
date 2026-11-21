@@ -36,10 +36,13 @@
 //-- Measurements retained for the SPA realtime views: one sample per
 //-- accepted telegram, oldest first when read back. The total watts feed
 //-- the Phase Load bar history, the per-phase delivered/returned watts and
-//-- the held gas rate feed the Actual Graph rolling table (about a hundred
-//-- measurements). Each sample carries the time it belongs to as
-//-- "HH:MM:SS" so the SPA can label a hovered bar.
+//-- the held gas rate feed the Actual Graph rolling table. The ring is
+//-- sized at init: it grows to the doubled capacity whenever the heap can
+//-- carry it and falls back to the baseline otherwise (see
+//-- loggerReceiverGetPowerHistoryCapacity). Each sample carries the time it
+//-- belongs to as "HH:MM:SS" so the SPA can label a hovered bar.
 #define LOGGER_POWER_HISTORY_CAPACITY 100u
+#define LOGGER_POWER_HISTORY_CAPACITY_MAX 200u
 #define LOGGER_POWER_HISTORY_TIME_MAX 12
 
 typedef struct
@@ -231,6 +234,12 @@ bool loggerReceiverGetPowerSnapshot(loggerPowerSnapshot* snapshot, uint32_t* cap
 //-- watts, the held gas rate and its "HH:MM:SS" time text. Returns the
 //-- number of samples written. Safe from any task.
 uint16_t loggerReceiverGetPowerHistory(loggerPowerHistorySample* outSamples, uint16_t maxSamples);
+
+//-- Number of sample slots the power history ring actually got at init:
+//-- between LOGGER_POWER_HISTORY_CAPACITY and LOGGER_POWER_HISTORY_CAPACITY_MAX,
+//-- depending on the memory that was available then. Callers size their
+//-- copy buffers (and the Actual Graph plot) from this figure.
+uint16_t loggerReceiverGetPowerHistoryCapacity(void);
 
 //-- Copies metadata of the retained records, newest first. Returns the
 //-- number of records written.

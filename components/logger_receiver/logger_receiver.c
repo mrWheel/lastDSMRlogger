@@ -145,8 +145,13 @@ typedef struct
   //-- history: one sample per accepted telegram in a ring, oldest first when
   //-- read back. Each sample also carries its "HH:MM:SS" time text so the
   //-- SPA can label a hovered bar. Stored under the same mutex as the last
-  //-- power frame, so a reader never mixes two telegram cadences.
-  loggerPowerHistorySample powerHistory[LOGGER_POWER_HISTORY_CAPACITY];
+  //-- power frame, so a reader never mixes two telegram cadences. Allocated
+  //-- at init, preferring PSRAM: the doubled table is offered to the heap
+  //-- first and the ring falls back to the baseline when it will not fit
+  //-- (see loggerReceiverInit). powerHistoryCapacity is the slot count the
+  //-- ring actually got.
+  loggerPowerHistorySample* powerHistory;
+  uint16_t powerHistoryCapacity;
   uint16_t powerHistoryCount;
   uint16_t powerHistoryNext;
 
@@ -971,10 +976,9 @@ static void onParserEvent(const dsmrParser* parser, const dsmrParserEvent* event
 
     historySample->gasM3h = self->gasRateM3h;
     fillPowerHistoryTime(stagingRecord, historySample->timeText, sizeof historySample->timeText);
-    self->powerHistoryNext =
-        (uint16_t)((self->powerHistoryNext + 1u) % LOGGER_POWER_HISTORY_CAPACITY);
+    self->powerHistoryNext = (uint16_t)((self->powerHistoryNext + 1u) % self->powerHistoryCapacity);
 
-    if (self->powerHistoryCount < LOGGER_POWER_HISTORY_CAPACITY)
+    if (self->powerHistoryCount < self->powerHistoryCapacity)
     {
       self->powerHistoryCount++;
     }
@@ -1867,6 +1871,30 @@ esp_err_t loggerReceiverInit(void)
     return ESP_ERR_NO_MEM;
   }
 
+  //-- The rolling sample table behind the Actual Graph: twice the baseline
+  //-- is offered to the heap first (PSRAM preferred, see
+  //-- allocTelegramBuffer) so the graph shows twice as many measurements
+  //-- whenever the module can carry them; a tight heap falls back to the
+  //-- baseline table instead of failing the boot.
+  self->powerHistory = (loggerPowerHistorySample*)allocTelegramBuffer(
+      sizeof(*self->powerHistory) * LOGGER_POWER_HISTORY_CAPACITY_MAX);
+  self->powerHistoryCapacity = LOGGER_POWER_HISTORY_CAPACITY_MAX;
+
+  if (self->powerHistory == NULL)
+  {
+    self->powerHistory = (loggerPowerHistorySample*)allocTelegramBuffer(
+        sizeof(*self->powerHistory) * LOGGER_POWER_HISTORY_CAPACITY);
+    self->powerHistoryCapacity = LOGGER_POWER_HISTORY_CAPACITY;
+  }
+
+  if (self->powerHistory == NULL)
+  {
+    ESP_LOGE(tag, "power history table could not be allocated");
+    return ESP_ERR_NO_MEM;
+  }
+
+  ESP_LOGI(tag, "power history table: %" PRIu16 " measurement slots", self->powerHistoryCapacity);
+
   //-- The accepted and rejected telegram totals continue across a reset or
   //-- power cycle: the values the counter task last persisted are the
   //-- starting point of the new reception session. Missing keys (first boot)
@@ -2191,16 +2219,21 @@ uint16_t loggerReceiverGetPowerHistory(loggerPowerHistorySample* outSamples, uin
   }
 
   //-- The ring's next write slot sits just past the oldest retained sample.
-  uint16_t start = (uint16_t)((self->powerHistoryNext + LOGGER_POWER_HISTORY_CAPACITY - count) %
-                              LOGGER_POWER_HISTORY_CAPACITY);
+  uint16_t start = (uint16_t)((self->powerHistoryNext + self->powerHistoryCapacity - count) %
+                              self->powerHistoryCapacity);
 
   for (uint16_t index = 0u; index < count; index++)
   {
-    outSamples[index] = self->powerHistory[(start + index) % LOGGER_POWER_HISTORY_CAPACITY];
+    outSamples[index] = self->powerHistory[(start + index) % self->powerHistoryCapacity];
   }
 
   xSemaphoreGive(self->mutex);
   return count;
+}
+
+uint16_t loggerReceiverGetPowerHistoryCapacity(void)
+{
+  return instance.powerHistoryCapacity;
 }
 
 bool loggerReceiverGetActiveConfig(loggerSettingsConfig* config)

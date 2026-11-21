@@ -1523,13 +1523,15 @@ function renderRingFileList(message)
 // per period on a zero line: the used kWh (red) grow upwards and the
 // returned kWh (green) hang below the zero line, with a centred legend; the
 // lower panel carries a blue line of the gas m³ per period with its own
-// legend. The months view pairs every period with the same month of the
-// year before (YY-MM against (YY-1)-MM): the used pair (red this period,
-// orange previous) stands side by side above the zero line, the returned
-// pair (dark green this period, light green previous) below it, and the
-// gas panel draws both lines (blue this period, light blue previous). A
-// month whose year-ago counterpart the ring no longer retains draws its
-// pair alone. Each panel has grid lines, y labels and rotated period
+// legend. The months view draws the newest twelve periods only (the
+// mockup's December .. November run) and pairs every period with the same
+// month of the year before (YY-MM against (YY-1)-MM): the left bar is the
+// month one year back, the right bar the period itself. The used pair
+// (orange previous, red this period) stands side by side above the zero
+// line, the returned pair (light green previous, dark green this period)
+// below it, and the gas panel draws both lines (light blue one year back,
+// blue this period). A month whose year-ago counterpart the ring no longer
+// retains draws its pair alone. Each panel has grid lines, y labels and rotated period
 // labels; the label band reserves exactly the room the slanted text
 // needs, so nothing is cut off and no dead space is left between the
 // panels. Hovering pops up a separate chip per series: on the hours and
@@ -1644,8 +1646,15 @@ function renderPeriodGraph(viewId, message)
   }
   else
   {
-    setPeriodGraphState(viewId, graph.records.length + " " + config.unitWord + "(s) plotted · " +
-                                config.api +
+    //-- The months view plots the newest twelve only, each paired with the
+    // same month one year back; the state line names the drawn groups.
+    const plotted = periodGraphWindow(viewId, graph.records).length;
+
+    setPeriodGraphState(viewId, plotted + " " + config.unitWord + "(s) plotted" +
+                                ((viewId === "monthsGraph")
+                                 ? ", each paired with the same month one year back"
+                                 : "") +
+                                " · " + config.api +
                                 (message.available ? "" : " (the device walk did not finish)"));
   }
 
@@ -1920,13 +1929,14 @@ function drawGraphLine(ctx, values, firstSlot, slot, plotLeft, yOf, color)
   });
 }
 
-// The record that pairs with the one at index on the months view: the ring
+// The record that pairs with a drawn period on the months view: the ring
 // entry of the same month one year back (the YYMM key minus a hundred, so
 // 2611 pairs with 2511), or null when the ring no longer retains that
-// month.
-function periodYearAgoRecord(records, index)
+// month. The lookup runs over all retained records, not just the drawn
+// window: the year-ago months live outside the newest twelve.
+function periodYearAgoRecordByKey(records, key)
 {
-  const yearAgoKey = Number(records[index].key) - 100;
+  const yearAgoKey = Number(key) - 100;
 
   if (yearAgoKey < 0)
   {
@@ -1934,6 +1944,22 @@ function periodYearAgoRecord(records, index)
   }
 
   return records.find((candidate) => Number(candidate.key) === yearAgoKey) || null;
+}
+
+// Months view window: the graph draws the newest twelve periods, the run
+// the mockup shows (December .. November). Every retained month older than
+// that only serves as the pair partner of its own successor. Fewer
+// retained periods simply draw fewer groups; the other views are untouched.
+const MONTHS_WINDOW_SIZE = 12;
+
+function periodGraphWindow(viewId, records)
+{
+  if ((viewId !== "monthsGraph") || (records.length <= MONTHS_WINDOW_SIZE))
+  {
+    return records;
+  }
+
+  return records.slice(records.length - MONTHS_WINDOW_SIZE);
 }
 
 // Used/returned bars on the energy panel: one bar pair per record (red
@@ -1971,30 +1997,31 @@ function drawPeriodBars(ctx, records, slot, plotLeft, yOfEnergy)
   });
 }
 
-// Months view: every period stands next to the same month of the year
-// before, used pair above the zero line (red this period, orange
-// previous), returned pair below it (dark green this period, light green
-// previous). A period whose year-ago month the ring no longer retains
-// draws its pair alone, like the mockup's first months.
-function drawPeriodBarsPaired(ctx, records, slot, plotLeft, yOfEnergy)
+// Months view: every drawn period stands as one group of two bars: the
+// left bar the same month of the year before (orange used, light green
+// returned), the right bar the period itself (red used, dark green
+// returned). The year-ago partner is looked up among all retained records,
+// not just the drawn window. A period whose year-ago month the ring no
+// longer retains draws its pair alone, like the mockup's first months.
+function drawPeriodBarsPaired(ctx, drawn, records, slot, plotLeft, yOfEnergy)
 {
   const pairWidth = Math.max(4, slot * 0.7);
   const barWidth = Math.max(1, (pairWidth - 1) / 2);
   const zeroY = yOfEnergy(0);
 
-  records.forEach((record, index) =>
+  drawn.forEach((record, index) =>
   {
     const centre = plotLeft + (index + 0.5) * slot;
     const leftX = centre - pairWidth / 2;
     const rightX = leftX + barWidth + 1;
-    const previous = periodYearAgoRecord(records, index);
+    const previous = periodYearAgoRecordByKey(records, record.key);
 
     const bars =
     [
-      {x: leftX, value: record.used || 0, color: GRAPH_COLORS.used, above: true},
-      {x: rightX, value: previous ? (previous.used || 0) : 0, color: GRAPH_COLORS.usedPrevious, above: true},
-      {x: leftX, value: record.returned || 0, color: GRAPH_COLORS.returned, above: false},
-      {x: rightX, value: previous ? (previous.returned || 0) : 0, color: GRAPH_COLORS.returnedPrevious, above: false},
+      {x: leftX, value: previous ? (previous.used || 0) : 0, color: GRAPH_COLORS.usedPrevious, above: true},
+      {x: rightX, value: record.used || 0, color: GRAPH_COLORS.used, above: true},
+      {x: leftX, value: previous ? (previous.returned || 0) : 0, color: GRAPH_COLORS.returnedPrevious, above: false},
+      {x: rightX, value: record.returned || 0, color: GRAPH_COLORS.returned, above: false},
     ];
 
     bars.forEach((bar) =>
@@ -2043,9 +2070,15 @@ function drawPeriodGraph(viewId)
   ctx.clearRect(0, 0, cssWidth, cssHeight);
 
   const records = graph.records;
+
+  //-- Months view: only the newest twelve periods take the axis (one paired
+  // group each); every older retained month only serves as a pair partner.
+  const paired = (viewId === "monthsGraph");
+  const drawn = paired ? periodGraphWindow(viewId, records) : records;
+
   const plotLeft = GRAPH_LAYOUT.marginLeft;
   const plotWidth = Math.max(10, cssWidth - plotLeft - GRAPH_LAYOUT.marginRight);
-  const slot = (records.length > 0) ? (plotWidth / records.length) : plotWidth;
+  const slot = (drawn.length > 0) ? (plotWidth / drawn.length) : plotWidth;
 
   // Both panels share the period axis; the lower one sits under the rotated
   // labels of the upper panel with its own legend row in between. The label
@@ -2067,11 +2100,26 @@ function drawPeriodGraph(viewId)
   let maxReturned = 0;
   let maxGas = 0;
 
-  records.forEach((record) =>
+  drawn.forEach((record) =>
   {
     maxUsed = Math.max(maxUsed, record.used || 0);
     maxReturned = Math.max(maxReturned, record.returned || 0);
     maxGas = Math.max(maxGas, record.gas || 0);
+
+    //-- The months view adds the left bars and the light blue line of the
+    // same month one year back (outside the drawn window): their amounts
+    // have to be on the scales too or they would tower over the panels.
+    if (paired)
+    {
+      const previous = periodYearAgoRecordByKey(records, record.key);
+
+      if (previous !== null)
+      {
+        maxUsed = Math.max(maxUsed, previous.used || 0);
+        maxReturned = Math.max(maxReturned, previous.returned || 0);
+        maxGas = Math.max(maxGas, previous.gas || 0);
+      }
+    }
   });
 
   //-- One kWh scale serves both directions so a red and a green bar of the
@@ -2089,8 +2137,6 @@ function drawPeriodGraph(viewId)
   const gasStep = graphStep(maxGas, KWH_STEPS, 1);
   const gasMax = graphScale(maxGas, gasStep);
 
-  const paired = (viewId === "monthsGraph");
-
   //-- Upper panel: the used/returned bars (grouped per period on the months
   // view) on the zero line.
   const yOfEnergy = drawGraphPanelFrame(ctx, panel1, kwhStep, kwhTop, kwhBottom, "kWh",
@@ -2105,14 +2151,14 @@ function drawPeriodGraph(viewId)
 
   if (paired)
   {
-    drawPeriodBarsPaired(ctx, records, slot, plotLeft, yOfEnergy);
+    drawPeriodBarsPaired(ctx, drawn, records, slot, plotLeft, yOfEnergy);
   }
   else
   {
-    drawPeriodBars(ctx, records, slot, plotLeft, yOfEnergy);
+    drawPeriodBars(ctx, drawn, slot, plotLeft, yOfEnergy);
   }
 
-  drawGraphTimeLabels(ctx, records, panel1.y + panel1.height, slot, plotLeft,
+  drawGraphTimeLabels(ctx, drawn, panel1.y + panel1.height, slot, plotLeft,
                       (record) => periodGraphLabel(config.ring, record.key));
 
   //-- Lower panel: the gas m³ per period as a blue line (the months view
@@ -2124,28 +2170,31 @@ function drawPeriodGraph(viewId)
                                      : [{color: GRAPH_COLORS.gas, label: "Gas used"}],
                                      plotLeft, plotWidth);
 
-  if (records.length > 0)
+  if (drawn.length > 0)
   {
-    drawGraphLine(ctx, records.map((record) => record.gas || 0), 0, slot, plotLeft, yOfGas,
+    drawGraphLine(ctx, drawn.map((record) => record.gas || 0), 0, slot, plotLeft, yOfGas,
                   GRAPH_COLORS.gas);
 
     if (paired)
     {
-      drawGraphLine(ctx, records.map((record, index) =>
+      drawGraphLine(ctx, drawn.map((record) =>
       {
-        const previous = periodYearAgoRecord(records, index);
+        const previous = periodYearAgoRecordByKey(records, record.key);
 
         return previous ? (previous.gas || 0) : null;
       }), 0, slot, plotLeft, yOfGas, GRAPH_COLORS.gasPrevious);
     }
   }
 
-  drawGraphTimeLabels(ctx, records, panel2.y + panel2.height, slot, plotLeft,
+  drawGraphTimeLabels(ctx, drawn, panel2.y + panel2.height, slot, plotLeft,
                       (record) => periodGraphLabel(config.ring, record.key));
 
   graph.layout =
   {
-    records: records,
+    records: drawn,
+    //-- All retained records behind the drawn window: the months view looks
+    // up each group's year-ago partner here.
+    allRecords: records,
     slot: slot,
     plotLeft: plotLeft,
     cssWidth: cssWidth,
@@ -2166,8 +2215,8 @@ function drawPeriodGraph(viewId)
 // chip, one riding above the top of the red bar and one just under the
 // tip of the green bar, so the two amounts are read apart instead of
 // merged into a net figure. The months view reads one bar at a time: the
-// cursor gets exactly one chip, for the bar it sits on (left column this
-// period, right column the same month one year back; above the zero line
+// cursor gets exactly one chip, for the bar it sits on (left column the
+// same month one year back, right column this period; above the zero line
 // that bar is a used bar, below it a returned one), riding along that
 // bar. Over the gas panel a single chip shows the gas m³. The chips
 // centre on their own bar and stay inside the plot.
@@ -2271,18 +2320,18 @@ function updatePeriodGraphTooltip(viewId)
   }
 
   // Months view: one chip for the hovered bar only. The slot geometry
-  // mirrors drawPeriodBarsPaired (left column this period, right column
-  // the same month of last year); above the zero line the cursor reads a
+  // mirrors drawPeriodBarsPaired (left column the same month of last year,
+  // right column this period); above the zero line the cursor reads a
   // used bar, below it a returned one.
   const pairWidth = Math.max(4, layout.slot * 0.7);
   const barWidth = Math.max(1, (pairWidth - 1) / 2);
   const leftX = centre - pairWidth / 2;
   const rightX = leftX + barWidth + 1;
 
-  const fromPrevious = (graph.hoverX >= centre);
-  const previous = periodYearAgoRecord(layout.records, index);
+  const fromPrevious = (graph.hoverX < centre);
+  const previous = periodYearAgoRecordByKey(layout.allRecords, record.key);
 
-  // The right column only holds bars when the ring retains the month of
+  // The left column only holds bars when the ring retains the month of
   // last year; hovering that empty column shows nothing.
   if (fromPrevious && (previous === null))
   {
@@ -2312,19 +2361,24 @@ function updatePeriodGraphTooltip(viewId)
 //-- Actual Graph view
 //-- --------------------------------------------------------------------------
 
-// The device keeps an internal rolling table of the newest ~100 accepted
+// The device keeps an internal rolling table of the newest accepted
 // telegrams (the receiver power history): per sample the unsigned delivered
 // and returned watts of each phase, the held gas m³/h rate and the
-// "HH:MM:SS" time. cmd=actualgraph hands the table over oldest sample
-// first; the view draws it right aligned in the full 100-slot plot, so the
-// newest measurements fill the graph at the right edge and a full table
-// shifts one slot to the left with every accepted telegram. Three used
+// "HH:MM:SS" time. The table holds a hundred samples, twice that whenever
+// the heap carried the wider table at boot; cmd=actualgraph echoes the
+// real slot count as "capacity" and the view plots on that pitch. The view
+// draws the samples right aligned in the full-capacity plot, so the newest
+// measurements fill the graph at the right edge and a full table shifts one
+// slot to the left with every accepted telegram. Three used
 // (L1..L3) and three returned (L1..L3) checkboxes switch each phase's
 // stacked series on and off; the watt scale follows the visible series
 // only. The lower panel carries the gas line, like the actualGraph mockup.
 // The view follows the telegram cadence: the device pushes nothing here, so
 // the SPA polls cmd=actualgraph on the Phase Load timer while it is open.
 
+// Baseline plot width: the device reports its real table size in every
+// cmd=actualgraph frame (message.capacity) and the view adopts it, so this
+// value only serves until the first frame arrives.
 const ACTUAL_GRAPH =
 {
   capacity: 100,
@@ -2359,13 +2413,20 @@ function renderActualGraph(message)
 {
   actualGraph.records = Array.isArray(message.records) ? message.records : [];
 
+  //-- The device reports the real size of its rolling table (twice the
+  // baseline when its heap carried it): the plot always uses its pitch.
+  if (Number.isFinite(message.capacity) && (message.capacity > 0))
+  {
+    ACTUAL_GRAPH.capacity = Math.round(message.capacity);
+  }
+
   if (actualGraph.records.length === 0)
   {
     setActualGraphState("No measurements retained yet (is a telegram arriving?).");
   }
   else
   {
-    setActualGraphState(actualGraph.records.length + " of ~" + ACTUAL_GRAPH.capacity +
+    setActualGraphState(actualGraph.records.length + " of " + ACTUAL_GRAPH.capacity +
                         " measurements plotted · /api/v3/actualgraph");
   }
 
@@ -2422,9 +2483,9 @@ function drawActualGraph()
   const plotLeft = ACTUAL_GRAPH.marginLeft;
   const plotWidth = Math.max(10, cssWidth - plotLeft - ACTUAL_GRAPH.marginRight);
 
-  // Steady 100-slot pitch: the newest sample always sits in the rightmost
-  // slot, so a filling table grows in from the right edge and a full one
-  // shifts left with every new sample.
+  // Steady capacity-slot pitch (the device's table size): the newest
+  // sample always sits in the rightmost slot, so a filling table grows in
+  // from the right edge and a full one shifts left with every new sample.
   const slot = plotWidth / ACTUAL_GRAPH.capacity;
   const firstSlot = ACTUAL_GRAPH.capacity - records.length;
 

@@ -1608,24 +1608,33 @@ static void appendHoursGraphJson(stringBuilder* sb)
 }
 
 //-- Actual Graph frame: the rolling table of the newest accepted telegrams
-//-- kept by the receiver (about a hundred samples). Each record carries the
-//-- sample's "HH:MM:SS" time, the unsigned delivered and returned watts per
-//-- phase and the held gas m³/h rate, oldest sample first: the SPA draws
-//-- them left to right, newest at the right edge, so the graph fills from
-//-- the right and scrolls left once the table is full. The sample array is
-//-- heap-allocated: this runs on the small wsPush and httpd task stacks
-//-- too, where a hundred samples do not fit. Out of memory sends an empty
-//-- table.
+//-- kept by the receiver (a hundred samples, twice that when the heap
+//-- carried the wider table at boot). The frame echoes the table's real
+//-- slot count as "capacity" so the SPA plots on the matching pitch. Each
+//-- record carries the sample's "HH:MM:SS" time, the unsigned delivered and
+//-- returned watts per phase and the held gas m³/h rate, oldest sample
+//-- first: the SPA draws them left to right, newest at the right edge, so
+//-- the graph fills from the right and scrolls left once the table is
+//-- full. The sample array is heap-allocated: this runs on the small wsPush
+//-- and httpd task stacks too, where the samples do not fit. Out of memory
+//-- sends an empty table.
 static void appendActualGraphJson(stringBuilder* sb)
 {
   sbAppend(sb, "{\"type\":\"actualgraph\",\"records\":[");
 
   uint16_t count = 0u;
-  loggerPowerHistorySample* history = malloc(sizeof *history * LOGGER_POWER_HISTORY_CAPACITY);
+  uint16_t capacity = loggerReceiverGetPowerHistoryCapacity();
+
+  if (capacity == 0u)
+  {
+    capacity = LOGGER_POWER_HISTORY_CAPACITY;
+  }
+
+  loggerPowerHistorySample* history = malloc(sizeof *history * capacity);
 
   if (history != NULL)
   {
-    count = loggerReceiverGetPowerHistory(history, LOGGER_POWER_HISTORY_CAPACITY);
+    count = loggerReceiverGetPowerHistory(history, capacity);
 
     for (uint16_t index = 0u; index < count; index++)
     {
@@ -1643,7 +1652,8 @@ static void appendActualGraphJson(stringBuilder* sb)
     free(history);
   }
 
-  sbAppend(sb, "],\"available\":");
+  sbAppend(sb, "],\"capacity\":");
+  sbAppendFmt(sb, "%" PRIu16 ",\"available\":", capacity);
   sbAppendFmt(sb, "%s}", (count > 0u) ? "true" : "false");
 }
 
