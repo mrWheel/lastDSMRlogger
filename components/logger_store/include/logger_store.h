@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.h - hour, day and month smart meter ring file store
-//-- Date: 2026-11-21 · Build: 9
+//-- Date: 2026-11-21 · Build: 10
 //--
 //-- Three fixed-capacity ring files land on the LittleFS storage partition,
 //-- written through mrwheel's ring_file_store component: the hours ring
@@ -178,6 +178,33 @@ esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePa
 //-- store is not running, an I/O error when the file could not be written
 //-- and ESP_OK otherwise.
 esp_err_t loggerStoreRingToCsv(loggerMeterRing_t ring, uint32_t* outRecords);
+
+//-- Same csv content as the RING<hours|days|months>.csv export file, built
+//-- in memory instead of written to the volume (the API's csv download of
+//-- one ring): header line first, one line per retained record, oldest
+//-- period first, formatted exactly like the file so the text re-imports
+//-- through loggerStorePopulateRing() unchanged. *outText receives a
+//-- heap-allocated NUL-terminated buffer that the caller releases with
+//-- free(); it stays NULL on failure. outRecords (optional) receives the
+//-- number of records rendered. Returns ESP_ERR_INVALID_ARG for an invalid
+//-- ring or a null outText, ESP_ERR_INVALID_STATE while the store is not
+//-- running, ESP_ERR_NO_MEM when the buffer could not be built and another
+//-- error when the walk could not complete.
+esp_err_t loggerStoreRingToCsvText(loggerMeterRing_t ring, char** outText, uint32_t* outRecords);
+
+//-- Visitor of the LittleFS volume scan: called once per entry of the
+//-- volume root. "readable" reports whether the size could be read (stat);
+//-- unreadable entries carry sizeBytes 0 and directories too report their
+//-- name only. The callback runs on the calling task; returning false stops
+//-- the scan early.
+typedef bool (*loggerStoreFileVisitor)(const char* name, bool isDirectory, bool readable,
+                                       uint32_t sizeBytes, void* userData);
+
+//-- Scans the files on the mounted LittleFS volume (the console's store
+//-- command listing). Returns ESP_ERR_INVALID_ARG for a null visitor,
+//-- ESP_ERR_INVALID_STATE while the volume is not mounted, ESP_FAIL when
+//-- the volume directory could not be opened and ESP_OK otherwise.
+esp_err_t loggerStoreListFiles(loggerStoreFileVisitor visitor, void* userData);
 
 //-- VFS mount point of the LittleFS storage volume, published for the SMB
 //-- network share (the component exposes an already mounted VFS path and

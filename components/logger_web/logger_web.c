@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-21 · Build: 18
+//-- Date: 2026-11-21 · Build: 20
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -12,8 +12,14 @@
 //-- raw telegram bytes travel as a binary frame behind their JSON header so
 //-- no client ever interprets telegram text as HTML. Browser to device
 //-- messages stay form-urlencoded so no third-party JSON parser is required
-//-- on the device. The HTTP API remains available for diagnostics and for
-//-- clients without WebSocket support. Handlers copy consistent snapshots
+//-- on the device. The HTTP API serves only the versioned surface: every
+//-- datum the telnet console and the SPA can request is a plain GET under
+//-- /api/v3/ (a short descriptive name per endpoint, the index at /api/v3
+//-- lists them) and the two SPA actions (save, view) are POSTs there; the
+//-- frames answer exactly what the console prints, in JSON. There is no
+//-- unversioned /api/ layer so a future v4 can define its own syntax. No
+//-- frame ever carries the MQTT password: the settings frames omit it and a
+//-- save without that field keeps the stored password. Handlers copy consistent snapshots
 //-- from the receiver and never hold its lock while writing to the network;
 //-- pushes run in their own task so a slow browser cannot stall reception.
 //-- ==========================================================================
@@ -31,6 +37,9 @@
 
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -39,6 +48,8 @@
 #include "logger_receiver.h"
 #include "logger_settings.h"
 #include "logger_store.h"
+#include "logger_telnet.h"
+#include "wifi_provisioner.h"
 
 static const char* tag = "loggerWeb";
 
@@ -80,6 +91,15 @@ extern const char styleCssEnd[] asm("_binary_style_css_end");
 //-- The Actual Graph frame carries up to the full receiver power history
 //-- (a hundred samples) with six phase figures and the gas rate each.
 #define WEB_ACTUALGRAPH_JSON_BYTES 12288
+
+//-- The v3 status frame carries the reception status plus the Wi-Fi and
+//-- control owner fields the console's status command reports next to it.
+#define WEB_STATUS_V3_JSON_BYTES 1536
+//-- The v3 device frame renders the console's state block and the v3 store
+//-- frame lists every file on the LittleFS volume with the capacity block,
+//-- so both are sized with headroom above the fullest answer.
+#define WEB_DEVICE_JSON_BYTES 2048
+#define WEB_STORE_JSON_BYTES 8192
 
 //-- --------------------------------------------------------------------------
 //-- WebSocket transport
@@ -628,8 +648,12 @@ static void appendSettingsJson(stringBuilder* sb, const loggerSettingsConfig* co
   sbAppendFmt(sb, ",\"mqttPort\":%u", (unsigned)config->mqttPort);
   sbAppend(sb, ",\"mqttUser\":");
   sbAppendJsonString(sb, config->mqttUser);
-  sbAppend(sb, ",\"mqttPassword\":");
-  sbAppendJsonString(sb, config->mqttPassword);
+
+  //-- The MQTT password is never sent out over any channel (security rule):
+  //-- no settings frame on HTTP or WebSocket carries it. The SPA keeps the
+  //-- field empty and only sends a password when the operator types a new
+  //-- one; an omitted field keeps the stored password (see
+  //-- applySettingsFromForm).
   sbAppend(sb, ",\"mqttTopTopic\":");
   sbAppendJsonString(sb, config->mqttTopTopic);
   sbAppendFmt(sb, ",\"mqttIntervalSeconds\":%" PRIu32, config->mqttIntervalSeconds);
@@ -909,9 +933,27 @@ static const char* applySettingsFromForm(const char* body)
     copyTrimmed(candidate.mqttUser, sizeof candidate.mqttUser, text);
   }
 
+  //-- The MQTT password never travels to the client (see appendSettingsJson),
+  //-- so the SPA can only send one it just received from the operator: an
+  //-- omitted field keeps the stored password (the settings frame simply does
+  //-- not carry it), a present empty field is an explicit clear.
+  const char* mqttPasswordOutcome = "kept";
+
   if (formGet(body, "mqttPassword", text, sizeof text))
   {
     copyTrimmed(candidate.mqttPassword, sizeof candidate.mqttPassword, text);
+    mqttPasswordOutcome = (candidate.mqttPassword[0] != '\0') ? "updated" : "cleared";
+  }
+  else
+  {
+    loggerSettingsConfig carried;
+
+    //-- Same precedence as the settings frame: the stored configuration
+    //-- first, the receiver's active one as the fallback.
+    if ((loggerSettingsLoad(&carried) == ESP_OK) || loggerReceiverGetActiveConfig(&carried))
+    {
+      snprintf(candidate.mqttPassword, sizeof candidate.mqttPassword, "%s", carried.mqttPassword);
+    }
   }
 
   if (formGet(body, "mqttTopTopic", text, sizeof text))
@@ -1053,12 +1095,13 @@ static const char* applySettingsFromForm(const char* body)
     settingsSavedCallback(&candidate);
   }
 
+  //-- The password itself is never logged: only what happened to it.
   ESP_LOGI(tag,
            "configuration applied and stored: gpio %d, profile %s, rx polarity %s, tx polarity %s, "
-           "display %s",
+           "display %s, mqtt password %s",
            candidate.rxGpio, candidate.profileId, candidate.rxInverted ? "inverted" : "normal",
            candidate.txInverted ? "inverted" : "normal",
-           candidate.displayFlipped ? "upside down" : "normal");
+           candidate.displayFlipped ? "upside down" : "normal", mqttPasswordOutcome);
   return NULL;
 }
 
@@ -1085,7 +1128,10 @@ static const char* stateName(loggerReceiverState state)
   }
 }
 
-static void appendStatusJson(stringBuilder* sb, const loggerReceiverStatus* status)
+//-- Emits every status field but the closing brace: the plain status frame
+//-- closes it right away, the v3 frame adds the console's Wi-Fi and control
+//-- facts first.
+static void appendStatusFields(stringBuilder* sb, const loggerReceiverStatus* status)
 {
   sbAppend(sb, "{\"type\":\"status\",\"state\":");
   sbAppendJsonString(sb, stateName(status->state));
@@ -1129,7 +1175,13 @@ static void appendStatusJson(stringBuilder* sb, const loggerReceiverStatus* stat
   sbAppendJsonString(sb, PROG_VERSION);
   sbAppend(sb, ",\"deviceTime\":");
   sbAppendJsonString(sb, deviceTime);
-  sbAppendFmt(sb, ",\"wallClock\":%s}", wallClockAvailable ? "true" : "false");
+  sbAppendFmt(sb, ",\"wallClock\":%s", wallClockAvailable ? "true" : "false");
+}
+
+static void appendStatusJson(stringBuilder* sb, const loggerReceiverStatus* status)
+{
+  appendStatusFields(sb, status);
+  sbAppend(sb, "}");
 }
 
 static void appendMetaJson(stringBuilder* sb, const loggerTelegramMeta* meta)
@@ -1547,9 +1599,9 @@ static void appendPeriodGraphJson(stringBuilder* sb, loggerMeterRing_t ring)
   appendPeriodGraphFrame(sb, ring, "graph");
 }
 
-//-- Legacy spelling of the hours ring graph frame (cmd=hoursgraph and
-//-- GET /api/hoursgraph): the same frame as graph&ring=hours, answering
-//-- under the original type name so existing clients keep working.
+//-- Legacy spelling of the hours ring graph frame (cmd=hoursgraph on the
+//-- WebSocket): the same frame as graph&ring=hours, answering under the
+//-- original type name so existing clients keep working.
 static void appendHoursGraphJson(stringBuilder* sb)
 {
   appendPeriodGraphFrame(sb, LOGGER_RING_HOURS, "hoursgraph");
@@ -1711,19 +1763,6 @@ static esp_err_t handleConfigSave(httpd_req_t* req)
   return sendJson(req, "{\"ok\":true}");
 }
 
-static esp_err_t handleStatusGet(httpd_req_t* req)
-{
-  loggerReceiverStatus status;
-  loggerReceiverGetStatus(&status);
-
-  char buffer[WEB_STATUS_JSON_BYTES];
-  stringBuilder sb;
-  sbInit(&sb, buffer, sizeof buffer);
-  appendStatusJson(&sb, &status);
-
-  return sendJson(req, buffer);
-}
-
 static esp_err_t handleTelegramsGet(httpd_req_t* req)
 {
   char buffer[WEB_LIST_JSON_BYTES];
@@ -1739,52 +1778,39 @@ static esp_err_t handleTelegramsGet(httpd_req_t* req)
   return sendJson(req, buffer);
 }
 
-static esp_err_t handleTelegramGet(httpd_req_t* req)
+//-- Serves the exact accepted bytes of one retained record as plain text
+//-- (original line endings and trailer preserved, so nothing can be
+//-- interpreted as HTML). Used by the v3 raw endpoint; an aged-out sequence
+//-- answers like the console reports it.
+static esp_err_t serveTelegramRawBytes(httpd_req_t* req, uint32_t sequence)
 {
-  //-- The wildcard URI is either /api/telegram/<seq> or /api/telegram/<seq>/raw.
-  const char* argument = req->uri + strlen("/api/telegram/");
-  bool rawRequest = (strstr(argument, "/raw") != NULL);
-  char sequenceText[16];
-  snprintf(sequenceText, sizeof sequenceText, "%s", argument);
+  loggerTelegramRecord* record = malloc(sizeof *record);
 
-  for (char* cursor = sequenceText; *cursor != '\0'; cursor++)
+  if (record == NULL)
   {
-    if (*cursor == '/')
-    {
-      *cursor = '\0';
-      break;
-    }
+    return sendError(req, 500, "out of memory");
   }
 
-  uint32_t sequence = (uint32_t)strtoul(sequenceText, NULL, 10);
-
-  if (rawRequest)
+  if (!loggerReceiverGetRecord(sequence, record))
   {
-    loggerTelegramRecord* record = malloc(sizeof *record);
-
-    if (record == NULL)
-    {
-      return sendError(req, 500, "out of memory");
-    }
-
-    if (!loggerReceiverGetRecord(sequence, record))
-    {
-      free(record);
-
-      httpd_resp_set_status(req, "404 Not Found");
-      httpd_resp_set_type(req, "text/plain; charset=utf-8");
-      return httpd_resp_send(req, "aged out", HTTPD_RESP_USE_STRLEN);
-    }
-
-    //-- Exact bytes of the accepted frame: original line endings and trailer
-    //-- preserved, served as plain text so nothing is interpreted as HTML.
-    httpd_resp_set_type(req, "text/plain; charset=utf-8");
-    esp_err_t result =
-        httpd_resp_send(req, (const char*)record->rawBytes, (int)record->meta.rawLength);
     free(record);
-    return result;
+
+    httpd_resp_set_status(req, "404 Not Found");
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    return httpd_resp_send(req, "aged out", HTTPD_RESP_USE_STRLEN);
   }
 
+  httpd_resp_set_type(req, "text/plain; charset=utf-8");
+  esp_err_t result =
+      httpd_resp_send(req, (const char*)record->rawBytes, (int)record->meta.rawLength);
+  free(record);
+  return result;
+}
+
+//-- Serves the decoded detail JSON of one retained record (the same frame
+//-- the cmd=telegram answer sends). Used by the v3 telegram endpoint.
+static esp_err_t serveTelegramDetailJson(httpd_req_t* req, uint32_t sequence)
+{
   char* json = malloc(WEB_DETAIL_JSON_BYTES);
 
   if (json == NULL)
@@ -1870,33 +1896,6 @@ static esp_err_t handleRingFileGet(httpd_req_t* req)
   return result;
 }
 
-static esp_err_t handleHoursGraphGet(httpd_req_t* req)
-{
-  //-- The hourly usage series of the Hours Graph view for diagnostics: the
-  //-- same frame the cmd=hoursgraph answer sends. The walk runs on this
-  //-- task like the ring file table (ring_file_store documents 8 KB of
-  //-- stack for any task driving it, which the enlarged httpd stack covers).
-  char* buffer = malloc(WEB_HOURSGRAPH_JSON_BYTES);
-
-  if (buffer == NULL)
-  {
-    return sendError(req, 500, "out of memory");
-  }
-
-  stringBuilder sb;
-  sbInit(&sb, buffer, WEB_HOURSGRAPH_JSON_BYTES);
-  appendHoursGraphJson(&sb);
-
-  if (sb.overflow)
-  {
-    ESP_LOGE(tag, "hours graph json overflow");
-  }
-
-  esp_err_t result = sendJson(req, buffer);
-  free(buffer);
-  return result;
-}
-
 static esp_err_t handleGraphGet(httpd_req_t* req)
 {
   //-- The usage series of one ring for the Hours, Days and Months Graph
@@ -1974,6 +1973,425 @@ static esp_err_t handleViewReport(httpd_req_t* req)
 
   loggerBoardShowScreen(screen);
   return sendJson(req, "{\"ok\":true}");
+}
+
+//-- --------------------------------------------------------------------------
+//-- v3 API: standard data calls under /api/v3/
+//-- --------------------------------------------------------------------------
+
+//-- Every datum the telnet console and the SPA can request and show is also
+//-- retrievable here as a plain GET, each endpoint under a short
+//-- descriptive English name. The frames reuse the WebSocket JSON builders
+//-- (so they carry the same "type" tag and fields the SPA receives); the
+//-- console-only answers — version line, device state block, LittleFS
+//-- volume listing and the csv rendering of a ring — are added as JSON (or
+//-- csv text) in this section. The two actions the SPA normally sends over
+//-- the WebSocket (save settings, report the viewed screen) are the POST
+//-- endpoints below; a populate import stays on the console. There is no
+//-- unversioned /api/ surface anymore: everything lives under /api/v3/.
+
+typedef struct
+{
+  const char* method;
+  const char* uri;
+  const char* description;
+} ApiV3Entry;
+
+//-- The published v3 surface, listed verbatim by the index endpoint.
+static const ApiV3Entry apiV3Entries[] = {
+    {"GET", "/api/v3", "this index of the v3 endpoints"},
+    {"GET", "/api/v3/config", "stored settings with the active state and valid choices"},
+    {"POST", "/api/v3/config",
+     "save form-urlencoded settings; omitting mqttPassword keeps the stored password"},
+    {"GET", "/api/v3/status", "reception state, counters, clock, Wi-Fi and control owners"},
+    {"GET", "/api/v3/version", "firmware, parser, ESP-IDF and compiler versions"},
+    {"GET", "/api/v3/device",
+     "device state block: identity, versions, memory, chip and flash facts"},
+    {"GET", "/api/v3/telegrams", "metadata of the retained telegram records, newest first"},
+    {"GET", "/api/v3/telegram", "decoded fields of the most recently accepted telegram"},
+    {"GET", "/api/v3/telegram/<seq>", "decoded fields of one retained telegram"},
+    {"GET", "/api/v3/raw", "exact bytes of the most recently accepted telegram (text/plain)"},
+    {"GET", "/api/v3/raw/<seq>", "exact accepted bytes of one retained telegram (text/plain)"},
+    {"GET", "/api/v3/power", "realtime power frame of the newest telegram with its sample history"},
+    {"GET", "/api/v3/ringfile?ring=<hours|days|months>",
+     "stored records of one meter ring, newest first"},
+    {"GET", "/api/v3/graph?ring=<hours|days|months>",
+     "per-period used/returned kWh and gas m3 of one ring, oldest first"},
+    {"GET", "/api/v3/actualgraph", "rolling per-phase sample table of the newest telegrams"},
+    {"GET", "/api/v3/store", "LittleFS volume: files with sizes, capacity and free space"},
+    {"GET", "/api/v3/csv?ring=<hours|days|months>",
+     "one meter ring as re-importable csv (text/csv, the ring2csv content)"},
+    {"POST", "/api/v3/view", "reports the active browser screen name to the device display"},
+};
+
+static esp_err_t handleApiV3IndexGet(httpd_req_t* req)
+{
+  char* buffer = malloc(WEB_CONFIG_JSON_BYTES);
+
+  if (buffer == NULL)
+  {
+    return sendError(req, 500, "out of memory");
+  }
+
+  stringBuilder sb;
+  sbInit(&sb, buffer, WEB_CONFIG_JSON_BYTES);
+  sbAppend(&sb, "{\"type\":\"api\",\"api\":\"v3\",\"endpoints\":[");
+
+  for (size_t index = 0u; index < (sizeof apiV3Entries / sizeof apiV3Entries[0]); index++)
+  {
+    sbAppendFmt(&sb, "%s{\"method\":", (index > 0u) ? "," : "");
+    sbAppendJsonString(&sb, apiV3Entries[index].method);
+    sbAppend(&sb, ",\"uri\":");
+    sbAppendJsonString(&sb, apiV3Entries[index].uri);
+    sbAppend(&sb, ",\"description\":");
+    sbAppendJsonString(&sb, apiV3Entries[index].description);
+    sbAppend(&sb, "}");
+  }
+
+  sbAppend(&sb, "]}");
+
+  esp_err_t result = sendJson(req, buffer);
+  free(buffer);
+  return result;
+}
+
+static esp_err_t handleApiV3StatusGet(httpd_req_t* req)
+{
+  loggerReceiverStatus status;
+  loggerReceiverGetStatus(&status);
+
+  char buffer[WEB_STATUS_V3_JSON_BYTES];
+  stringBuilder sb;
+  sbInit(&sb, buffer, sizeof buffer);
+  appendStatusFields(&sb, &status);
+
+  //-- The Wi-Fi facts the console's status command prints next to the
+  //-- reception block: the configured SSID and the granted address.
+  wifi_config_t stationConfig;
+  memset(&stationConfig, 0, sizeof stationConfig);
+  const char* ssid = "?";
+
+  if (esp_wifi_get_config(WIFI_IF_STA, &stationConfig) == ESP_OK)
+  {
+    ssid = (const char*)stationConfig.sta.ssid;
+  }
+
+  sbAppend(&sb, ",\"wifiSsid\":");
+  sbAppendJsonString(&sb, ssid);
+
+  esp_netif_ip_info_t ipInfo;
+  memset(&ipInfo, 0, sizeof ipInfo);
+  char ip[16] = "not connected";
+  bool wifiConnected = (wifi_prov_get_ip_info(&ipInfo) == ESP_OK);
+
+  if (wifiConnected)
+  {
+    snprintf(ip, sizeof ip, IPSTR, IP2STR(&ipInfo.ip));
+  }
+
+  sbAppend(&sb, ",\"wifiIp\":");
+  sbAppendJsonString(&sb, ip);
+  sbAppendFmt(&sb, ",\"wifiConnected\":%s", wifiConnected ? "true" : "false");
+
+  //-- One control slot per channel: a browser page and a telnet session can
+  //-- each hold their own, so both claims are reported.
+  int ownerFd = -1;
+  bool webClaimed = loggerControlGetOwner(LOGGER_CONTROL_WEB, &ownerFd);
+  ownerFd = -1;
+  bool telnetClaimed = loggerControlGetOwner(LOGGER_CONTROL_TELNET, &ownerFd);
+
+  sbAppendFmt(&sb, ",\"controlWebClaimed\":%s", webClaimed ? "true" : "false");
+  sbAppendFmt(&sb, ",\"controlTelnetClaimed\":%s", telnetClaimed ? "true" : "false");
+  sbAppend(&sb, "}");
+
+  return sendJson(req, buffer);
+}
+
+static esp_err_t handleApiV3VersionGet(httpd_req_t* req)
+{
+  //-- The console's version line as JSON, plus the compile facts the state
+  //-- block prints above it.
+  char compileStamp[32];
+  snprintf(compileStamp, sizeof compileStamp, "%s %s", __DATE__, __TIME__);
+
+  char buffer[512];
+  stringBuilder sb;
+  sbInit(&sb, buffer, sizeof buffer);
+  sbAppend(&sb, "{\"type\":\"version\",\"firmwareVersion\":");
+  sbAppendJsonString(&sb, PROG_VERSION);
+  sbAppend(&sb, ",\"parserVersion\":");
+  sbAppendJsonString(&sb, dsmrParserVersion());
+  sbAppend(&sb, ",\"idfVersion\":");
+  sbAppendJsonString(&sb, esp_get_idf_version());
+  sbAppend(&sb, ",\"compilerVersion\":");
+  sbAppendJsonString(&sb, __VERSION__);
+  sbAppend(&sb, ",\"compileStamp\":");
+  sbAppendJsonString(&sb, compileStamp);
+  sbAppend(&sb, "}");
+
+  return sendJson(req, buffer);
+}
+
+static esp_err_t handleApiV3DeviceGet(httpd_req_t* req)
+{
+  //-- The console's state block as JSON: same facts, collected by the very
+  //-- getter the console prints from (logger_telnet owns the state block).
+  loggerTelnetDeviceInfo info;
+
+  if (!loggerTelnetGetDeviceInfo(&info))
+  {
+    return sendError(req, 500, "device facts unavailable");
+  }
+
+  char* buffer = malloc(WEB_DEVICE_JSON_BYTES);
+
+  if (buffer == NULL)
+  {
+    return sendError(req, 500, "out of memory");
+  }
+
+  stringBuilder sb;
+  sbInit(&sb, buffer, WEB_DEVICE_JSON_BYTES);
+
+  sbAppend(&sb, "{\"type\":\"device\",\"copyright\":");
+  sbAppendJsonString(&sb, info.copyright);
+  sbAppend(&sb, ",\"hostname\":");
+  sbAppendJsonString(&sb, info.hostname);
+  sbAppend(&sb, ",\"firmwareVersion\":");
+  sbAppendJsonString(&sb, info.firmwareVersion);
+  sbAppend(&sb, ",\"compileDate\":");
+  sbAppendJsonString(&sb, info.compileDate);
+  sbAppend(&sb, ",\"compileStamp\":");
+  sbAppendJsonString(&sb, info.compileStamp);
+  sbAppend(&sb, ",\"idfVersion\":");
+  sbAppendJsonString(&sb, info.idfVersion);
+  sbAppend(&sb, ",\"parserVersion\":");
+  sbAppendJsonString(&sb, info.parserVersion);
+  sbAppend(&sb, ",\"compilerVersion\":");
+  sbAppendJsonString(&sb, info.compilerVersion);
+  sbAppend(&sb, ",\"chipModel\":");
+  sbAppendJsonString(&sb, info.chipModel);
+  sbAppendFmt(&sb, ",\"chipRevisionMajor\":%u,\"chipRevisionMinor\":%u,\"chipCores\":%d",
+              info.chipRevisionMajor, info.chipRevisionMinor, info.chipCores);
+  sbAppendFmt(&sb, ",\"chipId\":%" PRIu64, info.chipId);
+  sbAppendFmt(&sb, ",\"cpuFreqMhz\":%d", info.cpuFreqMhz);
+  sbAppendFmt(&sb, ",\"freeHeapBytes\":%" PRIu32, info.freeHeapBytes);
+  sbAppendFmt(&sb, ",\"minFreeHeapBytes\":%" PRIu32, info.minFreeHeapBytes);
+  sbAppendFmt(&sb, ",\"largestFreeBlockBytes\":%" PRIu32, info.largestFreeBlockBytes);
+  sbAppendFmt(&sb, ",\"psramFreeBytes\":%" PRIu32, info.psramFreeBytes);
+  sbAppendFmt(&sb, ",\"psramTotalBytes\":%" PRIu32, info.psramTotalBytes);
+  sbAppendFmt(&sb, ",\"hasAppPartition\":%s", info.hasAppPartition ? "true" : "false");
+  sbAppendFmt(&sb, ",\"appPartitionBytes\":%" PRIu32, info.appPartitionBytes);
+  sbAppendFmt(&sb, ",\"imageVerified\":%s", info.imageVerified ? "true" : "false");
+  sbAppendFmt(&sb, ",\"imageBytes\":%" PRIu32, info.imageBytes);
+  sbAppendFmt(&sb, ",\"freeSketchBytes\":%" PRIu32,
+              info.imageVerified ? (info.appPartitionBytes - info.imageBytes) : 0u);
+  sbAppendFmt(&sb, ",\"hasImageHeader\":%s", info.hasImageHeader ? "true" : "false");
+  sbAppend(&sb, ",\"flashMode\":");
+  sbAppendJsonString(&sb, info.flashMode);
+  sbAppend(&sb, ",\"flashSpeed\":");
+  sbAppendJsonString(&sb, info.flashSpeed);
+  sbAppendFmt(&sb, ",\"flashSizeReadable\":%s", info.flashSizeReadable ? "true" : "false");
+  sbAppendFmt(&sb, ",\"flashBytes\":%" PRIu32, info.flashBytes);
+  sbAppend(&sb, ",\"flashSizeError\":");
+  sbAppendJsonString(&sb, info.flashSizeError);
+  sbAppendFmt(&sb, ",\"hasStoragePartition\":%s", info.hasStoragePartition ? "true" : "false");
+  sbAppendFmt(&sb, ",\"storageKb\":%" PRIu32, info.storageKb);
+  sbAppend(&sb, "}");
+
+  if (sb.overflow)
+  {
+    ESP_LOGE(tag, "device json overflow");
+  }
+
+  esp_err_t result = sendJson(req, buffer);
+  free(buffer);
+  return result;
+}
+
+//-- Visitor of the volume scan: renders one file as a JSON entry.
+typedef struct
+{
+  stringBuilder* sb;
+  uint32_t emitted;
+} StoreFileEmit;
+
+static bool appendStoreFileEntry(const char* name, bool isDirectory, bool readable,
+                                 uint32_t sizeBytes, void* userData)
+{
+  StoreFileEmit* emit = (StoreFileEmit*)userData;
+  stringBuilder* sb = emit->sb;
+
+  sbAppendFmt(sb, "%s{\"name\":", (emit->emitted > 0u) ? "," : "");
+  sbAppendJsonString(sb, name);
+  sbAppendFmt(sb, ",\"directory\":%s,\"readable\":%s,\"sizeBytes\":%" PRIu32 "}",
+              isDirectory ? "true" : "false", readable ? "true" : "false", sizeBytes);
+  emit->emitted++;
+
+  //-- Stop the scan the moment the buffer is full: the client receives the
+  //-- entries that fit instead of a truncated JSON tail.
+  return !sb->overflow;
+}
+
+static esp_err_t handleApiV3StoreGet(httpd_req_t* req)
+{
+  //-- The console's store command as JSON: every file on the mounted
+  //-- LittleFS volume with its size, then the capacity block.
+  char* buffer = malloc(WEB_STORE_JSON_BYTES);
+
+  if (buffer == NULL)
+  {
+    return sendError(req, 500, "out of memory");
+  }
+
+  stringBuilder sb;
+  sbInit(&sb, buffer, WEB_STORE_JSON_BYTES);
+
+  bool mounted = (loggerStoreMountPoint() != NULL);
+  sbAppendFmt(&sb, "{\"type\":\"store\",\"mounted\":%s,\"files\":[", mounted ? "true" : "false");
+
+  StoreFileEmit emit;
+  memset(&emit, 0, sizeof emit);
+  emit.sb = &sb;
+  esp_err_t scanned =
+      mounted ? loggerStoreListFiles(appendStoreFileEntry, &emit) : ESP_ERR_INVALID_STATE;
+
+  sbAppendFmt(&sb, "],\"available\":%s", (scanned == ESP_OK) ? "true" : "false");
+
+  size_t totalBytes = 0u;
+  size_t usedBytes = 0u;
+  bool hasCapacity = loggerStoreVolumeInfo(&totalBytes, &usedBytes);
+
+  sbAppendFmt(&sb, ",\"capacity\":{\"available\":%s", hasCapacity ? "true" : "false");
+
+  if (hasCapacity)
+  {
+    sbAppendFmt(&sb, ",\"totalBytes\":%lu,\"usedBytes\":%lu,\"freeBytes\":%lu",
+                (unsigned long)totalBytes, (unsigned long)usedBytes,
+                (unsigned long)(totalBytes - usedBytes));
+  }
+
+  sbAppend(&sb, "]}");
+
+  if (sb.overflow)
+  {
+    ESP_LOGE(tag, "store json overflow");
+  }
+
+  esp_err_t result = sendJson(req, buffer);
+  free(buffer);
+  return result;
+}
+
+static esp_err_t handleApiV3CsvGet(httpd_req_t* req)
+{
+  //-- The csv content the console's ring2csv command writes to the volume,
+  //-- served directly as a download: same header, same lines, same file
+  //-- name (the text re-imports through populate unchanged). The optional
+  //-- ?ring= query selects the ring (hours by default).
+  loggerMeterRing_t ring = LOGGER_RING_HOURS;
+  const char* query = strchr(req->uri, '?');
+
+  if ((query != NULL) && !ringFromParameters(query + 1, &ring))
+  {
+    return sendError(req, 400, "unknown ring");
+  }
+
+  char* text = NULL;
+  uint32_t records = 0u;
+  esp_err_t outcome = loggerStoreRingToCsvText(ring, &text, &records);
+
+  if (outcome != ESP_OK)
+  {
+    free(text);
+    return sendError(req, 500,
+                     (outcome == ESP_ERR_INVALID_STATE) ? "meter store not running"
+                                                        : esp_err_to_name(outcome));
+  }
+
+  char disposition[64];
+  snprintf(disposition, sizeof disposition, "attachment; filename=\"RING%s.csv\"",
+           loggerStoreRingName(ring));
+
+  httpd_resp_set_hdr(req, "Content-Disposition", disposition);
+  httpd_resp_set_type(req, "text/csv; charset=utf-8");
+
+  ESP_LOGI(tag, "v3 csv served %" PRIu32 " record(s) of the %s ring", records,
+           loggerStoreRingName(ring));
+
+  esp_err_t result = httpd_resp_send(req, text, HTTPD_RESP_USE_STRLEN);
+  free(text);
+  return result;
+}
+
+//-- Sequence of the most recently accepted telegram (the newest entry of
+//-- the retained list). False while no telegram was accepted at all, so the
+//-- endpoints without a sequence can answer like the console does.
+static bool latestAcceptedSequence(uint32_t* outSequence)
+{
+  loggerTelegramMeta newest;
+
+  if (loggerReceiverListRecords(&newest, 1u) == 0u)
+  {
+    return false;
+  }
+
+  *outSequence = newest.sequence;
+  return true;
+}
+
+static esp_err_t handleApiV3TelegramGet(httpd_req_t* req)
+{
+  const char* argument = req->uri + strlen("/api/v3/telegram");
+
+  while (*argument == '/')
+  {
+    argument++;
+  }
+
+  //-- No sequence in the URI: the most recently accepted telegram, like the
+  //-- console's telegram command without an argument.
+  if (argument[0] == '\0')
+  {
+    uint32_t sequence = 0u;
+
+    if (!latestAcceptedSequence(&sequence))
+    {
+      return sendError(req, 404, "no accepted telegram yet");
+    }
+
+    return serveTelegramDetailJson(req, sequence);
+  }
+
+  return serveTelegramDetailJson(req, (uint32_t)strtoul(argument, NULL, 10));
+}
+
+static esp_err_t handleApiV3RawGet(httpd_req_t* req)
+{
+  const char* argument = req->uri + strlen("/api/v3/raw");
+
+  while (*argument == '/')
+  {
+    argument++;
+  }
+
+  //-- No sequence: the most recently accepted telegram, like the console's
+  //-- raw command without an argument.
+  if (argument[0] == '\0')
+  {
+    uint32_t sequence = 0u;
+
+    if (!latestAcceptedSequence(&sequence))
+    {
+      httpd_resp_set_status(req, "404 Not Found");
+      httpd_resp_set_type(req, "text/plain; charset=utf-8");
+      return httpd_resp_send(req, "no accepted telegram yet", HTTPD_RESP_USE_STRLEN);
+    }
+
+    return serveTelegramRawBytes(req, sequence);
+  }
+
+  return serveTelegramRawBytes(req, (uint32_t)strtoul(argument, NULL, 10));
 }
 
 //-- --------------------------------------------------------------------------
@@ -2545,7 +2963,16 @@ esp_err_t loggerWebStart(void)
   }
 
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.max_uri_handlers = 16;
+
+  //-- Room for every URI below with headroom: the assets, the v2 API, the
+  //-- /api/v3 data endpoints and the single /ws handler.
+  config.max_uri_handlers = 32;
+
+  //-- The per-sequence endpoints carry a trailing wildcard (/api/telegram/*,
+  //-- /api/v3/telegram/*, /api/v3/raw/*): esp_http_server honours those only
+  //-- once the documented wildcard matcher is selected — the default matcher
+  //-- is a plain string compare, which never matches a wildcarded URI.
+  config.uri_match_fn = httpd_uri_match_wildcard;
 
   //-- A single page load opens roughly five concurrent sockets; the default
   //-- of four was already too tight for one browser (see the sizing note in
@@ -2585,17 +3012,32 @@ esp_err_t loggerWebStart(void)
   registerUri(server, "/app.js", HTTP_GET, false, handleAppJs);
   registerUri(server, "/style.css", HTTP_GET, false, handleStyleCss);
   registerUri(server, "/favicon.ico", HTTP_GET, false, handleFavicon);
-  registerUri(server, "/api/config", HTTP_GET, false, handleConfigGet);
-  registerUri(server, "/api/config", HTTP_POST, false, handleConfigSave);
-  registerUri(server, "/api/status", HTTP_GET, false, handleStatusGet);
-  registerUri(server, "/api/telegrams", HTTP_GET, false, handleTelegramsGet);
-  registerUri(server, "/api/telegram/*", HTTP_GET, false, handleTelegramGet);
-  registerUri(server, "/api/power", HTTP_GET, false, handlePowerGet);
-  registerUri(server, "/api/ringfile", HTTP_GET, false, handleRingFileGet);
-  registerUri(server, "/api/hoursgraph", HTTP_GET, false, handleHoursGraphGet);
-  registerUri(server, "/api/graph", HTTP_GET, false, handleGraphGet);
-  registerUri(server, "/api/actualgraph", HTTP_GET, false, handleActualGraphGet);
-  registerUri(server, "/api/view", HTTP_POST, false, handleViewReport);
+
+  //-- The whole API lives under /api/v3/: everything the console and the
+  //-- SPA can request is a plain GET here (the two SPA actions are POSTs).
+  //-- There is deliberately no unversioned /api/ surface: an API version 4
+  //-- can then introduce its own syntax without an unversioned layer beside
+  //-- it. The frames are URI-agnostic, so several v3 routes re-enter the
+  //-- shared builders' handlers.
+  registerUri(server, "/api/v3", HTTP_GET, false, handleApiV3IndexGet);
+  registerUri(server, "/api/v3/config", HTTP_GET, false, handleConfigGet);
+  registerUri(server, "/api/v3/config", HTTP_POST, false, handleConfigSave);
+  registerUri(server, "/api/v3/status", HTTP_GET, false, handleApiV3StatusGet);
+  registerUri(server, "/api/v3/version", HTTP_GET, false, handleApiV3VersionGet);
+  registerUri(server, "/api/v3/device", HTTP_GET, false, handleApiV3DeviceGet);
+  registerUri(server, "/api/v3/telegrams", HTTP_GET, false, handleTelegramsGet);
+  registerUri(server, "/api/v3/telegram", HTTP_GET, false, handleApiV3TelegramGet);
+  registerUri(server, "/api/v3/telegram/*", HTTP_GET, false, handleApiV3TelegramGet);
+  registerUri(server, "/api/v3/raw", HTTP_GET, false, handleApiV3RawGet);
+  registerUri(server, "/api/v3/raw/*", HTTP_GET, false, handleApiV3RawGet);
+  registerUri(server, "/api/v3/power", HTTP_GET, false, handlePowerGet);
+  registerUri(server, "/api/v3/ringfile", HTTP_GET, false, handleRingFileGet);
+  registerUri(server, "/api/v3/graph", HTTP_GET, false, handleGraphGet);
+  registerUri(server, "/api/v3/actualgraph", HTTP_GET, false, handleActualGraphGet);
+  registerUri(server, "/api/v3/store", HTTP_GET, false, handleApiV3StoreGet);
+  registerUri(server, "/api/v3/csv", HTTP_GET, false, handleApiV3CsvGet);
+  registerUri(server, "/api/v3/view", HTTP_POST, false, handleViewReport);
+
   registerUri(server, "/ws", HTTP_GET, true, handleWebSocket);
 
   if (wsPushTask == NULL)

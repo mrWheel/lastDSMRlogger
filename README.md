@@ -1,6 +1,6 @@
 # lastDSMRlogger
 
-Buildnumber: 37
+Buildnumber: 39
 Last update-date: 2026-11-21
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
@@ -139,8 +139,10 @@ dynamic data (status, telegram list, settings, details, raw frames) travels
 over one WebSocket at `/ws`: the device pushes status every second and the
 telegram list whenever a telegram was accepted, the browser sends
 form-urlencoded commands, and raw telegram bytes arrive as a binary frame.
-The HTTP API remains available for diagnostics and clients without
-WebSocket support. The SPA opens with the **Telegrams** view. Embedded
+The HTTP API is versioned: the only surface is `/api/v3/` (see API below),
+there are no unversioned `/api/` paths, so a future v4 can introduce its
+own syntax without an unversioned layer beside it. The SPA opens with the
+**Telegrams** view. Embedded
 assets are served with `Cache-Control: no-store` so a browser reload never
 runs a stale `app.js` after a firmware update. The web server task runs on
 an 8 KB stack: WebSocket command handling builds the telegram detail JSON
@@ -171,7 +173,9 @@ the device.
   version reported by the meter), and M-Bus channels 1–4 with Auto, Disabled
   or an explicit device type. All dropdowns are filled from the valid
   choices the device reports. An **MQTT** group enters the broker IP/URL,
-  broker port, user, password, top topic and broadcast interval
+  broker port, user, password, top topic and broadcast interval (the stored
+  password is never shown by the device: the password field starts empty
+  and a save only sends it when the operator typed a new one)
   (0 = no broadcast); a **Network** group enters the hostname and the fixed
   IP (only the last part — empty or 0 means plain DHCP). Save validates and
   applies the complete configuration as one operation and stores it in NVS;
@@ -209,12 +213,12 @@ the device.
   at least every five seconds, and every read interval when the interval
   is shorter: the device pushes the newest power frame the moment a
   telegram is accepted and the SPA polls `cmd=power` on its own timer as
-  well. `GET /api/power` serves the same JSON without WebSocket support.
+  well. `GET /api/v3/power` serves the same JSON without WebSocket support.
 - **Show RingFile**: the stored records of one on-device meter ring (hours,
   days or months; a radio group picks the ring, a Refresh button re-requests
   it), newest period first: one table row per stored period with the five
   meter counters (kWh and m³) and the three fictional tariff amounts (EUR).
-  `cmd=ringfile&ring=<period>` on the WebSocket, `GET /api/ringfile` with
+  `cmd=ringfile&ring=<period>` on the WebSocket, `GET /api/v3/ringfile` with
   the optional `?ring=` query serve the same JSON.
 - **Hours Graph / Days Graph / Months Graph**: the usage overview of one
   meter ring, styled after the `assets/hoursGraph.png`,
@@ -240,10 +244,10 @@ the device.
   panel shows exactly one chip: the one for the bar the cursor sits on
   (this period or previous year, used or returned); the
   state line names the API the records come from
-  (`/api/ringfile?ring=hours|days|months`). The device turns the retained
+  (`/api/v3/ringfile?ring=hours|days|months`). The device turns the retained
   cumulative counters into per-period differences
-  (`cmd=graph&ring=<period>`, or `GET /api/graph?ring=<period>`;
-  `cmd=hoursgraph` and `GET /api/hoursgraph` remain as the hours spelling):
+  (`cmd=graph&ring=<period>`, or `GET /api/v3/graph?ring=<period>`;
+  `cmd=hoursgraph` remains as the hours spelling on the WebSocket):
   the oldest record has no predecessor and is left out, a counter reset is
   clamped to zero, a period that does not directly follow its retained
   predecessor (imported history ending in the past, periods aged out of the
@@ -258,7 +262,7 @@ the device.
   unsigned delivered and returned watts of each phase (OBIS
   `1-0:21/41/61.7.0` and `1-0:22/42/62.7.0`), the gas m³/h rate of the last
   observed gas-counter increase (held between gas arrivals) and the sample
-  time. `cmd=actualgraph` (or `GET /api/actualgraph`) hands the table over
+  time. `cmd=actualgraph` (or `GET /api/v3/actualgraph`) hands the table over
   oldest first. The upper panel stacks the used watts upwards (light red
   L1, red L2, dark red L3) and the returned watts downwards (light green
   L1, green L2, dark green L3), every phase keeping its own colour and its
@@ -330,23 +334,44 @@ so neither adds to the rejected total. Because older firmware counted every
 diagnostic, the persisted rejected total is rebased to zero once after this
 firmware boots.
 
-### API
+### API — standard data calls under /api/v3/
 
-|Method |Path                        |Purpose                                                       |
-|-------|----------------------------|--------------------------------------------------------------|
-|WS     |`/ws`                       |SPA transport: status/telegram/power pushes + `cmd=config\|save\|status\|telegrams\|telegram\|raw\|power\|ringfile\|graph\|actualgraph\|hoursgraph\|view`, raw bytes as binary frame |
-|GET    |`/api/config`               |NVS settings + active state + valid choices (data sources, interval bounds, countries, profiles) |
-|POST   |`/api/config`               |Save form-urlencoded settings incl. `rxGpio`, `rxInverted` (0/1) and `interval` (interval clamped to 2..600; one atomic operation) |
-|GET    |`/api/status`               |Reception state, counters, last diagnostic, uptime            |
-|GET    |`/api/telegrams`            |Metadata of retained records (incl. `meterTimeText` from OBIS `0-0:1.0.0`), newest first |
-|GET    |`/api/telegram/<seq>`       |Decoded detail of one record                                  |
-|GET    |`/api/telegram/<seq>/raw`   |Exact accepted frame bytes as `text/plain`                    |
-|GET    |`/api/power`                |Realtime power frame of the newest accepted telegram (phases and total watts/amps/volts, meter time, scale ladder step, history of the newest 100 accepted total watts) |
-|GET    |`/api/ringfile`             |Records of one meter ring (`?ring=hours\|days\|months`, hours by default), newest first |
-|GET    |`/api/graph`                |Per-period used/returned kWh and gas m³ of one ring (`?ring=hours\|days\|months`, hours by default; differences of consecutive counters), oldest first |
-|GET    |`/api/hoursgraph`           |Legacy spelling of `/api/graph?ring=hours` (answers under type `hoursgraph`) |
-|GET    |`/api/actualgraph`          |Rolling table of the newest ~100 accepted telegrams: delivered and returned watts per phase, held gas m³/h and sample time, oldest first |
-|POST   |`/api/view`                 |Reports the active browser screen name to the device display  |
+Everything the telnet console and the SPA can request and show is
+retrievable as a plain GET under `/api/v3/`, each endpoint under a short
+descriptive English name. The JSON frames answer exactly what the console
+prints and what the SPA receives (they carry the same `type` tag); the
+index at `/api/v3` lists the surface live from the device. The two SPA
+actions (save settings, report the viewed screen) are POSTs in the same
+namespace; a populate import stays on the console. There is no unversioned
+`/api/` surface: all endpoints are versioned so a future v4 can define its
+own syntax.
+
+The MQTT password never leaves the device: no settings frame (HTTP or
+WebSocket) carries `mqttPassword`, the SPA's password field starts empty,
+and a save that omits the `mqttPassword` field keeps the stored password
+(a present empty value clears it explicitly).
+
+|Method |Path                                    |Purpose                                                       |
+|-------|----------------------------------------|--------------------------------------------------------------|
+|WS     |`/ws`                                   |SPA transport: status/telegram/power pushes + `cmd=config\|save\|status\|telegrams\|telegram\|raw\|power\|ringfile\|graph\|actualgraph\|hoursgraph\|view`, raw bytes as binary frame |
+|GET    |`/api/v3`                               |Index: lists all v3 endpoints with descriptions               |
+|GET    |`/api/v3/config`                        |NVS settings + active state + valid choices (data sources, interval bounds, countries, profiles); never includes `mqttPassword` |
+|POST   |`/api/v3/config`                        |Save form-urlencoded settings incl. `rxGpio`, `rxInverted` (0/1) and `interval` (interval clamped to 2..600; one atomic operation; omitted `mqttPassword` keeps the stored password) |
+|GET    |`/api/v3/status`                        |Reception state, counters, last diagnostic, uptime **plus** the console's extra facts: `wifiSsid`, `wifiIp`, `wifiConnected`, `controlWebClaimed`, `controlTelnetClaimed` |
+|GET    |`/api/v3/version`                       |Console version line as JSON: firmware, parserDSMR, ESP-IDF and gcc versions, compile stamp |
+|GET    |`/api/v3/device`                        |Console state block as JSON: copyright, hostname, versions, chip, heap, PSRAM, image and flash facts |
+|GET    |`/api/v3/telegrams`                     |Metadata of retained records (incl. `meterTimeText` from OBIS `0-0:1.0.0`), newest first |
+|GET    |`/api/v3/telegram`                      |Decoded fields of the most recently accepted telegram         |
+|GET    |`/api/v3/telegram/<seq>`                |Decoded detail of one retained record                         |
+|GET    |`/api/v3/raw`                           |Exact bytes of the most recently accepted telegram (`text/plain`) |
+|GET    |`/api/v3/raw/<seq>`                     |Exact accepted frame bytes as `text/plain`                    |
+|GET    |`/api/v3/power`                         |Realtime power frame of the newest accepted telegram (phases and total watts/amps/volts, meter time, scale ladder step, history of the newest 100 accepted total watts) |
+|GET    |`/api/v3/ringfile?ring=hours\|days\|months` |Records of one meter ring (hours by default), newest first |
+|GET    |`/api/v3/graph?ring=hours\|days\|months`|Per-period used/returned kWh and gas m³ of one ring (hours by default; differences of consecutive counters), oldest first |
+|GET    |`/api/v3/actualgraph`                   |Rolling table of the newest ~100 accepted telegrams: delivered and returned watts per phase, held gas m³/h and sample time, oldest first |
+|GET    |`/api/v3/store`                         |Console `store` command as JSON: every LittleFS volume file with its size, plus capacity, used and free bytes |
+|GET    |`/api/v3/csv?ring=hours\|days\|months`  |Console `ring2csv` content as a `text/csv` download: the exact `RING<name>.csv` a ring2csv would write (re-importable through populate), without touching the volume |
+|POST   |`/api/v3/view`                          |Reports the active browser screen name to the device display  |
 
 ### Test data mode
 
@@ -447,8 +472,8 @@ the LittleFS volume):
 |`status`         |reception state, counters, clock, Wi-Fi, control owner **and** the device state block (copyright, hostname, versions, memory, chip, flash) |
 |`version`        |firmware and parserDSMR versions                                 |
 |`telegrams`      |the telegrams retained in RAM                                    |
-|`telegram <seq>` |decoded fields of one retained telegram                          |
-|`raw <seq>`      |exact accepted bytes of one retained telegram                    |
+|`telegram [<seq>]`|decoded fields of one retained telegram; without a sequence the most recently accepted telegram |
+|`raw [<seq>]`    |exact accepted bytes of one retained telegram; without a sequence the most recently accepted telegram |
 |`power`          |the realtime power frame of the newest accepted telegram         |
 |`showring <ring>`|stored records of one meter ring: `month`, `days` or `hours`       |
 |`ring2csv <ring>`|writes one meter ring to the volume as `RING<ring>.csv` (see below) |
@@ -495,7 +520,7 @@ on the local network (the broker may be any IP, host name or full
 |-----------------------|-------------------------------------------------------------------------------------------|
 |Broker IP or URL       |the broker to connect to; empty disables MQTT                                              |
 |Broker port            |used when the broker text carries no port (default 1883)                                   |
-|User / Password        |broker credentials; both empty for an anonymous broker                                     |
+|User / Password        |broker credentials; both empty for an anonymous broker. The stored password is never sent to the browser: an empty password field keeps it, typing a new value replaces it |
 |Top topic              |every broadcast goes to `<top topic>/telegram` (empty selects `lastdsmrlogger`)            |
 |Broadcast interval (s) |how often the latest telegram is published; **0 = no broadcast**                           |
 

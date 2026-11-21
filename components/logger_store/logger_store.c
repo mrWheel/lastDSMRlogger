@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.c - hour, day and month smart meter ring file store
-//-- Date: 2026-11-21 · Build: 10
+//-- Date: 2026-11-21 · Build: 11
 //--
 //-- The store task owns all ring_file_store work: it mounts the LittleFS
 //-- storage partition, removes the ring file of the retired minute store,
@@ -30,12 +30,14 @@
 #include "logger_store.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1048,8 +1050,10 @@ esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePa
 //-- is invalidated by a concurrent snapshot), then writes the file oldest
 //-- first: key as eight YYMMDDHH digits, the five counters at three decimals
 //-- and the three tariff amounts at two. An empty ring still produces the
-//-- header line.
-static esp_err_t exportRingFile(loggerMeterRing_t ring, uint32_t* outRecords)
+//-- header line. The caller may hand an already open stream (the in-memory
+//-- csv text of the API); with file NULL the RING<name>.csv volume file is
+//-- opened and closed here like the console's ring2csv always did.
+static esp_err_t exportRingFile(loggerMeterRing_t ring, FILE* file, uint32_t* outRecords)
 {
   MeterRing* active = &rings[ring];
   ringFileHandle_t* handle = active->handle;
@@ -1114,15 +1118,20 @@ static esp_err_t exportRingFile(loggerMeterRing_t ring, uint32_t* outRecords)
     return result;
   }
 
+  bool ownFile = (file == NULL);
   char path[STORE_IMPORT_PATH_BYTES];
-  snprintf(path, sizeof path, STORE_MOUNT_POINT "/RING%s.csv", active->name);
+  path[0] = '\0';
 
-  FILE* file = fopen(path, "w");
-
-  if (file == NULL)
+  if (ownFile)
   {
-    ESP_LOGW(tag, "ring2csv could not open %s: errno %d", path, errno);
-    return ESP_FAIL;
+    snprintf(path, sizeof path, STORE_MOUNT_POINT "/RING%s.csv", active->name);
+    file = fopen(path, "w");
+
+    if (file == NULL)
+    {
+      ESP_LOGW(tag, "ring2csv could not open %s: errno %d", path, errno);
+      return ESP_FAIL;
+    }
   }
 
   fprintf(file, STORE_EXPORT_HEADER);
@@ -1144,15 +1153,21 @@ static esp_err_t exportRingFile(loggerMeterRing_t ring, uint32_t* outRecords)
             record->meter.tariffAmount2Euro, record->meter.tariffAmountGasEuro);
   }
 
-  fclose(file);
+  if (ownFile)
+  {
+    fclose(file);
+  }
 
   if (outRecords != NULL)
   {
     *outRecords = collected;
   }
 
-  ESP_LOGI(tag, "ring2csv wrote %" PRIu32 " record(s) of the %s ring to %s", collected,
-           active->name, path);
+  if (ownFile)
+  {
+    ESP_LOGI(tag, "ring2csv wrote %" PRIu32 " record(s) of the %s ring to %s", collected,
+             active->name, path);
+  }
 
   return ESP_OK;
 }
@@ -1160,6 +1175,7 @@ static esp_err_t exportRingFile(loggerMeterRing_t ring, uint32_t* outRecords)
 typedef struct
 {
   loggerMeterRing_t ring;
+  FILE* file;
   uint32_t* outRecords;
   SemaphoreHandle_t done;
   esp_err_t outcome;
@@ -1169,9 +1185,42 @@ static void exportRingTask(void* argument)
 {
   ExportJob* job = (ExportJob*)argument;
 
-  job->outcome = exportRingFile(job->ring, job->outRecords);
+  job->outcome = exportRingFile(job->ring, job->file, job->outRecords);
   xSemaphoreGive(job->done);
   vTaskDelete(NULL);
+}
+
+//-- Shared task dance of both exports: the walk runs on its own task (the
+//-- component asks for a generous stack for any task driving the ring
+//-- cursor) while the calling task waits on the semaphore.
+static esp_err_t runExportJob(loggerMeterRing_t ring, FILE* file, uint32_t* outRecords)
+{
+  SemaphoreHandle_t done = xSemaphoreCreateBinary();
+
+  if (done == NULL)
+  {
+    return ESP_ERR_NO_MEM;
+  }
+
+  ExportJob job;
+  job.ring = ring;
+  job.file = file;
+  job.outRecords = outRecords;
+  job.done = done;
+  job.outcome = ESP_FAIL;
+
+  if (xTaskCreate(exportRingTask, "ringExport", STORE_EXPORT_TASK_STACK_BYTES, &job,
+                  STORE_EXPORT_TASK_PRIORITY, NULL) != pdPASS)
+  {
+    vSemaphoreDelete(done);
+    ESP_LOGE(tag, "could not create the ring export task");
+    return ESP_ERR_NO_MEM;
+  }
+
+  xSemaphoreTake(done, portMAX_DELAY);
+  vSemaphoreDelete(done);
+
+  return job.outcome;
 }
 
 esp_err_t loggerStoreRingToCsv(loggerMeterRing_t ring, uint32_t* outRecords)
@@ -1191,31 +1240,51 @@ esp_err_t loggerStoreRingToCsv(loggerMeterRing_t ring, uint32_t* outRecords)
     return ESP_ERR_INVALID_STATE;
   }
 
-  SemaphoreHandle_t done = xSemaphoreCreateBinary();
+  return runExportJob(ring, NULL, outRecords);
+}
 
-  if (done == NULL)
+esp_err_t loggerStoreRingToCsvText(loggerMeterRing_t ring, char** outText, uint32_t* outRecords)
+{
+  if ((ring < LOGGER_RING_HOURS) || (ring >= LOGGER_RING_COUNT) || (outText == NULL))
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  *outText = NULL;
+
+  if (outRecords != NULL)
+  {
+    *outRecords = 0u;
+  }
+
+  if (rings[ring].handle == NULL)
+  {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  //-- The memstream grows on demand; fclose finalises it and the buffer
+  //-- stays allocated for the caller to free().
+  char* text = NULL;
+  size_t textLength = 0u;
+  FILE* stream = open_memstream(&text, &textLength);
+
+  if (stream == NULL)
   {
     return ESP_ERR_NO_MEM;
   }
 
-  ExportJob job;
-  job.ring = ring;
-  job.outRecords = outRecords;
-  job.done = done;
-  job.outcome = ESP_FAIL;
+  esp_err_t outcome = runExportJob(ring, stream, outRecords);
+  bool writeFailed = (ferror(stream) != 0);
+  fclose(stream);
 
-  if (xTaskCreate(exportRingTask, "ringExport", STORE_EXPORT_TASK_STACK_BYTES, &job,
-                  STORE_EXPORT_TASK_PRIORITY, NULL) != pdPASS)
+  if ((outcome != ESP_OK) || writeFailed || (text == NULL))
   {
-    vSemaphoreDelete(done);
-    ESP_LOGE(tag, "could not create the ring export task");
-    return ESP_ERR_NO_MEM;
+    free(text);
+    return (outcome != ESP_OK) ? outcome : ESP_ERR_NO_MEM;
   }
 
-  xSemaphoreTake(done, portMAX_DELAY);
-  vSemaphoreDelete(done);
-
-  return job.outcome;
+  *outText = text;
+  return ESP_OK;
 }
 
 //-- --------------------------------------------------------------------------
@@ -1367,6 +1436,63 @@ bool loggerStoreVolumeInfo(size_t* totalBytes, size_t* usedBytes)
   *totalBytes = total;
   *usedBytes = used;
   return true;
+}
+
+esp_err_t loggerStoreListFiles(loggerStoreFileVisitor visitor, void* userData)
+{
+  if (visitor == NULL)
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (loggerStoreMountPoint() == NULL)
+  {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  DIR* directory = opendir(STORE_MOUNT_POINT);
+
+  if (directory == NULL)
+  {
+    ESP_LOGW(tag, "could not open the volume directory: errno %d", errno);
+    return ESP_FAIL;
+  }
+
+  struct dirent* entry = NULL;
+
+  while ((entry = readdir(directory)) != NULL)
+  {
+    if ((strcmp(entry->d_name, ".") == 0) || (strcmp(entry->d_name, "..") == 0))
+    {
+      continue;
+    }
+
+    char path[STORE_IMPORT_PATH_BYTES];
+    snprintf(path, sizeof path, "%s/%s", STORE_MOUNT_POINT, entry->d_name);
+
+    struct stat details;
+    memset(&details, 0, sizeof details);
+
+    if (stat(path, &details) != 0)
+    {
+      //-- Unreadable entry: still reported by name, size unknown.
+      if (!visitor(entry->d_name, false, false, 0u, userData))
+      {
+        break;
+      }
+
+      continue;
+    }
+
+    if (!visitor(entry->d_name, S_ISDIR(details.st_mode), true, (uint32_t)details.st_size,
+                 userData))
+    {
+      break;
+    }
+  }
+
+  closedir(directory);
+  return ESP_OK;
 }
 
 esp_err_t loggerStoreInit(void)

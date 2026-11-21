@@ -52,6 +52,11 @@ const state =
   lastStatus: null,
   powerLastSeq: null,
   powerHistory: [],
+  // The MQTT password never travels from the device (security rule): the
+  // field is never prefilled and stays empty until the operator types a new
+  // password. Only then does a save carry the mqttPassword field at all;
+  // while untouched, the device keeps the stored password.
+  mqttPasswordChanged: false,
 };
 
 const WS_RAPID_CLOSE_MS = 3000;
@@ -629,7 +634,11 @@ function renderSettings(message)
   el.inpMqttBroker.value = (settings && settings.mqttBroker) ? settings.mqttBroker : "";
   el.inpMqttPort.value = (settings && settings.mqttPort) ? String(settings.mqttPort) : "1883";
   el.inpMqttUser.value = (settings && settings.mqttUser) ? settings.mqttUser : "";
-  el.inpMqttPassword.value = (settings && settings.mqttPassword) ? settings.mqttPassword : "";
+  // The settings frame never carries the password, so the field is always
+  // cleared on (re)fill: it shows nothing stored and only travels back when
+  // the operator types a new password (see state.mqttPasswordChanged).
+  el.inpMqttPassword.value = "";
+  state.mqttPasswordChanged = false;
   el.inpMqttTopic.value = (settings && settings.mqttTopTopic) ? settings.mqttTopTopic : "";
   el.inpMqttInterval.value =
       (settings && settings.mqttIntervalSeconds) ? String(settings.mqttIntervalSeconds) : "0";
@@ -766,7 +775,12 @@ function saveSettings(event)
                "&mqttBroker=" + encodeURIComponent(mqttBroker) +
                "&mqttPort=" + encodeURIComponent(mqttPort) +
                "&mqttUser=" + encodeURIComponent((el.inpMqttUser.value || "").trim()) +
-               "&mqttPassword=" + encodeURIComponent(el.inpMqttPassword.value || "") +
+               // The password field only travels when the operator typed a
+               // new one: an absent field keeps the stored password (an
+               // explicitly emptied field after typing clears it).
+               (state.mqttPasswordChanged
+                   ? "&mqttPassword=" + encodeURIComponent(el.inpMqttPassword.value || "")
+                   : "") +
                "&mqttTopTopic=" + encodeURIComponent((el.inpMqttTopic.value || "").trim()) +
                "&mqttInterval=" + encodeURIComponent(mqttInterval) +
                "&hostname=" + encodeURIComponent(hostname) +
@@ -1529,9 +1543,9 @@ function renderRingFileList(message)
 
 const PERIOD_GRAPHS =
 {
-  hoursGraph: {ring: "hours", unitWord: "hour", api: "/api/ringfile?ring=hours", labelsHeight: 46},
-  daysGraph: {ring: "days", unitWord: "day", api: "/api/ringfile?ring=days", labelsHeight: 68},
-  monthsGraph: {ring: "months", unitWord: "month", api: "/api/ringfile?ring=months", labelsHeight: 40},
+  hoursGraph: {ring: "hours", unitWord: "hour", api: "/api/v3/ringfile?ring=hours", labelsHeight: 46},
+  daysGraph: {ring: "days", unitWord: "day", api: "/api/v3/ringfile?ring=days", labelsHeight: 68},
+  monthsGraph: {ring: "months", unitWord: "month", api: "/api/v3/ringfile?ring=months", labelsHeight: 40},
 };
 
 const GRAPH_COLORS =
@@ -2352,7 +2366,7 @@ function renderActualGraph(message)
   else
   {
     setActualGraphState(actualGraph.records.length + " of ~" + ACTUAL_GRAPH.capacity +
-                        " measurements plotted · /api/actualgraph");
+                        " measurements plotted · /api/v3/actualgraph");
   }
 
   drawActualGraph();
@@ -2717,6 +2731,14 @@ function boot()
   bindElements();
   buildTabBar();
   el.settingsForm.addEventListener("submit", saveSettings);
+
+  // The device never sends the stored MQTT password: the save only carries
+  // the mqttPassword field once the operator has typed into this field
+  // (state.mqttPasswordChanged), so an untouched field keeps the password.
+  el.inpMqttPassword.addEventListener("input", () =>
+  {
+    state.mqttPasswordChanged = true;
+  });
 
   el.srcToggle.addEventListener("change", updateSourceLabels);
   el.rxPolarityToggle.addEventListener("change", updatePolarityLabels);

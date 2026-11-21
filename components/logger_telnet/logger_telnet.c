@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_telnet.c - telnet console server on port 23
-//-- Date: 2026-11-21 · Build: 12
+//-- Date: 2026-11-21 · Build: 14
 //--
 //-- A plain BSD-socket console task: it listens on port 23, serves exactly
 //-- one session at a time and answers a command set from the receiver,
@@ -291,8 +291,8 @@ static void printHelp(int fd)
           "                     memory, flash\r\n"
           "  version            firmware and parser versions\r\n"
           "  telegrams          the telegrams retained in RAM\r\n"
-          "  telegram <seq>     decoded fields of one retained telegram\r\n"
-          "  raw <seq>          exact bytes of one retained telegram\r\n"
+          "  telegram [seq]     decoded fields of one telegram (latest accepted)\r\n"
+          "  raw [seq]          exact bytes of one telegram (latest accepted)\r\n"
           "  power              the realtime power frame of the newest telegram\r\n"
           "  showring {month|days|hours}\r\n"
           "                     the stored records of one meter ring (default hours)\r\n"
@@ -476,16 +476,20 @@ static const char* spiSpeedName(uint8_t speed)
   }
 }
 
-static void printState(int fd)
+bool loggerTelnetGetDeviceInfo(loggerTelnetDeviceInfo* out)
 {
-  char compileDate[16];
-  formatCompileDate(compileDate, sizeof compileDate);
+  if (out == NULL)
+  {
+    return false;
+  }
 
-  telnetPrintf(fd, "\r\n%s\r\n", TELNET_COPYRIGHT);
+  memset(out, 0, sizeof *out);
+
+  snprintf(out->copyright, sizeof out->copyright, "%s", TELNET_COPYRIGHT);
 
   //-- The hostname the station actually announces (set from the settings at
-  //-- the last join or save).
-  char hostname[LOGGER_HOSTNAME_MAX] = "?";
+  //-- the last join or save); "?" until one is known.
+  snprintf(out->hostname, sizeof out->hostname, "?");
   esp_netif_t* station = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
 
   if (station != NULL)
@@ -494,72 +498,57 @@ static void printState(int fd)
 
     if ((esp_netif_get_hostname(station, &applied) == ESP_OK) && (applied != NULL))
     {
-      snprintf(hostname, sizeof hostname, "%s", applied);
+      snprintf(out->hostname, sizeof out->hostname, "%s", applied);
     }
   }
 
-  telnetPrintf(fd, "hostname       : %s\r\n", hostname);
-  telnetPrintf(fd, "firmware       : %s (%s)\r\n", PROG_VERSION, compileDate);
-  telnetPrintf(fd, "compiled       : %s %s\r\n", __DATE__, __TIME__);
-  telnetPrintf(fd, "compiled with  : ESP-IDF %s, parserDSMR %s, gcc %s\r\n", esp_get_idf_version(),
-               dsmrParserVersion(), __VERSION__);
-  telnetPrintf(fd, "sdk version    : %s\r\n", esp_get_idf_version());
+  snprintf(out->firmwareVersion, sizeof out->firmwareVersion, "%s", PROG_VERSION);
+  formatCompileDate(out->compileDate, sizeof out->compileDate);
+  snprintf(out->compileStamp, sizeof out->compileStamp, "%s %s", __DATE__, __TIME__);
+  snprintf(out->idfVersion, sizeof out->idfVersion, "%s", esp_get_idf_version());
+  snprintf(out->parserVersion, sizeof out->parserVersion, "%s", dsmrParserVersion());
+  snprintf(out->compilerVersion, sizeof out->compilerVersion, "%s", __VERSION__);
 
   esp_chip_info_t chip;
   esp_chip_info(&chip);
-  telnetPrintf(fd, "chip model     : ESP32-S3 (revision %u.%u, %d core(s))\r\n",
-               (unsigned)(chip.revision / 100), (unsigned)(chip.revision % 100), (int)chip.cores);
+  snprintf(out->chipModel, sizeof out->chipModel, "ESP32-S3");
+  out->chipRevisionMajor = (unsigned)(chip.revision / 100);
+  out->chipRevisionMinor = (unsigned)(chip.revision % 100);
+  out->chipCores = (int)chip.cores;
 
   uint8_t mac[6];
-  uint64_t chipId = 0u;
 
   if (esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY) == ESP_OK)
   {
     for (uint8_t index = 0u; index < sizeof mac; index++)
     {
-      chipId = (chipId << 8) | mac[index];
+      out->chipId = (out->chipId << 8) | mac[index];
     }
   }
 
-  telnetPrintf(fd, "chip ID        : %" PRIu64 " (efuse mac)\r\n", chipId);
-  telnetPrintf(fd, "CPU freq       : %d MHz (configured)\r\n", CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
-
-  telnetPrintf(fd, "free heap      : %" PRIu32 " bytes\r\n", esp_get_free_heap_size());
-  telnetPrintf(fd, "min free heap  : %" PRIu32 " bytes (lowest since boot)\r\n",
-               esp_get_minimum_free_heap_size());
-  telnetPrintf(fd, "max block      : %u bytes (largest free block)\r\n",
-               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-  telnetPrintf(fd, "free PSRAM     : %u bytes\r\n",
-               (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-  telnetPrintf(fd, "PSRAM size     : %u bytes\r\n",
-               (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+  out->cpuFreqMhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+  out->freeHeapBytes = esp_get_free_heap_size();
+  out->minFreeHeapBytes = esp_get_minimum_free_heap_size();
+  out->largestFreeBlockBytes = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  out->psramFreeBytes = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  out->psramTotalBytes = (uint32_t)heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
 
   //-- The running application image: partition total, verified image length
   //-- and the room left in the partition (the sketch space).
   const esp_partition_t* app = esp_ota_get_running_partition();
-  uint32_t imageBytes = 0u;
+  out->hasAppPartition = (app != NULL);
 
   if (app != NULL)
   {
+    out->appPartitionBytes = (uint32_t)app->size;
+
     esp_image_metadata_t metadata;
     esp_partition_pos_t position = {app->address, app->size};
 
     if (esp_image_verify(ESP_IMAGE_VERIFY_SILENT, &position, &metadata) == ESP_OK)
     {
-      imageBytes = metadata.image_len;
-    }
-
-    telnetPrintf(fd, "program size   : %" PRIu32 " bytes (running app partition)\r\n",
-                 (uint32_t)app->size);
-
-    if (imageBytes != 0u)
-    {
-      telnetPrintf(fd, "program used   : %" PRIu32 " bytes\r\n", imageBytes);
-      telnetPrintf(fd, "free sketch    : %" PRIu32 " bytes\r\n", (uint32_t)app->size - imageBytes);
-    }
-    else
-    {
-      telnetPrintf(fd, "program used   : not verified\r\n");
+      out->imageVerified = true;
+      out->imageBytes = metadata.image_len;
     }
 
     //-- The image header carries the SPI mode and clock factor the chip is
@@ -569,29 +558,97 @@ static void printState(int fd)
     if ((esp_partition_read(app, 0, &header, sizeof header) == ESP_OK) &&
         (header.magic == ESP_IMAGE_HEADER_MAGIC))
     {
-      telnetPrintf(fd, "flash mode     : %s\r\n", spiModeName(header.spi_mode));
-      telnetPrintf(fd, "flash speed    : %s\r\n", spiSpeedName(header.spi_speed));
+      out->hasImageHeader = true;
+      snprintf(out->flashMode, sizeof out->flashMode, "%s", spiModeName(header.spi_mode));
+      snprintf(out->flashSpeed, sizeof out->flashSpeed, "%s", spiSpeedName(header.spi_speed));
     }
   }
 
   uint32_t flashBytes = 0u;
   esp_err_t flashSizeRead = esp_flash_get_size(NULL, &flashBytes);
+  out->flashSizeReadable = (flashSizeRead == ESP_OK);
+  out->flashBytes = flashBytes;
 
-  if (flashSizeRead == ESP_OK)
+  if (!out->flashSizeReadable)
   {
-    telnetPrintf(fd, "flash size     : %" PRIu32 " bytes\r\n", flashBytes);
-  }
-  else
-  {
-    telnetPrintf(fd, "flash size     : unreadable (%s)\r\n", esp_err_to_name(flashSizeRead));
+    snprintf(out->flashSizeError, sizeof out->flashSizeError, "%s", esp_err_to_name(flashSizeRead));
   }
 
   const esp_partition_t* storage =
       esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "storage");
+  out->hasStoragePartition = (storage != NULL);
 
   if (storage != NULL)
   {
-    telnetPrintf(fd, "littlefs size  : %" PRIu32 " kB\r\n", (uint32_t)(storage->size / 1024u));
+    out->storageKb = (uint32_t)(storage->size / 1024u);
+  }
+
+  return true;
+}
+
+static void printState(int fd)
+{
+  loggerTelnetDeviceInfo info;
+
+  if (!loggerTelnetGetDeviceInfo(&info))
+  {
+    return;
+  }
+
+  telnetPrintf(fd, "\r\n%s\r\n", info.copyright);
+  telnetPrintf(fd, "hostname       : %s\r\n", info.hostname);
+  telnetPrintf(fd, "firmware       : %s (%s)\r\n", info.firmwareVersion, info.compileDate);
+  telnetPrintf(fd, "compiled       : %s\r\n", info.compileStamp);
+  telnetPrintf(fd, "compiled with  : ESP-IDF %s, parserDSMR %s, gcc %s\r\n", info.idfVersion,
+               info.parserVersion, info.compilerVersion);
+  telnetPrintf(fd, "sdk version    : %s\r\n", info.idfVersion);
+  telnetPrintf(fd, "chip model     : %s (revision %u.%u, %d core(s))\r\n", info.chipModel,
+               info.chipRevisionMajor, info.chipRevisionMinor, info.chipCores);
+  telnetPrintf(fd, "chip ID        : %" PRIu64 " (efuse mac)\r\n", info.chipId);
+  telnetPrintf(fd, "CPU freq       : %d MHz (configured)\r\n", info.cpuFreqMhz);
+  telnetPrintf(fd, "free heap      : %" PRIu32 " bytes\r\n", info.freeHeapBytes);
+  telnetPrintf(fd, "min free heap  : %" PRIu32 " bytes (lowest since boot)\r\n",
+               info.minFreeHeapBytes);
+  telnetPrintf(fd, "max block      : %u bytes (largest free block)\r\n",
+               (unsigned)info.largestFreeBlockBytes);
+  telnetPrintf(fd, "free PSRAM     : %u bytes\r\n", (unsigned)info.psramFreeBytes);
+  telnetPrintf(fd, "PSRAM size     : %u bytes\r\n", (unsigned)info.psramTotalBytes);
+
+  if (info.hasAppPartition)
+  {
+    telnetPrintf(fd, "program size   : %" PRIu32 " bytes (running app partition)\r\n",
+                 info.appPartitionBytes);
+
+    if (info.imageVerified)
+    {
+      telnetPrintf(fd, "program used   : %" PRIu32 " bytes\r\n", info.imageBytes);
+      telnetPrintf(fd, "free sketch    : %" PRIu32 " bytes\r\n",
+                   info.appPartitionBytes - info.imageBytes);
+    }
+    else
+    {
+      telnetPrintf(fd, "program used   : not verified\r\n");
+    }
+
+    if (info.hasImageHeader)
+    {
+      telnetPrintf(fd, "flash mode     : %s\r\n", info.flashMode);
+      telnetPrintf(fd, "flash speed    : %s\r\n", info.flashSpeed);
+    }
+  }
+
+  if (info.flashSizeReadable)
+  {
+    telnetPrintf(fd, "flash size     : %" PRIu32 " bytes\r\n", info.flashBytes);
+  }
+  else
+  {
+    telnetPrintf(fd, "flash size     : unreadable (%s)\r\n", info.flashSizeError);
+  }
+
+  if (info.hasStoragePartition)
+  {
+    telnetPrintf(fd, "littlefs size  : %" PRIu32 " kB\r\n", info.storageKb);
   }
   else
   {
@@ -621,6 +678,23 @@ static void printTelegramList(int fd)
       telnetPrintf(fd, "        notes: %s\r\n", records[index].notes);
     }
   }
+}
+
+//-- Sequence of the most recently accepted telegram: the newest entry of
+//-- the retained list (the list is handed newest first). False when no
+//-- telegram was accepted yet, so the telegram and raw commands can simply
+//-- show the latest telegram when no sequence is typed.
+static bool latestAcceptedSequence(uint32_t* outSequence)
+{
+  loggerTelegramMeta newest;
+
+  if (loggerReceiverListRecords(&newest, 1u) == 0u)
+  {
+    return false;
+  }
+
+  *outSequence = newest.sequence;
+  return true;
 }
 
 static void printTelegramDetail(int fd, uint32_t sequence)
@@ -1041,23 +1115,32 @@ static bool handleLine(int fd, char* line)
   else if ((strcmp(command, "telegram") == 0) || (strcmp(command, "raw") == 0))
   {
     bool rawRequest = (strcmp(command, "raw") == 0);
+    uint32_t sequence = 0u;
+    bool haveSequence;
 
-    if ((arguments == NULL) || (arguments[0] == '\0'))
+    if ((arguments != NULL) && (arguments[0] != '\0'))
     {
-      telnetPrintf(fd, "usage: %s <seq>   (see the telegrams command)\r\n", command);
+      sequence = (uint32_t)strtoul(arguments, NULL, 10);
+      haveSequence = true;
     }
     else
     {
-      uint32_t sequence = (uint32_t)strtoul(arguments, NULL, 10);
+      //-- No sequence typed: show the most recently accepted telegram, the
+      //-- same default the sequence-less v3 endpoints use.
+      haveSequence = latestAcceptedSequence(&sequence);
+    }
 
-      if (rawRequest)
-      {
-        printTelegramRaw(fd, sequence);
-      }
-      else
-      {
-        printTelegramDetail(fd, sequence);
-      }
+    if (!haveSequence)
+    {
+      telnetPrintf(fd, "no accepted telegram yet - try again after the next one\r\n");
+    }
+    else if (rawRequest)
+    {
+      printTelegramRaw(fd, sequence);
+    }
+    else
+    {
+      printTelegramDetail(fd, sequence);
     }
   }
   else if (strcmp(command, "power") == 0)
