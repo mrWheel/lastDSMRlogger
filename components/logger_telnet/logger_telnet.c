@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_telnet.c - telnet console server on port 23
-//-- Date: 2026-11-21 · Build: 8
+//-- Date: 2026-11-21 · Build: 10
 //--
 //-- A plain BSD-socket console task: it listens on port 23, serves exactly
 //-- one session at a time and answers a command set from the receiver,
@@ -65,7 +65,7 @@ static const char* tag = "loggerTelnet";
 //-- Question the populate command asks for its input file; the next line
 //-- typed is taken as the file name (relative to the LittleFS mount point).
 #define TELNET_POPULATE_QUESTION                                                                   \
-  "input file on LittleFS (e.g. assets/RINGmonths.csv, "                                           \
+  "input file on LittleFS (e.g. RINGmonths.csv, "                                                  \
   "empty line cancels): "
 
 //-- Minimal telnet negotiation: the console echoes and is full duplex, so
@@ -84,10 +84,70 @@ static volatile bool taskRunning = false;
 
 //-- Pending populate input: while awaiting the file name the next line is
 //-- taken as the answer instead of as a command. One session at a time, so
-//-- a plain pair of file-scope variables is enough; a fresh client resets
-//-- them.
+//-- plain file-scope variables are enough; a fresh client resets them.
 static bool populateAwaitingFile = false;
 static loggerMeterRing_t populateRing = LOGGER_RING_HOURS;
+static loggerPopulateMode_t populateMode = LOGGER_POPULATE_MERGE;
+
+//-- Every command word the console knows. Synonyms stay separate entries
+//-- (raw for the raw telegram dump, ringfile and exit as older spellings)
+//-- so a shortened word can name them too.
+static const char* const telnetCommands[] = {
+    "help",     "status",   "version", "telegrams", "telegram", "raw",  "power",
+    "showring", "ringfile", "store",   "populate",  "quit",     "exit", "ring2csv",
+};
+
+//-- The printf-style session writer is defined further down.
+static bool telnetPrintf(int fd, const char* format, ...);
+
+//-- Resolves one typed command word to the command it names: a
+//-- case-insensitive exact match always wins, otherwise the word must be an
+//-- unambiguous leading part of exactly one command ("show" and "showri"
+//-- both name "showring"). Unknown and ambiguous words are reported here
+//-- and give NULL.
+static const char* resolveCommand(int fd, const char* typed)
+{
+  size_t typedLength = strlen(typed);
+  const char* found = NULL;
+  uint8_t hits = 0u;
+
+  for (size_t index = 0u; index < (sizeof telnetCommands / sizeof telnetCommands[0]); index++)
+  {
+    if (strcasecmp(telnetCommands[index], typed) == 0)
+    {
+      return telnetCommands[index];
+    }
+
+    if ((typedLength > 0u) && (strncasecmp(telnetCommands[index], typed, typedLength) == 0))
+    {
+      found = telnetCommands[index];
+      hits++;
+    }
+  }
+
+  if (hits == 1u)
+  {
+    return found;
+  }
+
+  telnetPrintf(fd, "%s command '%s' - type help for the command list\r\n",
+               (hits == 0u) ? "unknown" : "ambiguous", typed);
+  return NULL;
+}
+
+//-- Suffix the importing line carries for a non-default populate mode.
+static const char* populateModeLabel(loggerPopulateMode_t mode)
+{
+  switch (mode)
+  {
+  case LOGGER_POPULATE_OVERWRITE:
+    return " (overwrite)";
+  case LOGGER_POPULATE_UPDATE:
+    return " (update)";
+  default:
+    return "";
+  }
+}
 
 //-- True while fd still holds the telnet console slot: every byte batch is
 //-- checked against the arbiter, so a session that lost the slot to a newer
@@ -221,12 +281,17 @@ static void printHelp(int fd)
           "  telegram <seq>     decoded fields of one retained telegram\r\n"
           "  raw <seq>          exact bytes of one retained telegram\r\n"
           "  power              the realtime power frame of the newest telegram\r\n"
-          "  showRing {month|days|hours}\r\n"
+          "  showring {month|days|hours}\r\n"
           "                     the stored records of one meter ring (default hours)\r\n"
-          "  populate {hours|days|months}\r\n"
-          "                     import a LittleFS csv file into one meter ring\r\n"
+          "  ring2csv {month|days|hours}\r\n"
+          "                     write one meter ring to the volume as RING<name>.csv\r\n"
+          "  populate {hours|days|months} [overwrite|update]\r\n"
+          "                     import a LittleFS csv file into one meter ring: merge\r\n"
+          "                     (default) fills free slots, overwrite clears the ring\r\n"
+          "                     first, update only revises stored periods\r\n"
           "  store              LittleFS volume: files with sizes, capacity and free space\r\n"
-          "  quit               close this session\r\n");
+          "  quit               close this session\r\n"
+          "\r\ncommands may be shortened to a unique leading part (show == showring)\r\n");
 }
 
 static void printStatus(int fd)
@@ -666,10 +731,10 @@ static void runPopulate(int fd, const char* fileName)
   loggerStoreImportResult result;
   memset(&result, 0, sizeof result);
 
-  telnetPrintf(fd, "\r\nimporting '%s' into the %s ring ...", fileName,
-               loggerStoreRingName(populateRing));
+  telnetPrintf(fd, "\r\nimporting '%s' into the %s ring%s ...", fileName,
+               loggerStoreRingName(populateRing), populateModeLabel(populateMode));
 
-  esp_err_t outcome = loggerStorePopulateRing(populateRing, fileName, &result);
+  esp_err_t outcome = loggerStorePopulateRing(populateRing, fileName, populateMode, &result);
 
   if (outcome != ESP_OK)
   {
@@ -730,29 +795,39 @@ static bool handleLine(int fd, char* line)
     *arguments++ = '\0';
   }
 
-  if (strcasecmp(line, "help") == 0)
+  //-- The command word may be an exact (case-insensitive) command name or
+  //-- an unambiguous leading part of one; the argument text stays as typed.
+  const char* command = resolveCommand(fd, line);
+
+  if (command == NULL)
+  {
+    telnetSendText(fd, TELNET_PROMPT);
+    return true;
+  }
+
+  if (strcmp(command, "help") == 0)
   {
     printHelp(fd);
   }
-  else if (strcasecmp(line, "status") == 0)
+  else if (strcmp(command, "status") == 0)
   {
     printStatus(fd);
   }
-  else if (strcasecmp(line, "version") == 0)
+  else if (strcmp(command, "version") == 0)
   {
     printVersion(fd);
   }
-  else if (strcasecmp(line, "telegrams") == 0)
+  else if (strcmp(command, "telegrams") == 0)
   {
     printTelegramList(fd);
   }
-  else if ((strcasecmp(line, "telegram") == 0) || (strcasecmp(line, "raw") == 0))
+  else if ((strcmp(command, "telegram") == 0) || (strcmp(command, "raw") == 0))
   {
-    bool rawRequest = (strcasecmp(line, "raw") == 0);
+    bool rawRequest = (strcmp(command, "raw") == 0);
 
     if ((arguments == NULL) || (arguments[0] == '\0'))
     {
-      telnetPrintf(fd, "usage: %s <seq>   (see the telegrams command)\r\n", line);
+      telnetPrintf(fd, "usage: %s <seq>   (see the telegrams command)\r\n", command);
     }
     else
     {
@@ -768,14 +843,14 @@ static bool handleLine(int fd, char* line)
       }
     }
   }
-  else if (strcasecmp(line, "power") == 0)
+  else if (strcmp(command, "power") == 0)
   {
     printPower(fd);
   }
-  else if ((strcasecmp(line, "showRing") == 0) || (strcasecmp(line, "ringfile") == 0))
+  else if ((strcmp(command, "showring") == 0) || (strcmp(command, "ringfile") == 0))
   {
     //-- The argument picks the ring (month, days or hours, default hours);
-    //-- ringfile stays as the old synonym of showRing hours.
+    //-- ringfile stays as the old synonym of showring hours.
     if (arguments != NULL)
     {
       while (isspace((unsigned char)*arguments))
@@ -786,19 +861,16 @@ static bool handleLine(int fd, char* line)
 
     printRingFile(fd, arguments);
   }
-  else if (strcasecmp(line, "store") == 0)
+  else if (strcmp(command, "ring2csv") == 0)
   {
-    printStore(fd);
-  }
-  else if (strcasecmp(line, "populate") == 0)
-  {
-    //-- The selector picks the ring (no default: importing is a write);
-    //-- the ring's name then asks for the csv file to import.
+    //-- The selector picks the ring (no default: exporting is a write); the
+    //-- file lands at the volume root as RING<name>.csv, ready for the SMB
+    //-- share and for a populate re-import.
     loggerMeterRing_t ring = LOGGER_RING_HOURS;
 
     if ((arguments == NULL) || (arguments[0] == '\0'))
     {
-      telnetPrintf(fd, "usage: populate {hours|days|months}\r\n");
+      telnetPrintf(fd, "usage: ring2csv {hours|days|months}\r\n");
     }
     else if (!loggerStoreRingFromName(arguments, &ring))
     {
@@ -806,21 +878,85 @@ static bool handleLine(int fd, char* line)
     }
     else
     {
+      uint32_t records = 0u;
+      esp_err_t outcome = loggerStoreRingToCsv(ring, &records);
+
+      if (outcome != ESP_OK)
+      {
+        telnetPrintf(fd, "ring2csv failed: %s\r\n", esp_err_to_name(outcome));
+      }
+      else
+      {
+        telnetPrintf(fd, "wrote %" PRIu32 " record(s) to RING%s.csv on the volume\r\n", records,
+                     loggerStoreRingName(ring));
+      }
+    }
+  }
+  else if (strcmp(command, "store") == 0)
+  {
+    printStore(fd);
+  }
+  else if (strcmp(command, "populate") == 0)
+  {
+    //-- The first argument picks the ring (no default: importing is a
+    //-- write), the optional second one how the ring's current records are
+    //-- treated (merge is the default); accepted arguments then ask for
+    //-- the csv file to import.
+    loggerMeterRing_t ring = LOGGER_RING_HOURS;
+    loggerPopulateMode_t mode = LOGGER_POPULATE_MERGE;
+    bool accepted = true;
+    char ringText[32];
+    char modeText[32];
+    ringText[0] = '\0';
+    modeText[0] = '\0';
+
+    if ((arguments == NULL) || (arguments[0] == '\0'))
+    {
+      telnetPrintf(fd, "usage: populate {hours|days|months} [overwrite|update]\r\n");
+      accepted = false;
+    }
+    else
+    {
+      (void)sscanf(arguments, "%31s %31s", ringText, modeText);
+    }
+
+    if (accepted && !loggerStoreRingFromName(ringText, &ring))
+    {
+      telnetPrintf(fd, "unknown ring '%s' - use month, days or hours\r\n", ringText);
+      accepted = false;
+    }
+
+    if (accepted && (modeText[0] != '\0'))
+    {
+      if (strcasecmp(modeText, "overwrite") == 0)
+      {
+        mode = LOGGER_POPULATE_OVERWRITE;
+      }
+      else if (strcasecmp(modeText, "update") == 0)
+      {
+        mode = LOGGER_POPULATE_UPDATE;
+      }
+      else
+      {
+        telnetPrintf(fd, "unknown mode '%s' - use overwrite or update\r\n", modeText);
+        accepted = false;
+      }
+    }
+
+    if (accepted)
+    {
       populateRing = ring;
+      populateMode = mode;
       populateAwaitingFile = true;
-      telnetPrintf(fd, "\r\nimporting into the %s ring.\r\n%s", loggerStoreRingName(ring),
-                   TELNET_POPULATE_QUESTION);
+      telnetPrintf(fd, "\r\nimporting into the %s ring%s.\r\n%s", loggerStoreRingName(ring),
+                   populateModeLabel(mode), TELNET_POPULATE_QUESTION);
       return true; //-- the file name replaces the next prompt
     }
   }
-  else if ((strcasecmp(line, "quit") == 0) || (strcasecmp(line, "exit") == 0))
+  else if ((strcmp(command, "quit") == 0) || (strcmp(command, "exit") == 0))
   {
     telnetSendText(fd, "Goodbye.\r\n");
     return false;
-  }
-  else
-  {
-    telnetPrintf(fd, "unknown command '%s' - type help for the command list\r\n", line);
   }
 
   telnetSendText(fd, TELNET_PROMPT);
@@ -1095,6 +1231,7 @@ static void telnetTaskLoop(void* argument)
         iacState = 0u;
         pendingCr = false;
         populateAwaitingFile = false;
+        populateMode = LOGGER_POPULATE_MERGE;
 
         const uint8_t willEcho[3] = {TELNET_IAC, TELNET_WILL, TELNET_OPT_ECHO};
         const uint8_t willSga[3] = {TELNET_IAC, TELNET_WILL, TELNET_OPT_SGA};

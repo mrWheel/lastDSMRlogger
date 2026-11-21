@@ -172,6 +172,27 @@
         </table>
       </div>
     </section>
+
+    <section id="viewHoursGraph" class="card" hidden>
+      <h2>Hours Graph</h2>
+      <div id="hoursGraphState" class="message"></div>
+      <div class="listToolbar">
+        <button id="refreshHoursGraph" type="button">Refresh</button>
+      </div>
+      <!-- The hourly usage overview of the hours ring (see app.js): the
+           device turns the retained cumulative counters into per-hour
+           amounts, oldest hour left to newest right. The canvas holds two
+           stacked panels on the shared hour axis, like the hoursGraph
+           mockup: one bar per hour on a zero line in the upper panel, the
+           used kWh (red) growing upwards and the returned kWh (green)
+           hanging below the line, with a legend above them, and below a
+           blue line of the gas m³ per hour with its own legend. Hovering a
+           slot pops up its net kWh (upper panel) or gas m³ (lower panel),
+           without date or time (app.js). -->
+      <div class="hoursGraphWrap">
+        <canvas id="hoursGraphCanvas"></canvas>
+      </div>
+    </section>
   </main>
 
   <footer id="footerInfo"></footer>

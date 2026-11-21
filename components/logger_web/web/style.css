@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-20 · Build: 19 */
+   Date: 2026-11-21 · Build: 20 */
 
 :root
 {
@@ -817,6 +817,45 @@ footer
   display: block;
   width: 100%;
   height: 130px;
+}
+
+/* --------------------------------------------------------------------------
+   Hours Graph view: the hourly usage overview of the hours ring (drawn by
+   app.js on a single canvas with two stacked panels). The wrap reuses the
+   sparkline frame styling; the hover chip reuses the powerTooltip look.
+   ------------------------------------------------------------------------ */
+.hoursGraphWrap
+{
+  position: relative;
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid var(--separator);
+  border-radius: 12px;
+  background: var(--controlFill);
+}
+
+#hoursGraphCanvas
+{
+  display: block;
+  width: 100%;
+  height: 356px;
+}
+
+.hoursGraphTooltip
+{
+  position: absolute;
+  padding: 5px 10px;
+  border-radius: 9px;
+  background: var(--card);
+  color: var(--fg);
+  border: 1px solid var(--hairline);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translateX(-50%);
+  box-shadow: var(--shadow);
+  z-index: 5;
 }
 
 /* --------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 # lastDSMRlogger - ESP-IDF project root
-# Date: 2026-11-20 · Build: 2
+# Date: 2026-11-21 · Build: 3
 #
 # The parserDSMR dependency is pinned to the sibling checkout. The ESP-IDF
 # build adds the checkout's components/parserDSMR directory to
@@ -17,8 +17,9 @@ project(lastDSMRlogger)
 
 # The storage partition image is built from storageImage/ at every build
 # (joltwallet's littlefs_create_partition_image, its own venv included).
-# storageImage/assets/ is the drop folder for the csv files the telnet
-# console's populate command imports; put new input files in there, rebuild
+# storageImage/ is the drop folder for the csv files the telnet console's
+# populate command imports: files placed in the folder land at the volume
+# root (e.g. RINGmonths.csv). Put new input files in there, rebuild
 # and land the image on the device with
 #   python $IDF_PATH/components/partition_table/parttool.py \
 #     -p PORT write_partition --partition-name storage --input build/storage.bin

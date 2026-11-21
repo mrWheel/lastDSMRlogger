@@ -1,13 +1,13 @@
 # lastDSMRlogger
 
-Buildnumber: 26
+Buildnumber: 28
 Last update-date: 2026-11-21
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
-shows recent telegrams in a single-page web application with three views:
-Settings, Telegrams and Realtime (a web replica of the on-device power
-panel). Configuration is stored in NVS and survives a power
+shows recent telegrams in a single-page web application with five views:
+Settings, Telegrams, Phase Load (a web replica of the on-device power
+panel), Show RingFile and Hours Graph. Configuration is stored in NVS and survives a power
 cycle; the recent telegram history lives in RAM.
 
 ## 1. Project layout
@@ -49,7 +49,7 @@ automatically.
 |parserDSMR                |`https://github.com/mrWheel/parserDSMR` checkout at `../parserDSMR`                                         |revision `686a3aeefb5c4b107ce9884023fab4014b184b31` (v0.9.1, includes the raw-frame API and `dsmrParserVersion()`; `PROG_VERSION` now has internal linkage, so it no longer clashes with the application's own symbol) |
 |esp32_s3_piggyback        |`https://github.com/mrWheel/esp32-s3-Piggyback`, component directory `components/esp32_s3_piggyback`       |commit `912fa25b86fdb62d8f1005ae57e227c5803db373` (v1.3.0), vendored under `components/` |
 |esp-idf-wifi-provisioner  |ESP Component Registry `michmich/esp-idf-wifi-provisioner`                                                  |version `0.4.0` (upstream commit `2c7aaa6aa0e319a429186ee470e137b8579f632f`) |
-|ring_file_store           |`https://github.com/mrWheel/ringFileStore` checkout at `../ringFileStore`, component directory `components/ring_file_store` (for now instead of the registry release `mrwheel/ring_file_store: ^0.1.2`) |local working copy (v0.1.3 in the checkout's `idf_component.yml`) |
+|ring_file_store           |ESP Component Registry `mrwheel/ring_file_store`                                                            |`^0.1.3` |
 |littlefs                  |ESP Component Registry `joltwallet/littlefs`                                                                |`^1.23.1` |
 |smb_server                |ESP Component Registry `mrwheel/smb_server`                                                                 |`^0.3.0` (GPL-3.0, guest-only SMB2/SMB3 file server) |
 
@@ -205,6 +205,26 @@ the device.
   is shorter: the device pushes the newest power frame the moment a
   telegram is accepted and the SPA polls `cmd=power` on its own timer as
   well. `GET /api/power` serves the same JSON without WebSocket support.
+- **Show RingFile**: the stored records of one on-device meter ring (hours,
+  days or months; a radio group picks the ring, a Refresh button re-requests
+  it), newest period first: one table row per stored period with the five
+  meter counters (kWh and m³) and the three fictional tariff amounts (EUR).
+  `cmd=ringfile&ring=<period>` on the WebSocket, `GET /api/ringfile` with
+  the optional `?ring=` query serve the same JSON.
+- **Hours Graph**: the hourly usage overview of the hours ring, styled after
+  the `assets/hoursGraph.jpeg` mockup: two stacked panels on one shared hour
+  axis (oldest hour left, newest right). The upper panel carries grouped
+  bars per hour for the used (red) and returned (green) kWh with a centred
+  legend; the lower panel a blue line of the gas m³ per hour with its own
+  legend. Each panel has grid lines with y labels, a unit label and rotated
+  hour labels; hovering a slot pops up the hour with its three amounts. The
+  device turns the retained cumulative counters into per-hour differences
+  (`cmd=hoursgraph`, or `GET /api/hoursgraph`): the oldest record has no
+  predecessor and is left out, a counter reset is clamped to zero, an hour
+  that does not directly follow its retained predecessor (imported history
+  ending in the past, hours aged out of the ring) is left out so the gap
+  shows as a hole instead of one giant bar, and a Refresh button
+  re-requests the series (switching to the view requests it too).
 
 On-device TFT debug lines show the active browser screen, the last accepted
 telegram, and the Wi-Fi portal/connected state. With the first accepted
@@ -257,7 +277,7 @@ and the web status strip stay complete regardless.
 
 |Method |Path                        |Purpose                                                       |
 |-------|----------------------------|--------------------------------------------------------------|
-|WS     |`/ws`                       |SPA transport: status/telegram/power pushes + `cmd=config\|save\|status\|telegrams\|telegram\|raw\|power\|view`, raw bytes as binary frame |
+|WS     |`/ws`                       |SPA transport: status/telegram/power pushes + `cmd=config\|save\|status\|telegrams\|telegram\|raw\|power\|ringfile\|hoursgraph\|view`, raw bytes as binary frame |
 |GET    |`/api/config`               |NVS settings + active state + valid choices (data sources, interval bounds, countries, profiles) |
 |POST   |`/api/config`               |Save form-urlencoded settings incl. `rxGpio`, `rxInverted` (0/1) and `interval` (interval clamped to 2..600; one atomic operation) |
 |GET    |`/api/status`               |Reception state, counters, last diagnostic, uptime            |
@@ -265,6 +285,8 @@ and the web status strip stay complete regardless.
 |GET    |`/api/telegram/<seq>`       |Decoded detail of one record                                  |
 |GET    |`/api/telegram/<seq>/raw`   |Exact accepted frame bytes as `text/plain`                    |
 |GET    |`/api/power`                |Realtime power frame of the newest accepted telegram (phases and total watts/amps/volts, meter time, scale ladder step, history of the newest 90 accepted total watts) |
+|GET    |`/api/ringfile`             |Records of one meter ring (`?ring=hours\|days\|months`, hours by default), newest first |
+|GET    |`/api/hoursgraph`           |Per-hour used/returned kWh and gas m³ of the hours ring (differences of consecutive counters), oldest first |
 |POST   |`/api/view`                 |Reports the active browser screen name to the device display  |
 
 ### Test data mode
@@ -357,7 +379,8 @@ operators.
   session is not disturbed.
 
 The console greets with the firmware version and the peer address and answers
-these commands (read-only except `populate`, which writes one ring file):
+these commands (read-only except `populate` and `ring2csv`, which write to
+the LittleFS volume):
 
 |Command          |Shows                                                            |
 |-----------------|-----------------------------------------------------------------|
@@ -368,10 +391,17 @@ these commands (read-only except `populate`, which writes one ring file):
 |`telegram <seq>` |decoded fields of one retained telegram                          |
 |`raw <seq>`      |exact accepted bytes of one retained telegram                    |
 |`power`          |the realtime power frame of the newest accepted telegram         |
-|`showRing <ring>`|stored records of one meter ring: `month`, `days` or `hours`       |
-|`populate <ring>`|imports a LittleFS csv file into one meter ring: `hours`, `days` or `months` (see below) |
+|`showring <ring>`|stored records of one meter ring: `month`, `days` or `hours`       |
+|`ring2csv <ring>`|writes one meter ring to the volume as `RING<ring>.csv` (see below) |
+|`populate <ring> [mode]`|imports a LittleFS csv file into one meter ring: `hours`, `days` or `months`, mode `overwrite` or `update` (see below) |
 |`store`          |LittleFS volume: files with sizes, capacity and free space       |
 |`quit`           |close the session                                                |
+
+Commands are case-insensitive and may be shortened to any leading part that
+names exactly one command (`show` and `showri` both mean `showring`); a word
+that matches nothing is unknown and one that matches several commands is
+reported as ambiguous. `ringfile` stays available as the old synonym of
+`showring`.
 
 ### SMB network share
 
@@ -401,7 +431,7 @@ on the volume through the storage partition image, not through the share.
 The console command `populate {hours|days|months}` imports historical
 periods from a semicolon separated csv file on the LittleFS volume into one
 meter ring. After the ring selector the command asks for the input file,
-relative to the volume root (typically `assets/RINGmonths.csv`); an empty
+relative to the volume root (typically `RINGmonths.csv`); an empty
 line cancels.
 
 The file starts with a header line. Its first column names the period key
@@ -420,23 +450,55 @@ Unknown columns — including the `#` and the empty trailing columns that
 exported files carry — are skipped. Every data line starts with the period
 key (8, 6 or 4 digits) and carries its values in header order; **a blank or
 missing value becomes 0**, and the tariff amount fields never appear in a
-file, so they stay 0 too. Records are edited into the ring, so historical
-periods backfill the retained window; periods older than the ring capacity
-(49 hours, 32 days, 24 months) are refused and reported. Several lines of
-one period update the same record: the last line wins.
+file, so they stay 0 too. Several lines of one period update the same
+record: the last line wins.
+
+The optional mode argument picks what happens to the records the ring
+already holds:
+
+|Mode (default)            |Effect                                                          |
+|--------------------------|----------------------------------------------------------------|
+|`merge`                   |keeps stored records and backfills every free slot of the retained window; periods older than the ring capacity (49 hours, 32 days, 24 months) are refused and reported |
+|`overwrite`               |clears the ring just before the first valid data line, so the file alone names the stored periods and the whole file lands without window refusals |
+|`update`                  |only revises periods the ring already stores; every key it does not hold is refused as not stored, nothing is ever added |
+
+An import that never reaches a valid data line (missing file, bad header,
+only rejected lines) leaves the ring untouched in all three modes.
 
 ```
-logger> populate months
-importing into the months ring.
-input file on LittleFS (e.g. assets/RINGmonths.csv, empty line cancels): assets/RINGmonths.csv
+logger> populate hours overwrite
+importing into the hours ring (overwrite).
+input file on LittleFS (e.g. RINGmonths.csv, empty line cancels): RINGhours.csv
 
-7 line(s) read, 7 edit(s) written, 0 line(s) rejected, 0 refused
-logger> showRing months
+49 line(s) read, 49 edit(s) written, 0 line(s) rejected, 0 refused
+logger> showring hours
+```
+
+### Exporting a ring (`ring2csv`)
+
+The console command `ring2csv {hours|days|months}` writes one meter ring
+back to the LittleFS volume as a semicolon separated csv file named
+`RING<ring>.csv` at the volume root: the header
+`YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255`
+followed by one line per retained record, oldest period first, the key as
+eight `YYMMDDHH` digits and the five counters at three decimals. The file is
+re-importable through `populate` unchanged, and the read-only `DSMRLOGGER`
+SMB share exposes it for inspection or editing on any machine.
+
+```
+logger> ring2csv hours
+wrote 49 record(s) to RINGhours.csv on the volume
+logger> populate hours overwrite
+importing into the hours ring (overwrite).
+input file on LittleFS (e.g. RINGmonths.csv, empty line cancels): RINGhours.csv
+
+49 line(s) read, 49 edit(s) written, 0 line(s) rejected, 0 refused
 ```
 
 Input files land on the device through the storage partition image: drop
-them into `storageImage/assets/` (the sample `RINGhours.csv`, `RINGdays.csv`
-and `RINGmonths.csv` ship there),
+them into `storageImage/` — the folder the image is built from, and the
+import csv files land at the volume root (the sample `RINGhours.csv`,
+`RINGdays.csv` and `RINGmonths.csv` ship there) —
 rebuild and write `build/storage.bin` to the device:
 
 ```
@@ -444,7 +506,7 @@ python $IDF_PATH/components/partition_table/parttool.py \
   -p PORT write_partition --partition-name storage --input build/storage.bin
 ```
 
-Note: listing a nearly full ring — `showRing` or the web pages — makes the
+Note: listing a nearly full ring — `showring` or the web pages — makes the
 `ring_file_store` iterator inspect every slot on every step, which costs a
 very large number of flash reads once a ring is full; a listing of the
 49-hour ring can then run for minutes and the task watchdog will report the

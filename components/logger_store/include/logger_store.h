@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.h - hour, day and month smart meter ring file store
-//-- Date: 2026-11-20 · Build: 6
+//-- Date: 2026-11-21 · Build: 8
 //--
 //-- Three fixed-capacity ring files land on the LittleFS storage partition,
 //-- written through mrwheel's ring_file_store component: the hours ring
@@ -14,8 +14,10 @@
 //-- payload struct carries only the measurements.
 //--
 //-- The console's populate command imports historical periods from a
-//-- semicolon separated csv file on the volume (drop folder "assets/") into
-//-- one ring through ringFileEdit(), missing values becoming 0.0.
+//-- semicolon separated csv file on the volume (the import files are
+//-- shipped to the volume root by the storage partition image built from
+//-- the project's storageImage/ folder) into one ring through
+//-- ringFileEdit(), missing values becoming 0.0.
 //-- ==========================================================================
 
 #ifndef LOGGER_STORE_H
@@ -109,6 +111,18 @@ esp_err_t loggerStoreListRecords(loggerMeterRing_t ring, loggerStoreRecordVisito
 //-- Populate import
 //-- --------------------------------------------------------------------------
 
+//-- How a populate import treats the records the ring already holds.
+typedef enum
+{
+  LOGGER_POPULATE_MERGE = 0, //-- keeps stored records and backfills every free
+                             //-- slot of the retained window (the default)
+  LOGGER_POPULATE_OVERWRITE, //-- clears the ring before the first data line,
+                             //-- so the file alone names the stored periods
+  LOGGER_POPULATE_UPDATE,    //-- only revises periods the ring already stores;
+                             //-- keys it does not hold are refused
+  LOGGER_POPULATE_COUNT
+} loggerPopulateMode_t;
+
 //-- Outcome counters of one populate import.
 typedef struct
 {
@@ -130,16 +144,39 @@ typedef struct
 //-- of exported files - are skipped. Every data line starts with the period
 //-- key and carries its values in header order; a blank or missing value
 //-- becomes 0.0, and the tariff amount fields never appear in a file and
-//-- therefore stay 0.0. Records reach the ring through ringFileEdit(), so
-//-- historical periods backfill the retained window; periods older than the
-//-- ring capacity are refused and counted. The path is relative to the
-//-- LittleFS mount point ("assets/RINGmonths.csv") and may not climb out of
-//-- the volume. Returns ESP_ERR_INVALID_ARG for a missing argument or a bad
-//-- header, ESP_ERR_NOT_FOUND when the file does not exist,
+//-- therefore stay 0.0. The mode picks how the ring's current records are
+//-- treated: MERGE backfills the retained window through ringFileEdit()
+//-- (periods older than the ring capacity are refused and counted),
+//-- OVERWRITE clears the ring just before the first valid data line so the
+//-- file alone names the stored periods, and UPDATE only revises periods
+//-- the ring already stores (every other key is refused as not stored). An
+//-- import that never reaches a valid data line leaves the ring untouched
+//-- in all three modes. The path is relative to the
+//-- LittleFS mount point ("RINGmonths.csv", the import csv files land at
+//-- the volume root with the storage partition image) and may not climb out
+//-- of the volume. Returns ESP_ERR_INVALID_ARG for a missing argument, a bad
+//-- mode or a bad header, ESP_ERR_NOT_FOUND when the file does not exist,
 //-- ESP_ERR_INVALID_STATE while the store is not running, and ESP_OK when
 //-- the file was processed (per-line outcomes land in result).
 esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePath,
-                                  loggerStoreImportResult* result);
+                                  loggerPopulateMode_t mode, loggerStoreImportResult* result);
+
+//-- --------------------------------------------------------------------------
+//-- Csv export (ring2csv)
+//-- --------------------------------------------------------------------------
+
+//-- Writes one meter ring back to the LittleFS volume as a semicolon
+//-- separated csv file (the console's ring2csv command): the file lands at
+//-- the volume root as "RING<hours|days|months>.csv", carries the header
+//-- "YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;
+//-- 0-1:24.1.0*255" and one line per retained record, oldest period first,
+//-- with the key as eight digits and the five counters at three decimals.
+//-- The result re-imports through loggerStorePopulateRing() unchanged.
+//-- outRecords (optional) receives the number of records written. Returns
+//-- ESP_ERR_INVALID_ARG for an invalid ring, ESP_ERR_INVALID_STATE while the
+//-- store is not running, an I/O error when the file could not be written
+//-- and ESP_OK otherwise.
+esp_err_t loggerStoreRingToCsv(loggerMeterRing_t ring, uint32_t* outRecords);
 
 //-- VFS mount point of the LittleFS storage volume, published for the SMB
 //-- network share (the component exposes an already mounted VFS path and

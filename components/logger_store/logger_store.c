@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.c - hour, day and month smart meter ring file store
-//-- Date: 2026-11-20 · Build: 7
+//-- Date: 2026-11-21 · Build: 9
 //--
 //-- The store task owns all ring_file_store work: it mounts the LittleFS
 //-- storage partition, removes the ring file of the retired minute store,
@@ -17,8 +17,14 @@
 //-- synchronizes all three files so the staged records reach storage.
 //-- The console's populate command feeds historical periods in through
 //-- loggerStorePopulateRing(): a semicolon separated csv file from the
-//-- volume's "assets" drop folder, keyed by period and columned by OBIS
-//-- code, is edited into one ring with missing values becoming 0.0.
+//-- volume root (the import csv files are shipped there by the storage
+//-- partition image built from the project's storageImage/ folder), keyed
+//-- by period and columned by OBIS code, is edited into one ring with
+//-- missing values becoming 0.0. A mode picks what happens to the records
+//-- the ring already holds: merge (default) backfills, overwrite clears the
+//-- ring before importing and update only revises stored periods. The
+//-- console's ring2csv command writes one ring back to the volume root as
+//-- a re-importable csv through loggerStoreRingToCsv().
 //-- ==========================================================================
 
 #include "logger_store.h"
@@ -30,7 +36,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -363,16 +368,6 @@ static bool openMeterRings(void)
 
   ESP_LOGI(tag, "mounted LittleFS partition '%s' at %s", STORE_PARTITION_LABEL, STORE_MOUNT_POINT);
 
-  //-- The documented drop folder for populate import files (SMB share):
-  //-- LittleFS needs the directory to exist before a file can land in it.
-  char assetsPath[64];
-  snprintf(assetsPath, sizeof assetsPath, "%s/assets", STORE_MOUNT_POINT);
-
-  if ((mkdir(assetsPath, 0777) != 0) && (errno != EEXIST))
-  {
-    ESP_LOGW(tag, "could not create the import folder %s: errno %d", assetsPath, errno);
-  }
-
   //-- The temporary per-minute store is retired: its ring file and a lock
   //-- it may have left behind no longer belong on the volume.
   (void)ringFileBreakStaleLock(STORE_LEGACY_RING_PATH);
@@ -677,6 +672,8 @@ static const char* importErrName(esp_err_t err)
   {
   case RING_FILE_STORE_ERR_BUCKET_OUT_OF_RANGE:
     return "outside the retained window";
+  case RING_FILE_STORE_ERR_KEY_NOT_FOUND:
+    return "the period is not stored";
   case RING_FILE_STORE_ERR_NOT_NEWER:
     return "not newer than the newest bucket";
   case RING_FILE_STORE_ERR_READONLY:
@@ -698,15 +695,30 @@ typedef struct
 {
   loggerMeterRing_t ring;
   const char* relativePath;
+  loggerPopulateMode_t mode;
   loggerStoreImportResult* result;
   SemaphoreHandle_t done;
   esp_err_t outcome;
 } ImportJob;
 
+//-- Readable name of a populate mode (log and console lines).
+static const char* populateModeName(loggerPopulateMode_t mode)
+{
+  switch (mode)
+  {
+  case LOGGER_POPULATE_OVERWRITE:
+    return "overwrite";
+  case LOGGER_POPULATE_UPDATE:
+    return "update";
+  default:
+    return "merge";
+  }
+}
+
 //-- The import itself, executed on the dedicated import task with the
 //-- arguments validated by the public wrapper.
 static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath,
-                                loggerStoreImportResult* result)
+                                loggerPopulateMode_t mode, loggerStoreImportResult* result)
 {
   char path[STORE_IMPORT_PATH_BYTES];
   snprintf(path, sizeof path, "%s/%s", STORE_MOUNT_POINT, relativePath);
@@ -727,6 +739,7 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
   memset(fieldOfColumn, 0xFF, sizeof fieldOfColumn);
 
   bool headerRead = false;
+  bool ringCleared = false;
   esp_err_t outcome = ESP_OK;
   char line[STORE_IMPORT_LINE_BYTES];
 
@@ -828,10 +841,56 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
       }
     }
 
-    //-- ringFileEdit backfills historical periods (ringFileAdd would refuse
-    //-- anything older than the newest stored bucket) and keeps its
-    //-- position when the period is already active.
-    esp_err_t edited = ringFileEdit(rings[ring].handle, timeStamp, &record);
+    esp_err_t edited;
+
+    if (mode == LOGGER_POPULATE_UPDATE)
+    {
+      //-- Update mode never adds a period: only keys the ring already
+      // stores get their values revised, everything else is refused.
+      uint64_t usedKey = 0u;
+      ringFileGranularity_t granularity = RING_FILE_GRANULARITY_NONE;
+      MeterRingEntry stored;
+
+      if ((ringFileGranularityFromSchemaId(rings[ring].schemaId, &granularity) != ESP_OK) ||
+          (ringFileTimeStampToUsedKey(timeStamp, granularity, &usedKey) != ESP_OK))
+      {
+        edited = ESP_ERR_INVALID_ARG;
+      }
+      else
+      {
+        edited = ringFileReadByKey(rings[ring].handle, usedKey, &stored);
+
+        if (edited == ESP_OK)
+        {
+          edited = ringFileEdit(rings[ring].handle, timeStamp, &record);
+        }
+      }
+    }
+    else
+    {
+      //-- Overwrite mode empties the ring just before the first valid
+      // data line, so an import that never reaches one leaves the ring
+      // untouched. An empty ring accepts any bucket, which lets the whole
+      // file land without retained-window refusals.
+      if ((mode == LOGGER_POPULATE_OVERWRITE) && !ringCleared)
+      {
+        ringCleared = true;
+        esp_err_t cleared = ringFileClear(rings[ring].handle);
+
+        if (cleared != ESP_OK)
+        {
+          outcome = cleared;
+          snprintf(result->firstError, sizeof result->firstError, "could not clear the ring: %s",
+                   importErrName(cleared));
+          break;
+        }
+      }
+
+      //-- ringFileEdit backfills historical periods (ringFileAdd would refuse
+      //-- anything older than the newest stored bucket) and keeps its
+      //-- position when the period is already active.
+      edited = ringFileEdit(rings[ring].handle, timeStamp, &record);
+    }
 
     if (edited == ESP_OK)
     {
@@ -869,11 +928,12 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
     snprintf(result->firstError, sizeof result->firstError, "file has no header line");
   }
 
-  ESP_LOGI(tag,
-           "populate %s ring from %s: %lu line(s) read, %lu written, %lu rejected, %lu refused",
-           rings[ring].name, path, (unsigned long)result->rowsRead,
-           (unsigned long)result->bucketsWritten, (unsigned long)result->rowsRejected,
-           (unsigned long)result->bucketsRefused);
+  ESP_LOGI(
+      tag,
+      "populate %s ring from %s (%s): %lu line(s) read, %lu written, %lu rejected, %lu refused",
+      rings[ring].name, path, populateModeName(mode), (unsigned long)result->rowsRead,
+      (unsigned long)result->bucketsWritten, (unsigned long)result->rowsRejected,
+      (unsigned long)result->bucketsRefused);
 
   return outcome;
 }
@@ -889,16 +949,17 @@ static void importRingTask(void* argument)
 {
   ImportJob* job = (ImportJob*)argument;
 
-  job->outcome = importRingFile(job->ring, job->relativePath, job->result);
+  job->outcome = importRingFile(job->ring, job->relativePath, job->mode, job->result);
   xSemaphoreGive(job->done);
   vTaskDelete(NULL);
 }
 
 esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePath,
-                                  loggerStoreImportResult* result)
+                                  loggerPopulateMode_t mode, loggerStoreImportResult* result)
 {
   if ((ring < LOGGER_RING_HOURS) || (ring >= LOGGER_RING_COUNT) || (relativePath == NULL) ||
-      (relativePath[0] == '\0') || (result == NULL))
+      (relativePath[0] == '\0') || (result == NULL) || (mode < LOGGER_POPULATE_MERGE) ||
+      (mode >= LOGGER_POPULATE_COUNT))
   {
     return ESP_ERR_INVALID_ARG;
   }
@@ -927,6 +988,7 @@ esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePa
   ImportJob job;
   job.ring = ring;
   job.relativePath = relativePath;
+  job.mode = mode;
   job.result = result;
   job.done = done;
   job.outcome = ESP_FAIL;
@@ -941,6 +1003,197 @@ esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePa
 
   //-- One small csv lands in milliseconds; the wait only ever lasts as long
   //-- as the LittleFS writes of the imported periods take.
+  xSemaphoreTake(done, portMAX_DELAY);
+  vSemaphoreDelete(done);
+
+  return job.outcome;
+}
+
+//-- --------------------------------------------------------------------------
+//-- Csv export (ring2csv)
+//-- --------------------------------------------------------------------------
+
+//-- The export walks and writes through ring_file_store and LittleFS just
+//-- like the import, so it runs on a one-shot task with the same stack.
+#define STORE_EXPORT_TASK_STACK_BYTES 10240
+#define STORE_EXPORT_TASK_PRIORITY 4
+
+//-- The retained window is bounded by the largest ring capacity (hours);
+//-- the walk can never commit more records than that.
+#define STORE_EXPORT_MAX_RECORDS 64u
+
+//-- Header of an exported file: the period key column followed by the five
+//-- counter columns in the spelling the populate import maps back (the
+//-- 0-1:24.1.0 gas code is accepted for all published gas codes alike).
+#define STORE_EXPORT_HEADER                                                                        \
+  "YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255\r\n"
+
+//-- Walks the ring newest first into a buffer (deduplicating a cursor that
+//-- is invalidated by a concurrent snapshot), then writes the file oldest
+//-- first: key as eight YYMMDDHH digits and the five counters at three
+//-- decimals. An empty ring still produces the header line.
+static esp_err_t exportRingFile(loggerMeterRing_t ring, uint32_t* outRecords)
+{
+  MeterRing* active = &rings[ring];
+  ringFileHandle_t* handle = active->handle;
+
+  if (handle == NULL)
+  {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  MeterRingEntry entries[STORE_EXPORT_MAX_RECORDS];
+  uint32_t collected = 0u;
+  uint64_t lastEmittedKey = 0u;
+  uint32_t steps = 0u;
+  MeterRingEntry entry;
+  ringFileIterator_t iterator;
+  memset(&entry, 0, sizeof entry);
+  memset(&iterator, 0, sizeof iterator);
+
+  esp_err_t result = ringFileIteratorBegin(handle, &iterator, RING_FILE_ITER_NEWEST, NULL, &entry);
+
+  while (result == ESP_OK)
+  {
+    if ((collected == 0u) || (entry.keys.usedKey < lastEmittedKey))
+    {
+      lastEmittedKey = entry.keys.usedKey;
+
+      if (collected < STORE_EXPORT_MAX_RECORDS)
+      {
+        entries[collected++] = entry;
+      }
+    }
+
+    steps++;
+
+    if (steps > (active->maxRecords * 3u))
+    {
+      ESP_LOGW(tag, "%s ring export walk abandoned after %" PRIu32 " steps", active->name, steps);
+      return ESP_FAIL;
+    }
+
+    //-- Full ring walks are flash-read heavy: hand the cpu to the idle task
+    //-- after each record so the task watchdog stays quiet (as in the list
+    //-- walk).
+    vTaskDelay(1);
+
+    result = ringFileIteratorPrevious(handle, &iterator, &entry);
+
+    if (result == RING_FILE_STORE_ERR_ITER_INVALIDATED)
+    {
+      //-- A concurrent snapshot moved the cursor: collect the whole ring
+      // again from the newest.
+      collected = 0u;
+      lastEmittedKey = 0u;
+      result = ringFileIteratorBegin(handle, &iterator, RING_FILE_ITER_NEWEST, NULL, &entry);
+    }
+  }
+
+  if ((result != RING_FILE_STORE_ERR_ITER_END) && (result != RING_FILE_STORE_ERR_RING_EMPTY))
+  {
+    ESP_LOGW(tag, "%s ring export walk stopped after %" PRIu32 " records: %s", active->name,
+             collected, esp_err_to_name(result));
+    return result;
+  }
+
+  char path[STORE_IMPORT_PATH_BYTES];
+  snprintf(path, sizeof path, STORE_MOUNT_POINT "/RING%s.csv", active->name);
+
+  FILE* file = fopen(path, "w");
+
+  if (file == NULL)
+  {
+    ESP_LOGW(tag, "ring2csv could not open %s: errno %d", path, errno);
+    return ESP_FAIL;
+  }
+
+  fprintf(file, STORE_EXPORT_HEADER);
+
+  //-- Newest first in the buffer, oldest first on storage.
+  for (uint32_t index = collected; index > 0u;)
+  {
+    index--;
+    const MeterRingEntry* record = &entries[index];
+
+    //-- Eight plain YYMMDDHH digits: strip the component's minute/second
+    //-- digits and the century from the full timestamp.
+    uint64_t key = (record->keys.timeStamp / 10000ULL) % 100000000ULL;
+
+    fprintf(file, "%08" PRIu64 ";%.3f;%.3f;%.3f;%.3f;%.3f\r\n", key,
+            record->meter.energyDeliveredTariff1Kwh, record->meter.energyDeliveredTariff2Kwh,
+            record->meter.energyReturnedTariff1Kwh, record->meter.energyReturnedTariff2Kwh,
+            record->meter.gasDeliveredM3);
+  }
+
+  fclose(file);
+
+  if (outRecords != NULL)
+  {
+    *outRecords = collected;
+  }
+
+  ESP_LOGI(tag, "ring2csv wrote %" PRIu32 " record(s) of the %s ring to %s", collected,
+           active->name, path);
+
+  return ESP_OK;
+}
+
+typedef struct
+{
+  loggerMeterRing_t ring;
+  uint32_t* outRecords;
+  SemaphoreHandle_t done;
+  esp_err_t outcome;
+} ExportJob;
+
+static void exportRingTask(void* argument)
+{
+  ExportJob* job = (ExportJob*)argument;
+
+  job->outcome = exportRingFile(job->ring, job->outRecords);
+  xSemaphoreGive(job->done);
+  vTaskDelete(NULL);
+}
+
+esp_err_t loggerStoreRingToCsv(loggerMeterRing_t ring, uint32_t* outRecords)
+{
+  if ((ring < LOGGER_RING_HOURS) || (ring >= LOGGER_RING_COUNT))
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (outRecords != NULL)
+  {
+    *outRecords = 0u;
+  }
+
+  if (rings[ring].handle == NULL)
+  {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  SemaphoreHandle_t done = xSemaphoreCreateBinary();
+
+  if (done == NULL)
+  {
+    return ESP_ERR_NO_MEM;
+  }
+
+  ExportJob job;
+  job.ring = ring;
+  job.outRecords = outRecords;
+  job.done = done;
+  job.outcome = ESP_FAIL;
+
+  if (xTaskCreate(exportRingTask, "ringExport", STORE_EXPORT_TASK_STACK_BYTES, &job,
+                  STORE_EXPORT_TASK_PRIORITY, NULL) != pdPASS)
+  {
+    vSemaphoreDelete(done);
+    ESP_LOGE(tag, "could not create the ring export task");
+    return ESP_ERR_NO_MEM;
+  }
+
   xSemaphoreTake(done, portMAX_DELAY);
   vSemaphoreDelete(done);
 

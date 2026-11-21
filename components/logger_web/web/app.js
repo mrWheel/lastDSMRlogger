@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-20 · Build: 22
+// Date: 2026-11-21 · Build: 24
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -9,7 +9,7 @@
 // device pushes status, the telegram list and the realtime power frame, the
 // browser sends form-urlencoded commands (cmd=config, cmd=save,
 // cmd=telegram, cmd=raw, cmd=view, cmd=telegrams, cmd=power,
-// cmd=ringfile). Raw telegram
+// cmd=ringfile, cmd=hoursgraph). Raw telegram
 // bytes arrive as a binary frame
 // behind their JSON header. Every rendering path uses textContent so
 // telegram text is never interpreted as HTML. The active screen name is
@@ -68,6 +68,8 @@ const VIEWS =
   {id: "power", label: "Phase Load", section: "viewPower", command: "cmd=power"},
   {id: "ringfile", label: "Show RingFile", section: "viewRingFile",
    command: () => "cmd=ringfile&ring=" + selectedRing()},
+  {id: "hoursGraph", label: "Hours Graph", section: "viewHoursGraph",
+   command: "cmd=hoursgraph"},
 ];
 
 // Resolves a view's command: either a fixed string or a function evaluated
@@ -97,7 +99,8 @@ function bindElements()
                "powerPanel", "powerTelegram", "powerRows",
                "powerScaleLabel", "powerSpark",
                "ringFileState", "refreshRingFile", "ringFileTable", "ringFileKeyHeader",
-               "viewSettings", "viewTelegrams", "viewPower", "viewRingFile",
+               "hoursGraphState", "refreshHoursGraph", "hoursGraphCanvas",
+               "viewSettings", "viewTelegrams", "viewPower", "viewRingFile", "viewHoursGraph",
                "takeoverModal", "takeoverMessage", "takeoverTakeBack"];
 
   ids.forEach((id) =>
@@ -278,6 +281,10 @@ function handleTextMessage(message)
       renderRingFileList(message);
       break;
 
+    case "hoursgraph":
+      renderHoursGraph(message);
+      break;
+
     case "raw":
       state.pendingRawSeq = message.sequence;
       break;
@@ -348,6 +355,10 @@ function handleServerError(message)
   else if (message.request === "ringfile")
   {
     setRingFileState(message.error || "Ring file unavailable.");
+  }
+  else if (message.request === "hoursgraph")
+  {
+    setHoursGraphState(message.error || "Hours graph unavailable.");
   }
   else
   {
@@ -1382,6 +1393,440 @@ function renderRingFileList(message)
 }
 
 //-- --------------------------------------------------------------------------
+//-- Hours Graph view
+//-- --------------------------------------------------------------------------
+
+// The device turns the retained cumulative counters of the hours ring into
+// per-hour amounts (cmd=hoursgraph) and sends them oldest first, so the
+// graph reads left to right like the hoursGraph mockup: two stacked panels
+// on one shared hour axis. The upper panel carries one bar per hour on a
+// zero line in the middle of the panel: the used kWh (red) grow upwards and
+// the returned kWh (green) hang below the zero line, with a centred legend;
+// the lower panel carries a blue line of the gas m³ per hour with its own
+// legend. Each panel has grid lines, y labels and rotated hour labels.
+// Hovering a slot pops up the net kWh (upper) or the gas m³ (lower) of that
+// hour, without date or time. Everything is drawn straight from the frame's
+// numbers, nothing is interpreted.
+
+const HOURS_GRAPH =
+{
+  height: 356,
+  marginLeft: 46,
+  marginRight: 10,
+  legendHeight: 16,
+  panelHeight: 140,
+  gasPanelHeight: 100,
+  labelsHeight: 32,
+  panelGap: 12,
+};
+
+const HOURS_GRAPH_COLORS =
+{
+  used: "#ff3b30",
+  returned: "#34c759",
+  gas: "#007aff",
+};
+
+// Newest frame and the drawing geometry of the newest canvas frame (for
+// the hover popup), plus the mouse position inside the canvas (null:
+// outside). The popup follows the panel the cursor is over: the kWh panel
+// shows the net consumption of the hour, the gas panel the gas m³.
+let hoursGraphRecords = [];
+let hoursGraphLayout = null;
+let hoursGraphHoverX = null;
+let hoursGraphHoverY = null;
+let hoursGraphTip = null;
+
+function setHoursGraphState(message)
+{
+  el.hoursGraphState.textContent = message;
+}
+
+function renderHoursGraph(message)
+{
+  hoursGraphRecords = Array.isArray(message.records) ? message.records : [];
+
+  if (hoursGraphRecords.length === 0)
+  {
+    setHoursGraphState(message.available
+                       ? "No complete hour records stored yet (is the clock synchronised?)."
+                       : "The meter store is not running on the device.");
+  }
+  else
+  {
+    setHoursGraphState(hoursGraphRecords.length + " hour(s) plotted, oldest first" +
+                       (message.available ? "" : " (the device walk did not finish)"));
+  }
+
+  drawHoursGraph();
+}
+
+// Wall-clock hour key as the axis reads it: 26111916 becomes "19-11 16:00".
+function hoursGraphHourLabel(key)
+{
+  const text = String(key).padStart(8, "0");
+
+  if (!/^\d{8}$/.test(text))
+  {
+    return text;
+  }
+
+  return text.slice(4, 6) + "-" + text.slice(2, 4) + " " + text.slice(6, 8) + ":00";
+}
+
+// Grid step of a panel: the smallest ladder step whose fifth grid line
+// still reaches the panel's maximum; an empty panel keeps a plain 1-scale.
+function hoursGraphStep(maxValue)
+{
+  const steps = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
+
+  if (!(maxValue > 0))
+  {
+    return 1;
+  }
+
+  for (const step of steps)
+  {
+    if (maxValue <= step * 5)
+    {
+      return step;
+    }
+  }
+
+  return steps[steps.length - 1];
+}
+
+function hoursGraphScale(maxValue, step)
+{
+  return Math.max(step, Math.ceil(maxValue / step) * step);
+}
+
+// One panel's furniture: the centred legend row above it, the horizontal
+// grid lines with their y labels, the zero baseline, the left axis and the
+// unit above the axis. The scale spans scaleBottom .. scaleTop (both on the
+// shared step; scaleBottom is negative when the panel hangs bars below the
+// zero line, zero for a plain 0-based panel). The bars or line of the panel
+// are drawn by the caller on top of this.
+function drawHoursPanelFrame(ctx, panel, step, scaleTop, scaleBottom, unit, legendEntries, plotLeft, plotWidth)
+{
+  const gridColor = cssVar("--separator", "rgba(60, 60, 67, 0.12)");
+  const axisColor = cssVar("--hairline", "rgba(60, 60, 67, 0.29)");
+  const secondaryColor = cssVar("--secondary", "#6e6e73");
+  const decimals = (step >= 1) ? 0 : 1;
+  const range = (scaleTop - scaleBottom) || step;
+
+  function yOf(value)
+  {
+    return panel.y + ((scaleTop - value) / range) * panel.height;
+  }
+
+  // Centred legend row: colour chip + name per entry.
+  ctx.font = "10px " + cssVar("--font", "sans-serif");
+  let rowWidth = 0;
+  legendEntries.forEach((entry) =>
+  {
+    rowWidth += 11 + 4 + ctx.measureText(entry.label).width + 16;
+  });
+  let legendX = plotLeft + Math.max(0, (plotWidth - rowWidth) / 2);
+
+  legendEntries.forEach((entry) =>
+  {
+    ctx.fillStyle = entry.color;
+    ctx.fillRect(legendX, panel.y - 13, 11, 11);
+    ctx.fillStyle = secondaryColor;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(entry.label, legendX + 15, panel.y - 7);
+    legendX += 11 + 4 + ctx.measureText(entry.label).width + 16;
+  });
+
+  // Grid lines every step above and below the zero line, labels left of
+  // the axis; the amounts below the line are the returned kWh, so they are
+  // labelled as the negative mirror of their magnitude.
+  ctx.font = "9px " + cssVar("--mono", "monospace");
+  ctx.lineWidth = 0.5;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+
+  for (let value = step; value <= scaleTop + (step / 100); value += step)
+  {
+    const y = yOf(value);
+    ctx.strokeStyle = gridColor;
+    ctx.beginPath();
+    ctx.moveTo(plotLeft, y);
+    ctx.lineTo(plotLeft + plotWidth, y);
+    ctx.stroke();
+    ctx.fillStyle = secondaryColor;
+    ctx.fillText(value.toFixed(decimals), plotLeft - 4, y);
+  }
+
+  for (let value = step; value <= -scaleBottom + (step / 100); value += step)
+  {
+    const y = yOf(-value);
+    ctx.strokeStyle = gridColor;
+    ctx.beginPath();
+    ctx.moveTo(plotLeft, y);
+    ctx.lineTo(plotLeft + plotWidth, y);
+    ctx.stroke();
+    ctx.fillStyle = secondaryColor;
+    ctx.fillText((-value).toFixed(decimals), plotLeft - 4, y);
+  }
+
+  //-- Zero line: the baseline the used bars grow from and the returned
+  // bars hang from (the panel bottom itself when the scale ends at zero).
+  ctx.strokeStyle = axisColor;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(plotLeft, yOf(0));
+  ctx.lineTo(plotLeft + plotWidth, yOf(0));
+  ctx.moveTo(plotLeft, panel.y + panel.height);
+  ctx.lineTo(plotLeft + plotWidth, panel.y + panel.height);
+  ctx.moveTo(plotLeft, panel.y);
+  ctx.lineTo(plotLeft, panel.y + panel.height);
+  ctx.stroke();
+
+  ctx.fillStyle = secondaryColor;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillText(unit, 6, panel.y - 2);
+
+  return yOf;
+}
+
+// Rotated hour labels under a panel; every k-th slot gets one so the
+// slanted text never collides at narrow pitches.
+function drawHoursTimeLabels(ctx, records, belowY, slot, plotLeft)
+{
+  ctx.save();
+  ctx.font = "9px " + cssVar("--mono", "monospace");
+  ctx.fillStyle = cssVar("--secondary", "#6e6e73");
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+
+  const labelEvery = Math.max(1, Math.ceil(26 / slot));
+
+  records.forEach((record, index) =>
+  {
+    if ((index % labelEvery) !== 0)
+    {
+      return;
+    }
+
+    ctx.save();
+    ctx.translate(plotLeft + (index + 0.5) * slot, belowY + 26);
+    ctx.rotate(-Math.PI / 4);
+    ctx.fillText(hoursGraphHourLabel(record.key), 0, 0);
+    ctx.restore();
+  });
+
+  ctx.restore();
+}
+
+function drawHoursGraph()
+{
+  const canvas = el.hoursGraphCanvas;
+
+  if (canvas === null)
+  {
+    return;
+  }
+
+  const wrap = canvas.parentElement;
+  const cssWidth = Math.max(320, wrap.clientWidth - 16);
+  const cssHeight = HOURS_GRAPH.height;
+  const dpr = window.devicePixelRatio || 1;
+
+  canvas.width = Math.round(cssWidth * dpr);
+  canvas.height = Math.round(cssHeight * dpr);
+  canvas.style.width = cssWidth + "px";
+  canvas.style.height = cssHeight + "px";
+
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+  const records = hoursGraphRecords;
+  const plotLeft = HOURS_GRAPH.marginLeft;
+  const plotWidth = Math.max(10, cssWidth - plotLeft - HOURS_GRAPH.marginRight);
+  const slot = (records.length > 0) ? (plotWidth / records.length) : plotWidth;
+
+  // Both panels share the hour axis; the lower one sits under the rotated
+  // labels of the upper panel with its own legend row in between.
+  const panel1 =
+  {
+    y: HOURS_GRAPH.legendHeight,
+    height: HOURS_GRAPH.panelHeight,
+  };
+  const panel2 =
+  {
+    y: panel1.y + panel1.height + HOURS_GRAPH.labelsHeight + HOURS_GRAPH.panelGap +
+       HOURS_GRAPH.legendHeight,
+    height: HOURS_GRAPH.gasPanelHeight,
+  };
+
+  let maxUsed = 0;
+  let maxReturned = 0;
+  let maxGas = 0;
+
+  records.forEach((record) =>
+  {
+    maxUsed = Math.max(maxUsed, record.used || 0);
+    maxReturned = Math.max(maxReturned, record.returned || 0);
+    maxGas = Math.max(maxGas, record.gas || 0);
+  });
+
+  //-- One kWh scale serves both directions so a red and a green bar of the
+  // same value have the same length; the zero line ends up between the
+  // scaled used span above and the scaled returned span below.
+  const kwhStep = hoursGraphStep(Math.max(maxUsed, maxReturned));
+  const kwhTop = (maxUsed > 0) ? hoursGraphScale(maxUsed, kwhStep) : 0;
+  const kwhBottom = (maxReturned > 0) ? -hoursGraphScale(maxReturned, kwhStep) : 0;
+
+  // An empty panel still needs a scale to sit its zero line on.
+  if ((kwhTop === 0) && (kwhBottom === 0))
+  {
+    kwhTop = kwhStep;
+  }
+  const gasStep = hoursGraphStep(maxGas);
+  const gasMax = hoursGraphScale(maxGas, gasStep);
+
+  //-- Upper panel: one bar per hour on the zero line, the used kWh (red)
+  // growing upwards and the returned kWh (green) hanging below it.
+  const yOfEnergy = drawHoursPanelFrame(ctx, panel1, kwhStep, kwhTop, kwhBottom, "kWh",
+                                        [{color: HOURS_GRAPH_COLORS.used, label: "Used"},
+                                         {color: HOURS_GRAPH_COLORS.returned, label: "Returned"}],
+                                        plotLeft, plotWidth);
+
+  const barWidth = Math.max(2, slot * 0.6);
+  const zeroY = yOfEnergy(0);
+
+  records.forEach((record, index) =>
+  {
+    const centre = plotLeft + (index + 0.5) * slot;
+    const barX = centre - barWidth / 2;
+
+    const entries =
+    [
+      {value: record.used || 0, color: HOURS_GRAPH_COLORS.used, from: zeroY, to: yOfEnergy(record.used || 0)},
+      {value: record.returned || 0, color: HOURS_GRAPH_COLORS.returned, from: zeroY, to: yOfEnergy(-(record.returned || 0))},
+    ];
+
+    entries.forEach((bar) =>
+    {
+      if (bar.value <= 0)
+      {
+        return;
+      }
+
+      const top = Math.min(bar.from, bar.to);
+      const bottom = Math.max(bar.from, bar.to);
+      ctx.fillStyle = bar.color;
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(barX, top, barWidth, bottom - top);
+      ctx.globalAlpha = 1;
+    });
+  });
+
+  drawHoursTimeLabels(ctx, records, panel1.y + panel1.height, slot, plotLeft);
+
+  //-- Lower panel: the gas m³ per hour as a blue line with a dot per hour.
+  const yOfGas = drawHoursPanelFrame(ctx, panel2, gasStep, gasMax, 0, "m³",
+                                     [{color: HOURS_GRAPH_COLORS.gas, label: "Gas used"}],
+                                     plotLeft, plotWidth);
+
+  if (records.length > 0)
+  {
+    ctx.strokeStyle = HOURS_GRAPH_COLORS.gas;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+
+    records.forEach((record, index) =>
+    {
+      const x = plotLeft + (index + 0.5) * slot;
+      const y = yOfGas(record.gas || 0);
+
+      if (index === 0)
+      {
+        ctx.moveTo(x, y);
+      }
+      else
+      {
+        ctx.lineTo(x, y);
+      }
+    });
+
+    ctx.stroke();
+
+    ctx.fillStyle = HOURS_GRAPH_COLORS.gas;
+
+    records.forEach((record, index) =>
+    {
+      ctx.beginPath();
+      ctx.arc(plotLeft + (index + 0.5) * slot, yOfGas(record.gas || 0), 1.8, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  drawHoursTimeLabels(ctx, records, panel2.y + panel2.height, slot, plotLeft);
+
+  hoursGraphLayout =
+  {
+    records: records,
+    slot: slot,
+    plotLeft: plotLeft,
+    cssWidth: cssWidth,
+    panelEnergy: panel1,
+    panelGas: panel2,
+    // Cursor above this y belongs to the kWh panel, below it to the gas
+    // panel (the rotated hour labels in between stay with the kWh panel).
+    panelSplitY: (panel1.y + panel1.height + panel2.y) / 2,
+  };
+  updateHoursGraphTooltip();
+}
+
+// Hover popup: the amount of the hour under the cursor, without date or
+// time — the net consumption (used minus returned) in kWh while the cursor
+// is over the upper panel, the gas m³ while it is over the lower panel —
+// centred above the hovered slot (same chip style as the power history
+// popup).
+function updateHoursGraphTooltip()
+{
+  if (hoursGraphTip === null)
+  {
+    hoursGraphTip = document.createElement("div");
+    hoursGraphTip.className = "hoursGraphTooltip";
+    hoursGraphTip.hidden = true;
+    el.hoursGraphCanvas.parentElement.appendChild(hoursGraphTip);
+  }
+
+  const layout = hoursGraphLayout;
+
+  if ((layout === null) || (layout.records.length === 0) ||
+      (hoursGraphHoverX === null) || (hoursGraphHoverY === null))
+  {
+    hoursGraphTip.hidden = true;
+    return;
+  }
+
+  const index = Math.min(layout.records.length - 1,
+                         Math.max(0, Math.floor((hoursGraphHoverX - layout.plotLeft) / layout.slot)));
+  const record = layout.records[index];
+  const overGas = hoursGraphHoverY >= layout.panelSplitY;
+  const panel = overGas ? layout.panelGas : layout.panelEnergy;
+
+  hoursGraphTip.textContent = overGas
+                              ? ((record.gas || 0).toFixed(3) + " m³")
+                              : (((record.used || 0) - (record.returned || 0)).toFixed(3) + " kWh");
+  hoursGraphTip.hidden = false;
+
+  const centre = layout.plotLeft + (index + 0.5) * layout.slot;
+  const half = hoursGraphTip.offsetWidth / 2;
+  const left = Math.min(layout.cssWidth - half, Math.max(half, centre));
+  hoursGraphTip.style.left = (el.hoursGraphCanvas.offsetLeft + left) + "px";
+  hoursGraphTip.style.top = (el.hoursGraphCanvas.offsetTop + panel.y + 2) + "px";
+}
+
+//-- --------------------------------------------------------------------------
 //-- View switching and boot
 //-- --------------------------------------------------------------------------
 
@@ -1473,6 +1918,14 @@ function boot()
     });
   });
 
+  // The hour records follow the ring: the view does not poll, this button
+  // re-requests the hourly usage series on demand (switching to the view
+  // requests it as well, like every other view command).
+  el.refreshHoursGraph.addEventListener("click", () =>
+  {
+    wsSend("cmd=hoursgraph");
+  });
+
   // Take over control again after another browser page evicted this page:
   // a reload claims control with the first frame of the fresh WebSocket
   // session.
@@ -1490,6 +1943,11 @@ function boot()
     {
       drawPowerSpark(lastPowerScale);
     }
+
+    if (state.screen === "hoursGraph")
+    {
+      drawHoursGraph();
+    }
   });
 
   // Hovering the history plot pops up the meter time and total watts of
@@ -1505,6 +1963,24 @@ function boot()
   {
     powerHoverX = null;
     updatePowerTooltip();
+  });
+
+  // Hovering the hours graph pops up the net kWh (upper panel) or the gas
+  // m³ (lower panel) of the hour under the cursor; leaving the plot hides
+  // the popup.
+  el.hoursGraphCanvas.addEventListener("mousemove", (event) =>
+  {
+    const rect = el.hoursGraphCanvas.getBoundingClientRect();
+    hoursGraphHoverX = event.clientX - rect.left;
+    hoursGraphHoverY = event.clientY - rect.top;
+    updateHoursGraphTooltip();
+  });
+
+  el.hoursGraphCanvas.addEventListener("mouseleave", () =>
+  {
+    hoursGraphHoverX = null;
+    hoursGraphHoverY = null;
+    updateHoursGraphTooltip();
   });
 
   wsConnect();
