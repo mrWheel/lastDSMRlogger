@@ -1,15 +1,17 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.h - hour, day and month smart meter ring file store
-//-- Date: 2026-11-21 · Build: 10
+//-- Date: 2026-11-22 · Build: 11
 //--
 //-- Three fixed-capacity ring files land on the LittleFS storage partition,
 //-- written through mrwheel's ring_file_store component: the hours ring
 //-- (file type "YYMMDDhh", key "YYMMDDhh"), the days ring (file type
 //-- "YYMMDD", key "YYMMDD") and the months ring (file type "YYMM", key
 //-- "YYMM"). All three are opened buffered with a one-record staging
-//-- buffer; the store task synchronizes the three files together at every
-//-- hour change. The component prepends its two automatic key fields
+//-- buffer; the store task synchronizes the three files together at least
+//-- once per configured rfs synchronisation interval (the one-minute
+//-- snapshots of the same period coalesce in the staging buffers, so only
+//-- the synchronisation touches storage). The component prepends its two automatic key fields
 //-- (timeStamp and the period usedKey) to every record, so the caller's
 //-- payload struct carries only the measurements.
 //--
@@ -57,8 +59,11 @@ bool loggerStoreRingFromName(const char* name, loggerMeterRing_t* outRing);
 //-- --------------------------------------------------------------------------
 
 //-- Meter counters of the most recently accepted telegram, in the units the
-//-- P1 telegram publishes them (kWh and m³). The tariff amounts are
-//-- fictional billing figures: a random few cents per tariff. The struct is
+//-- P1 telegram publishes them (kWh and m³). The tariff amounts come from
+//-- the registered tariff calculator (the tariff component's calculator
+//-- values them with the dynamic tariff table and the manual prices);
+//-- without a registered calculator they stay fictional billing figures: a
+//-- random few cents per tariff. The struct is
 //-- stored as raw bytes: pointer-free fixed-width fields only, and any
 //-- layout change requires deleting the ring files. The key fields are
 //-- added by the ring_file_store component and are never part of this
@@ -76,6 +81,26 @@ typedef struct
 } loggerMeterRecord;
 
 //-- --------------------------------------------------------------------------
+//-- Tariff calculator
+//-- --------------------------------------------------------------------------
+
+//-- Fills the three tariff amounts of one ring record. The store task calls
+//-- it on the store task, once per ring per snapshot, with the freshly read
+//-- counters and the period key of that ring: the calculator values the
+//-- energy consumed inside this ring's period (tariff 1, tariff 2 and gas)
+//-- and writes the amounts back into the record. The dynamic tariff table
+//-- and the manual fallback prices are the calculator's own concern; the
+//-- store only asks. Registering the tariff component's calculator replaces
+//-- the fictional demo amounts the store would otherwise write.
+typedef void (*loggerStoreTariffCalculator)(loggerMeterRing_t ring, uint64_t ringKey,
+                                            loggerMeterRecord* record);
+
+//-- Registers (or with NULL, unregisters) the calculator used for every
+//-- snapshot from now on. Called once at boot, before or after the store
+//-- task starts; the pointer is read per snapshot.
+void loggerStoreSetTariffCalculator(loggerStoreTariffCalculator calculator);
+
+//-- --------------------------------------------------------------------------
 //-- Operations
 //-- --------------------------------------------------------------------------
 
@@ -83,7 +108,8 @@ typedef struct
 //-- removes the ring file of the retired minute store, creates the three
 //-- ring files on first boot (or reopens the retained ones after that),
 //-- refreshes the current hour, day and month record every minute with the
-//-- latest counters and synchronizes all three files at every hour change.
+//-- latest counters and synchronizes all three files at least once per
+//-- configured rfs synchronisation interval.
 //-- Returns ESP_ERR_NO_MEM when the task could not be created; storage
 //-- problems are reported on the console by the task itself.
 esp_err_t loggerStoreInit(void);
@@ -219,5 +245,16 @@ const char* loggerStoreMountPoint(void);
 //-- running or the statistics could not be read; the outputs stay untouched
 //-- in that case.
 bool loggerStoreVolumeInfo(size_t* totalBytes, size_t* usedBytes);
+
+//-- Rough LittleFS wear inputs for the settings view's lifetime estimate of
+//-- the configured rfs synchronisation interval: the number of flash blocks
+//-- on the volume, the number of block-sized writes one synchronisation is
+//-- estimated to cause (staged slot images plus the file-system metadata
+//-- they commit) and the program/erase cycle rating of one flash block.
+//-- The estimate is deliberately pessimistic (uniform wear over all blocks
+//-- assumed); the SPA words it as an estimate. Returns false when the
+//-- volume is not mounted; the outputs stay untouched in that case.
+bool loggerStoreRfsWearInfo(uint32_t* totalBlocks, uint32_t* blockWritesPerSync,
+                            uint32_t* flashWriteCycles);
 
 #endif //-- LOGGER_STORE_H

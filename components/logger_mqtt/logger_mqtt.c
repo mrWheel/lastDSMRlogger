@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
-//-- File: logger_mqtt.c - MQTT publication of the latest accepted telegram
-//-- Date: 2026-11-21 · Build: 5
+//-- File: logger_mqtt.c - MQTT telegram publication and tariff ingestion
+//-- Date: 2026-11-22 · Build: 6
 //--
 //-- One background task owns the esp_mqtt client and the broadcast cadence.
 //-- It keeps a copy of the relevant settings behind a mutex; the settings
@@ -32,11 +32,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "logger_receiver.h"
+#include "logger_tariffs.h"
 #include "mqtt_client.h"
 
 static const char* tag = "loggerMqtt";
@@ -93,18 +95,196 @@ static esp_mqtt_client_handle_t client;
 static SemaphoreHandle_t clientMutex;
 static bool taskStarted = false;
 
+//-- --------------------------------------------------------------------------
+//-- Tariff ingestion (the subscription side of the client)
+//-- --------------------------------------------------------------------------
+
+//-- The event task owns the reassembly fields; the MQTT task owns the
+//-- subscription state and the pending handoff. No lock is needed between
+//-- them: the event task only touches the reassembly fields and the two
+//-- buffers, the task only reads tariffPendingReady/Length and the pending
+//-- buffer, and both flip tariffPendingReady last/first so a half-built
+//-- document is never ingested.
+static char tariffTopic[LOGGER_TARIFF_TOPIC_MAX];
+static bool tariffSubscribed;
+static bool tariffSubscribePending;
+static char* tariffRxBuffer;
+static char* tariffPendingBuffer;
+static size_t tariffRxTotal;
+static size_t tariffRxReceived;
+static bool tariffRxActive;
+static bool tariffRxIgnore;
+static size_t tariffPendingLength;
+static volatile bool tariffPendingReady;
+static uint32_t tariffSubscribeRetryMs;
+
 static void mqttTask(void* argument);
 
-static bool publicationRequested(void)
+static bool publicationRequested(const MqttSettings* source)
 {
-  return (settings.broker[0] != '\0') && (settings.intervalSeconds > 0u);
+  return (source->broker[0] != '\0') && (source->intervalSeconds > 0u);
 }
 
 //-- Recomputes the wanted client state from the settings and the station.
-//-- The caller holds settingsMutex.
+//-- The caller holds settingsMutex. The client runs while a broker is named
+//-- and the station has joined: publication additionally needs a broadcast
+//-- interval above zero, but the tariff subscription arrives over the same
+//-- client even when the device itself never broadcasts.
 static void refreshWantedState(void)
 {
-  clientShouldRun = publicationRequested() && networkReady;
+  clientShouldRun = (settings.broker[0] != '\0') && networkReady;
+}
+
+static char* allocateTariffBuffer(void)
+{
+  //-- One byte of headroom for the NUL the shared ingestion expects after
+  //-- the document bytes.
+  return heap_caps_malloc(LOGGER_TARIFF_JSON_MAX_BYTES + 1u, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+//-- Reassembles one MQTT message on the tariff topic (fragmented payloads
+//-- included) and hands the complete document to the tariff store through
+//-- the pending slot. Foreign topics are skipped whole; anything that
+//-- cannot be taken in is logged and dropped, never ingested half.
+static void handleTariffMessageData(esp_mqtt_event_t* event)
+{
+  bool firstFragment = (event->current_data_offset == 0);
+  size_t receivedSoFar = (size_t)event->current_data_offset + (size_t)event->data_len;
+
+  if (firstFragment)
+  {
+    tariffRxActive = false;
+    tariffRxIgnore = true;
+    tariffRxTotal =
+        (event->total_data_len > 0) ? (size_t)event->total_data_len : (size_t)event->data_len;
+
+    if (tariffRxTotal > LOGGER_TARIFF_JSON_MAX_BYTES)
+    {
+      ESP_LOGW(tag, "tariff message of %u bytes exceeds the document bound, dropped",
+               (unsigned)tariffRxTotal);
+      tariffRxActive = true;
+      return;
+    }
+
+    size_t wantedLength = strlen(tariffTopic);
+
+    if (((size_t)event->topic_len == wantedLength) &&
+        (memcmp(event->topic, tariffTopic, wantedLength) == 0))
+    {
+      if (tariffRxBuffer == NULL)
+      {
+        tariffRxBuffer = allocateTariffBuffer();
+      }
+
+      if (tariffRxBuffer != NULL)
+      {
+        tariffRxActive = true;
+        tariffRxIgnore = false;
+        tariffRxReceived = 0u;
+      }
+      else
+      {
+        ESP_LOGW(tag, "out of memory for the tariff receive buffer, message dropped");
+        tariffRxActive = true;
+      }
+    }
+  }
+
+  if (!tariffRxActive)
+  {
+    return;
+  }
+
+  if (tariffRxIgnore)
+  {
+    if (receivedSoFar >= tariffRxTotal)
+    {
+      tariffRxActive = false;
+    }
+
+    return;
+  }
+
+  if ((receivedSoFar > tariffRxTotal) || (tariffRxReceived > (size_t)event->current_data_offset))
+  {
+    ESP_LOGW(tag, "tariff message overran its declared size, dropped");
+    tariffRxActive = false;
+    tariffRxIgnore = true;
+    return;
+  }
+
+  memcpy(tariffRxBuffer + event->current_data_offset, event->data, event->data_len);
+  tariffRxReceived = receivedSoFar;
+
+  if (tariffRxReceived >= tariffRxTotal)
+  {
+    if (tariffPendingBuffer == NULL)
+    {
+      tariffPendingBuffer = allocateTariffBuffer();
+    }
+
+    if (tariffPendingBuffer == NULL)
+    {
+      ESP_LOGW(tag, "out of memory for the tariff pending buffer, message dropped");
+    }
+    else
+    {
+      if (tariffPendingReady)
+      {
+        ESP_LOGW(tag, "replacing a tariff message the task has not ingested yet");
+      }
+
+      memcpy(tariffPendingBuffer, tariffRxBuffer, tariffRxTotal);
+      tariffPendingBuffer[tariffRxTotal] = '\0';
+      tariffPendingLength = tariffRxTotal;
+      tariffPendingReady = true;
+    }
+
+    tariffRxActive = false;
+    tariffRxIgnore = true;
+  }
+}
+
+//-- (Re)subscribes the tariff topic when the effective topic changed or
+//-- the broker asks for a fresh subscription (a reconnect does not keep an
+//-- established one). The retained QoS 1 schedule is delivered by the
+//-- broker right away.
+static void ensureTariffSubscription(void)
+{
+  char wanted[LOGGER_TARIFF_TOPIC_MAX];
+  loggerTariffsEffectiveTopic(wanted, sizeof wanted);
+
+  if (!tariffSubscribePending && (strcmp(wanted, tariffTopic) == 0))
+  {
+    return;
+  }
+
+  if (tariffSubscribeRetryMs > 0u)
+  {
+    //-- Backoff after a failed attempt (a disconnected client rejects the
+    //-- subscribe): the client itself keeps retrying the broker anyway.
+    tariffSubscribeRetryMs =
+        (tariffSubscribeRetryMs >= MQTT_TICK_MS) ? (tariffSubscribeRetryMs - MQTT_TICK_MS) : 0u;
+    return;
+  }
+
+  xSemaphoreTake(clientMutex, portMAX_DELAY);
+  int result = (client != NULL) ? esp_mqtt_client_subscribe(client, wanted, 1) : -1;
+  xSemaphoreGive(clientMutex);
+
+  if (result >= 0)
+  {
+    snprintf(tariffTopic, sizeof tariffTopic, "%s", wanted);
+    tariffSubscribed = true;
+    tariffSubscribePending = false;
+    tariffSubscribeRetryMs = 0u;
+    ESP_LOGI(tag, "subscribed to the tariff topic %s (qos 1)", wanted);
+  }
+  else
+  {
+    tariffSubscribeRetryMs = 10000u;
+    ESP_LOGW(tag, "could not subscribe to the tariff topic %s (retrying in 10 s)", wanted);
+  }
 }
 
 //-- The esp_event handler the mqtt component dispatches through: the event
@@ -125,6 +305,10 @@ static void mqttEventHandler(void* argument, esp_event_base_t eventBase, int32_t
     xSemaphoreTake(settingsMutex, portMAX_DELAY);
     settings.publishNow = true;
     xSemaphoreGive(settingsMutex);
+
+    //-- A reconnect does not keep an established subscription: the task
+    //-- (re)subscribes the tariff topic on its next tick.
+    tariffSubscribePending = true;
   }
   else if (eventId == MQTT_EVENT_DISCONNECTED)
   {
@@ -133,6 +317,10 @@ static void mqttEventHandler(void* argument, esp_event_base_t eventBase, int32_t
   else if (eventId == MQTT_EVENT_ERROR)
   {
     ESP_LOGW(tag, "broker connection error");
+  }
+  else if (eventId == MQTT_EVENT_DATA)
+  {
+    handleTariffMessageData((esp_mqtt_event_t*)eventData);
   }
 }
 
@@ -195,6 +383,9 @@ static void stopClient(void)
     esp_mqtt_client_destroy(client);
     client = NULL;
   }
+
+  //-- A new client carries no subscription yet.
+  tariffSubscribed = false;
 }
 
 //-- Appends formatted text. snprintf reports what it *would* have written,
@@ -526,6 +717,34 @@ static void mqttTask(void* argument)
     xSemaphoreGive(clientMutex);
 
     if (!shouldRun)
+    {
+      sinceBroadcastMs = 0u;
+      continue;
+    }
+
+    //-- The tariff subscription rides on the same client, with or without
+    //-- a broadcast interval.
+    ensureTariffSubscription();
+
+    if (tariffPendingReady)
+    {
+      tariffPendingReady = false;
+      char reason[160] = "";
+      loggerTariffIngestResult_t outcome =
+          loggerTariffsIngestJson(tariffPendingBuffer, tariffPendingLength, reason, sizeof reason);
+
+      if (outcome == LOGGER_TARIFF_OK)
+      {
+        ESP_LOGI(tag, "tariff schedule accepted via MQTT (%u bytes)",
+                 (unsigned)tariffPendingLength);
+      }
+      else
+      {
+        ESP_LOGW(tag, "tariff message via MQTT rejected: %s", reason);
+      }
+    }
+
+    if (!publicationRequested(&copy))
     {
       sinceBroadcastMs = 0u;
       continue;

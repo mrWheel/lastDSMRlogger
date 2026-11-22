@@ -1,0 +1,20 @@
+[mqtt]
+# Address of the MQTT broker that lastDSMRlogger subscribes to.
+host = YOUR_MQTT_BROKER
+port = 1883
+username =
+password =
+tls = false
+# Optional PEM CA file, relative to this config file or an absolute path.
+ca_file =
+
+[logger]
+# Enter just the hostname (all lowecase). The script also accepts a .local suffix.
+hostname = lastdsmrlogger
+# Leave empty to use lastdsmrlogger/<hostname>/tariffs.
+# Set the complete topic here if the logger uses a different prefix or device ID.
+topic = subTopic
+
+
+
+

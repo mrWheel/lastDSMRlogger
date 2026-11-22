@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-22 · Build: 21
+//-- Date: 2026-11-22 · Build: 23
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -28,6 +28,7 @@
 
 #include <ctype.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +36,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -48,6 +50,7 @@
 #include "logger_receiver.h"
 #include "logger_settings.h"
 #include "logger_store.h"
+#include "logger_tariffs.h"
 #include "logger_telnet.h"
 #include "wifi_provisioner.h"
 
@@ -70,10 +73,10 @@ extern const char appJsEnd[] asm("_binary_app_js_end");
 extern const char styleCssStart[] asm("_binary_style_css_start");
 extern const char styleCssEnd[] asm("_binary_style_css_end");
 
-#define WEB_BODY_MAX 512
+#define WEB_BODY_MAX 768
 #define WEB_STATUS_JSON_BYTES 1024
 #define WEB_LIST_JSON_BYTES 2048
-#define WEB_CONFIG_JSON_BYTES 4096
+#define WEB_CONFIG_JSON_BYTES 6144
 //-- The power JSON also carries the bar history of the newest 90 accepted
 //-- samples (watts plus their "HH:MM:SS" time text), so it is sized for the
 //-- frame plus that array with headroom.
@@ -665,6 +668,15 @@ static void appendSettingsJson(stringBuilder* sb, const loggerSettingsConfig* co
   sbAppendJsonString(sb, config->hostname);
   sbAppendFmt(sb, ",\"fixedIpLastOctet\":%u", (unsigned)config->fixedIpLastOctet);
 
+  //-- Meter store and tariffs: the rfs synchronisation interval, the
+  //-- manual tariff prices and the dynamic tariffs switch.
+  sbAppendFmt(sb, ",\"rfsSyncIntervalMinutes\":%u", (unsigned)config->rfsSyncIntervalMinutes);
+  sbAppendFmt(sb, ",\"tariff1PricePerKwh\":%.3f", (double)config->tariff1PricePerKwh);
+  sbAppendFmt(sb, ",\"tariff2PricePerKwh\":%.3f", (double)config->tariff2PricePerKwh);
+  sbAppendFmt(sb, ",\"tariffGasPricePerM3\":%.3f", (double)config->tariffGasPricePerM3);
+  sbAppend(sb, ",\"dynamicTariffsEnabled\":");
+  sbAppend(sb, config->dynamicTariffsEnabled ? "true" : "false");
+
   sbAppend(sb, ",\"mbus\":[");
 
   for (uint8_t channel = DSMR_MBUS_CHANNEL_MIN; channel <= DSMR_MBUS_CHANNEL_MAX; channel++)
@@ -821,7 +833,31 @@ static void appendConfigJson(stringBuilder* sb)
   }
 
   sbAppend(sb,
-           "],\"mbusTypes\":[\"gas\",\"water\",\"heat\",\"cooling\",\"electricity\",\"other\"]}}");
+           "],\"mbusTypes\":[\"gas\",\"water\",\"heat\",\"cooling\",\"electricity\",\"other\"]");
+
+  //-- Bounds of the rfs synchronisation interval and the wear estimate
+  //-- inputs for the settings view (block count of the volume, estimated
+  //-- block-sized writes per synchronisation and the flash cycle rating);
+  //-- the lifetime itself is computed by the SPA from the entered value.
+  sbAppendFmt(sb, ",\"rfsSyncMin\":%u", (unsigned)LOGGER_SETTINGS_RFS_SYNC_MIN_MINUTES);
+  sbAppendFmt(sb, ",\"rfsSyncMax\":%u", (unsigned)LOGGER_SETTINGS_RFS_SYNC_MAX_MINUTES);
+
+  uint32_t totalBlocks = 0u;
+  uint32_t blockWritesPerSync = 0u;
+  uint32_t flashWriteCycles = 0u;
+
+  if (loggerStoreRfsWearInfo(&totalBlocks, &blockWritesPerSync, &flashWriteCycles))
+  {
+    sbAppendFmt(sb, ",\"rfsWear\":{\"totalBlocks\":%" PRIu32, totalBlocks);
+    sbAppendFmt(sb, ",\"blockWritesPerSync\":%" PRIu32, blockWritesPerSync);
+    sbAppendFmt(sb, ",\"flashWriteCycles\":%" PRIu32 "}", flashWriteCycles);
+  }
+  else
+  {
+    sbAppend(sb, ",\"rfsWear\":null");
+  }
+
+  sbAppend(sb, "}}");
 }
 
 //-- Applies and persists a complete configuration from a form-urlencoded
@@ -851,6 +887,21 @@ static void copyTrimmed(char* dst, size_t dstSize, const char* src)
 
   memcpy(dst, src, length);
   dst[length] = '\0';
+}
+
+//-- One manual tariff price from form text: an unusable value (not a
+//-- number, out of the sanity bounds) becomes 0.0.
+static float parseTariffPrice(const char* text)
+{
+  double value = atof(text);
+
+  if (!isfinite(value) || (value < (double)LOGGER_SETTINGS_TARIFF_PRICE_MIN) ||
+      (value > (double)LOGGER_SETTINGS_TARIFF_PRICE_MAX))
+  {
+    return 0.0f;
+  }
+
+  return (float)value;
 }
 
 //-- Lowercases every letter of the buffer in place (hostname spelling).
@@ -1019,6 +1070,40 @@ static const char* applySettingsFromForm(const char* body)
 
   candidate.fixedIpLastOctet =
       (uint8_t)((fixedOctet < 1) ? 0 : ((fixedOctet > 254) ? 254 : fixedOctet));
+
+  //-- The rfs synchronisation interval is clamped like the read interval:
+  //-- an unusable value becomes the documented default.
+  int rfsSyncMinutes = (int)LOGGER_SETTINGS_RFS_SYNC_DEFAULT_MINUTES;
+
+  if (formGet(body, "rfsSyncMinutes", text, sizeof text))
+  {
+    rfsSyncMinutes = atoi(text);
+  }
+
+  if ((rfsSyncMinutes < (int)LOGGER_SETTINGS_RFS_SYNC_MIN_MINUTES) ||
+      (rfsSyncMinutes > (int)LOGGER_SETTINGS_RFS_SYNC_MAX_MINUTES))
+  {
+    rfsSyncMinutes = (int)LOGGER_SETTINGS_RFS_SYNC_DEFAULT_MINUTES;
+  }
+
+  candidate.rfsSyncIntervalMinutes = (uint16_t)rfsSyncMinutes;
+
+  //-- Manual tariff prices: an unusable value becomes 0.0 (out of range or
+  //-- not a number), which simply earns nothing until it is corrected.
+  candidate.tariff1PricePerKwh =
+      formGet(body, "tariff1", text, sizeof text) ? parseTariffPrice(text) : 0.0f;
+  candidate.tariff2PricePerKwh =
+      formGet(body, "tariff2", text, sizeof text) ? parseTariffPrice(text) : 0.0f;
+  candidate.tariffGasPricePerM3 =
+      formGet(body, "tariffGas", text, sizeof text) ? parseTariffPrice(text) : 0.0f;
+
+  //-- Dynamic tariffs switch: 1 lets the tariff table price the ring
+  //-- records (manual prices as the fallback), 0 or an absent field always
+  //-- uses the manual prices.
+  if (formGet(body, "dynamicTariffs", text, sizeof text))
+  {
+    candidate.dynamicTariffsEnabled = (text[0] == '1');
+  }
 
   if (!formGet(body, "country", candidate.countryCode, sizeof candidate.countryCode))
   {
@@ -1996,6 +2081,372 @@ static esp_err_t handleViewReport(httpd_req_t* req)
   return sendJson(req, "{\"ok\":true}");
 }
 
+//-- ------------------------------------------------------------------------
+//-- v3 API: dynamic electricity tariffs
+//-- ------------------------------------------------------------------------
+
+//-- Room for the largest aggregated answer: the bucket bound at the widest
+//-- bucket framing. The document is far too big for the internal heap, so
+//-- the query buffer is asked of PSRAM (it lives in the same PSRAM as the
+//-- tariff store itself).
+#define WEB_TARIFF_QUERY_JSON_BYTES (256u * 1024u)
+
+//-- A raw answer never lists more stored intervals than this: a caller
+//-- wanting more must narrow the range.
+#define WEB_TARIFF_RAW_JSON_MAX 2048u
+
+typedef struct
+{
+  stringBuilder* sb;
+  bool first;
+  uint32_t emitted;
+  bool tooWide;
+} TariffJsonEmit;
+
+static bool tariffRawVisitor(const loggerTariffInterval* interval, void* userData)
+{
+  TariffJsonEmit* emit = (TariffJsonEmit*)userData;
+
+  if (emit->emitted >= WEB_TARIFF_RAW_JSON_MAX)
+  {
+    emit->tooWide = true;
+    return false;
+  }
+
+  char start[24];
+  char end[24];
+  loggerTariffsFormatUtc(interval->startEpochS, start, sizeof start);
+  loggerTariffsFormatUtc(interval->endEpochS, end, sizeof end);
+
+  sbAppend(emit->sb, emit->first ? "" : ",");
+  emit->first = false;
+  emit->emitted++;
+
+  sbAppend(emit->sb, "{\"start\":");
+  sbAppendJsonString(emit->sb, start);
+  sbAppend(emit->sb, ",\"end\":");
+  sbAppendJsonString(emit->sb, end);
+  sbAppendFmt(emit->sb, ",\"importPricePerKwh\":%.6f", (double)interval->importPricePerKwh);
+  sbAppend(emit->sb, ",\"exportPricePerKwh\":");
+
+  if (interval->hasExport)
+  {
+    sbAppendFmt(emit->sb, "%.6f", (double)interval->exportPricePerKwh);
+  }
+  else
+  {
+    sbAppend(emit->sb, "null");
+  }
+
+  sbAppend(emit->sb, "}");
+  return true;
+}
+
+static bool tariffBucketVisitor(const loggerTariffBucket* bucket, void* userData)
+{
+  TariffJsonEmit* emit = (TariffJsonEmit*)userData;
+
+  char start[24];
+  char end[24];
+  loggerTariffsFormatUtc(bucket->startUtcS, start, sizeof start);
+  loggerTariffsFormatUtc(bucket->endUtcS, end, sizeof end);
+
+  sbAppend(emit->sb, emit->first ? "" : ",");
+  emit->first = false;
+  emit->emitted++;
+
+  sbAppend(emit->sb, "{\"start\":");
+  sbAppendJsonString(emit->sb, start);
+  sbAppend(emit->sb, ",\"end\":");
+  sbAppendJsonString(emit->sb, end);
+  sbAppend(emit->sb, ",\"localLabel\":");
+  sbAppendJsonString(emit->sb, bucket->localLabel);
+  sbAppend(emit->sb, ",\"importPricePerKwh\":");
+
+  if (bucket->importCoveredSeconds > 0u)
+  {
+    sbAppendFmt(emit->sb, "%.6f", bucket->importPricePerKwh);
+  }
+  else
+  {
+    sbAppend(emit->sb, "null");
+  }
+
+  sbAppendFmt(emit->sb, ",\"importCoveredSeconds\":%" PRIu64, bucket->importCoveredSeconds);
+  sbAppend(emit->sb, ",\"exportPricePerKwh\":");
+
+  if (bucket->exportCoveredSeconds > 0u)
+  {
+    sbAppendFmt(emit->sb, "%.6f", bucket->exportPricePerKwh);
+  }
+  else
+  {
+    sbAppend(emit->sb, "null");
+  }
+
+  sbAppendFmt(emit->sb, ",\"exportCoveredSeconds\":%" PRIu64, bucket->exportCoveredSeconds);
+  sbAppendFmt(emit->sb, ",\"totalSeconds\":%" PRIu64, bucket->totalSeconds);
+  sbAppend(emit->sb, "}");
+  return true;
+}
+
+static void* tariffQueryAllocate(size_t size)
+{
+  void* buffer = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+  if (buffer == NULL)
+  {
+    buffer = malloc(size);
+  }
+
+  return buffer;
+}
+
+static esp_err_t handleTariffsCurrentGet(httpd_req_t* req)
+{
+  char topic[LOGGER_TARIFF_TOPIC_MAX];
+  loggerTariffsEffectiveTopic(topic, sizeof topic);
+
+  bool clockSynced = loggerTariffsClockSynced();
+  time_t now = time(NULL);
+  loggerTariffInterval active;
+  bool available = clockSynced && loggerTariffsActiveInterval(now, &active);
+
+  char buffer[1024];
+  stringBuilder sb;
+  sbInit(&sb, buffer, sizeof buffer);
+
+  sbAppend(&sb, "{\"type\":\"tariff\",\"mqttTopic\":");
+  sbAppendJsonString(&sb, topic);
+  sbAppendFmt(&sb, ",\"clockSynced\":%s", clockSynced ? "true" : "false");
+  sbAppend(&sb, ",\"currency\":");
+  sbAppendJsonString(&sb, loggerTariffsCurrency());
+  sbAppendFmt(&sb, ",\"storedIntervals\":%u", (unsigned)loggerTariffsStoredCount());
+  sbAppendFmt(&sb, ",\"available\":%s", available ? "true" : "false");
+
+  if (available)
+  {
+    char start[24];
+    char end[24];
+    loggerTariffsFormatUtc(active.startEpochS, start, sizeof start);
+    loggerTariffsFormatUtc(active.endEpochS, end, sizeof end);
+
+    sbAppend(&sb, ",\"start\":");
+    sbAppendJsonString(&sb, start);
+    sbAppend(&sb, ",\"end\":");
+    sbAppendJsonString(&sb, end);
+    sbAppendFmt(&sb, ",\"importPricePerKwh\":%.6f", (double)active.importPricePerKwh);
+    sbAppend(&sb, ",\"exportPricePerKwh\":");
+
+    if (active.hasExport)
+    {
+      sbAppendFmt(&sb, "%.6f", (double)active.exportPricePerKwh);
+    }
+    else
+    {
+      sbAppend(&sb, "null");
+    }
+  }
+
+  sbAppend(&sb, "}");
+
+  if (sb.overflow)
+  {
+    return sendError(req, 500, "tariff answer overflow");
+  }
+
+  return sendJson(req, buffer);
+}
+
+static esp_err_t handleTariffsQueryGet(httpd_req_t* req, const char* query)
+{
+  char fromText[40] = "";
+  char toText[40] = "";
+  char resolutionText[16] = "";
+
+  bool hasFrom = formGet(query, "from", fromText, sizeof fromText);
+  bool hasTo = formGet(query, "to", toText, sizeof toText);
+  bool hasResolution = formGet(query, "resolution", resolutionText, sizeof resolutionText);
+
+  if (!hasFrom || !hasTo || !hasResolution)
+  {
+    return sendError(req, 400, "from, to and resolution are required together");
+  }
+
+  int64_t from = 0;
+  int64_t to = 0;
+
+  if (!loggerTariffsParseUtc(fromText, &from) || !loggerTariffsParseUtc(toText, &to))
+  {
+    return sendError(req, 400, "from and to must be UTC 'YYYY-MM-DDTHH:MM:SSZ'");
+  }
+
+  if (to <= from)
+  {
+    return sendError(req, 400, "to must be after from");
+  }
+
+  lowercaseText(resolutionText);
+  loggerTariffResolution_t resolution;
+
+  if (strcmp(resolutionText, "raw") == 0)
+  {
+    resolution = LOGGER_TARIFF_RAW;
+  }
+  else if (strcmp(resolutionText, "hour") == 0)
+  {
+    resolution = LOGGER_TARIFF_HOUR;
+  }
+  else if (strcmp(resolutionText, "day") == 0)
+  {
+    resolution = LOGGER_TARIFF_DAY;
+  }
+  else if (strcmp(resolutionText, "month") == 0)
+  {
+    resolution = LOGGER_TARIFF_MONTH;
+  }
+  else
+  {
+    return sendError(req, 400, "unknown resolution (raw, hour, day or month)");
+  }
+
+  char* buffer = tariffQueryAllocate(WEB_TARIFF_QUERY_JSON_BYTES);
+
+  if (buffer == NULL)
+  {
+    return sendError(req, 500, "out of memory");
+  }
+
+  stringBuilder sb;
+  sbInit(&sb, buffer, WEB_TARIFF_QUERY_JSON_BYTES);
+  TariffJsonEmit emit = {&sb, true, 0u, false};
+
+  sbAppend(&sb, "{\"type\":\"tariffQuery\",\"resolution\":");
+  sbAppendJsonString(&sb, resolutionText);
+  sbAppend(&sb, ",\"from\":");
+  sbAppendJsonString(&sb, fromText);
+  sbAppend(&sb, ",\"to\":");
+  sbAppendJsonString(&sb, toText);
+  sbAppend(&sb, ",\"currency\":");
+  sbAppendJsonString(&sb, loggerTariffsCurrency());
+  sbAppend(&sb, (resolution == LOGGER_TARIFF_RAW) ? ",\"intervals\":[" : ",\"buckets\":[");
+
+  esp_err_t walk = ESP_OK;
+
+  if (resolution == LOGGER_TARIFF_RAW)
+  {
+    walk = loggerTariffsForEachRaw((time_t)from, (time_t)to, tariffRawVisitor, &emit);
+  }
+  else
+  {
+    walk = loggerTariffsAggregate((time_t)from, (time_t)to, resolution, tariffBucketVisitor, &emit);
+  }
+
+  sbAppend(&sb, "]");
+  sbAppendFmt(&sb, ",\"count\":%u}", (unsigned)emit.emitted);
+
+  if (walk != ESP_OK)
+  {
+    free(buffer);
+    return sendError(req, (walk == ESP_ERR_NO_MEM) ? 500 : 400,
+                     (walk == ESP_ERR_NO_MEM) ? "out of memory" : "range refused (too wide)");
+  }
+
+  if (emit.tooWide)
+  {
+    free(buffer);
+    return sendError(req, 400, "the range returns too many intervals, narrow the range");
+  }
+
+  if (sb.overflow)
+  {
+    free(buffer);
+    return sendError(req, 500, "tariff answer too large");
+  }
+
+  esp_err_t result = sendJson(req, buffer);
+  free(buffer);
+  return result;
+}
+
+static esp_err_t handleTariffsElectricityGet(httpd_req_t* req)
+{
+  const char* query = strchr(req->uri, '?');
+
+  if (query == NULL)
+  {
+    return handleTariffsCurrentGet(req);
+  }
+
+  return handleTariffsQueryGet(req, query + 1);
+}
+
+static esp_err_t handleTariffsElectricityPost(httpd_req_t* req)
+{
+  int contentLength = req->content_len;
+
+  if (contentLength <= 0)
+  {
+    return sendError(req, 400, "missing JSON body");
+  }
+
+  if ((size_t)contentLength > LOGGER_TARIFF_JSON_MAX_BYTES)
+  {
+    return sendError(req, 400, "the document exceeds the tariff payload bound");
+  }
+
+  char* body = tariffQueryAllocate((size_t)contentLength + 1u);
+
+  if (body == NULL)
+  {
+    return sendError(req, 500, "out of memory");
+  }
+
+  int received = 0;
+
+  while (received < contentLength)
+  {
+    int chunk = httpd_req_recv(req, body + received, (size_t)(contentLength - received));
+
+    if (chunk <= 0)
+    {
+      free(body);
+      return sendError(req, 400, "cannot read body");
+    }
+
+    received += chunk;
+  }
+
+  body[contentLength] = '\0';
+
+  char reason[120] = "";
+  loggerTariffIngestResult_t result =
+      loggerTariffsIngestJson(body, (size_t)contentLength, reason, sizeof reason);
+  free(body);
+
+  if (result == LOGGER_TARIFF_OK)
+  {
+    char json[256];
+    stringBuilder sb;
+    sbInit(&sb, json, sizeof json);
+    sbAppend(&sb, "{\"ok\":true,\"storedIntervals\":");
+    sbAppendFmt(&sb, "%u", (unsigned)loggerTariffsStoredCount());
+    sbAppend(&sb, ",\"currency\":");
+    sbAppendJsonString(&sb, loggerTariffsCurrency());
+    sbAppend(&sb, "}");
+    return sendJson(req, json);
+  }
+
+  ESP_LOGW(tag, "tariff submission refused: %s", reason);
+
+  if ((result == LOGGER_TARIFF_NO_SPACE) || (result == LOGGER_TARIFF_IO_ERROR))
+  {
+    return sendError(req, 500, reason);
+  }
+
+  return sendError(req, 400, reason);
+}
+
 //-- --------------------------------------------------------------------------
 //-- v3 API: standard data calls under /api/v3/
 //-- --------------------------------------------------------------------------
@@ -2044,6 +2495,12 @@ static const ApiV3Entry apiV3Entries[] = {
     {"GET", "/api/v3/csv?ring=<hours|days|months>",
      "one meter ring as re-importable csv (text/csv, the ring2csv content)"},
     {"POST", "/api/v3/view", "reports the active browser screen name to the device display"},
+    {"GET", "/api/v3/tariffs",
+     "the active electricity tariff interval (or an explicit unavailable report)"},
+    {"GET", "/api/v3/tariffs?from=<utc>&to=<utc>&resolution=<raw|hour|day|month>",
+     "stored intervals or time-weighted price averages for the UTC range"},
+    {"POST", "/api/v3/tariffs",
+     "accept the shared tariff schedule JSON document (same format as the MQTT topic)"},
 };
 
 static esp_err_t handleApiV3IndexGet(httpd_req_t* req)
@@ -3093,6 +3550,13 @@ esp_err_t loggerWebStart(void)
   registerUri(server, "/api/v3/store", HTTP_GET, false, handleApiV3StoreGet);
   registerUri(server, "/api/v3/csv", HTTP_GET, false, handleApiV3CsvGet);
   registerUri(server, "/api/v3/view", HTTP_POST, false, handleViewReport);
+
+  //-- The dynamic electricity tariffs: the POST accepts the shared
+  //-- schedule document, the GET answers the active interval or an
+  //-- aggregated walk of the stored ones (README: Dynamic electricity
+  //-- tariffs).
+  registerUri(server, "/api/v3/tariffs", HTTP_GET, false, handleTariffsElectricityGet);
+  registerUri(server, "/api/v3/tariffs", HTTP_POST, false, handleTariffsElectricityPost);
 
   registerUri(server, "/ws", HTTP_GET, true, handleWebSocket);
 

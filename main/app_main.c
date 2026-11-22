@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: app_main.c - application entry
-//-- Date: 2026-11-21 · Build: 15
+//-- Date: 2026-11-22 · Build: 17
 //--
 //-- Boot order: the board debug lines come up first, then NVS, then the P1
 //-- receiver. Reception starts as soon as a valid configuration is stored and
@@ -15,7 +15,7 @@
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
 extern const char* PROG_VERSION;
-const char* PROG_VERSION = "v0.5.7";
+const char* PROG_VERSION = "v0.5.8";
 
 #include <stdio.h>
 #include <string.h>
@@ -36,6 +36,7 @@ const char* PROG_VERSION = "v0.5.7";
 #include "logger_receiver.h"
 #include "logger_settings.h"
 #include "logger_store.h"
+#include "logger_tariffs.h"
 #include "logger_telnet.h"
 #include "logger_web.h"
 #include "nvs_flash.h"
@@ -457,6 +458,22 @@ void app_main(void)
   if (storeStarted != ESP_OK)
   {
     ESP_LOGE(tag, "meter store could not start: %s", esp_err_to_name(storeStarted));
+  }
+
+  //-- The dynamic electricity tariffs: shared ingestion for the MQTT
+  //-- tariff topic and the API, with the accepted schedule persisted on the
+  //-- meter store's volume (loaded lazily once that volume is mounted).
+  esp_err_t tariffsStarted = loggerTariffsInit();
+
+  if (tariffsStarted != ESP_OK)
+  {
+    ESP_LOGE(tag, "tariffs could not start: %s", esp_err_to_name(tariffsStarted));
+  }
+  else
+  {
+    //-- The meter store values its ring records through the tariff
+    //-- calculator: dynamic tariff prices with the manual fallback.
+    loggerStoreSetTariffCalculator(loggerTariffsMeterAmountCalculator);
   }
 
   BaseType_t created =

@@ -24,6 +24,7 @@ sdkconfig.old
 
 # Other
 .claude/
+tools/configEnergy.cfg
 *.un~
 
 # python temp

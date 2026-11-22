@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.h - versioned settings service
-//-- Date: 2026-11-21 · Build: 6
+//-- Date: 2026-11-22 · Build: 7
 //--
 //-- The settings service stores the complete versioned configuration in
 //-- ESP-IDF NVS, validates it against the parserDSMR built-in profiles and
@@ -74,6 +74,10 @@ typedef enum
 //-- fields were appended at the end of the struct. Smaller stored blobs
 //-- (the five original fields) migrate on load: the appended fields get
 //-- their defaults, so no save is required after updating.
+//-- Version 5 (extended again): the rfs synchronisation interval and the
+//-- manual tariff prices were appended at the end of the struct. Blobs of
+//-- either earlier size migrate on load: the appended fields get their
+//-- defaults, so no save is required after updating.
 #define LOGGER_SETTINGS_VERSION 5u
 #define LOGGER_SETTINGS_PROFILE_ID_MAX 32
 #define LOGGER_SETTINGS_COUNTRY_MAX 3
@@ -91,6 +95,20 @@ typedef enum
 //-- (accepted into the history) per interval.
 #define LOGGER_SETTINGS_INTERVAL_MIN_S 2u
 #define LOGGER_SETTINGS_INTERVAL_MAX_S 600u
+
+//-- rfs synchronisation interval in minutes: the meter store commits its
+//-- staged ring records at least this often (one-minute snapshots coalesce
+//-- in the staging buffers, so only the synchronisation touches storage).
+#define LOGGER_SETTINGS_RFS_SYNC_MIN_MINUTES 1u
+#define LOGGER_SETTINGS_RFS_SYNC_MAX_MINUTES 60u
+#define LOGGER_SETTINGS_RFS_SYNC_DEFAULT_MINUTES 10u
+
+//-- Bounds of the manual tariff prices in EUR per kWh (both energy
+//-- tariffs) and EUR per m³ (gas). Negative prices are valid: negative
+//-- spot prices occur. The prices apply when the dynamic tariff table has
+//-- no import price for the period, and always for gas.
+#define LOGGER_SETTINGS_TARIFF_PRICE_MIN (-5.0f)
+#define LOGGER_SETTINGS_TARIFF_PRICE_MAX 5.0f
 
 typedef struct
 {
@@ -158,6 +176,29 @@ typedef struct
   //-- Fixed IP: the last octet of the station address, the network part
   //-- taken from the lease the router granted. 0 means no fixed IP (DHCP).
   uint8_t fixedIpLastOctet;
+
+  //-- ------------------------------------------------------------------------
+  //-- Meter store and tariffs (appended with the second version 5 extension;
+  //-- older blobs leave these at their defaults)
+  //-- ------------------------------------------------------------------------
+
+  //-- Minutes between two rfs synchronisations (1 through 60). The store
+  //-- task commits the staged ring records at least this often.
+  uint16_t rfsSyncIntervalMinutes;
+
+  //-- Manual tariff prices in EUR per kWh (both energy tariffs) and EUR
+  //-- per m³ (gas): the fallback for periods the dynamic tariff table does
+  //-- not price, and the only price for gas.
+  float tariff1PricePerKwh;
+  float tariff2PricePerKwh;
+  float tariffGasPricePerM3;
+
+  //-- Dynamic tariffs switch. True lets the meter store value the consumed
+  //-- energy with the import prices of the dynamic tariff table (through
+  //-- the registered tariff calculator); periods without a stored price
+  //-- fall back to the manual prices above. False always uses the manual
+  //-- prices.
+  bool dynamicTariffsEnabled;
 } loggerSettingsConfig;
 
 //-- Loads the stored configuration and validates it. Returns ESP_ERR_NOT_FOUND

@@ -1,6 +1,6 @@
 # lastDSMRlogger
 
-Buildnumber: 41
+Buildnumber: 43
 Last update-date: 2026-11-22
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
@@ -19,6 +19,7 @@ telegram history lives in RAM.
 |`components/logger_settings/`     |Versioned NVS settings service, validation against parser profiles, data source and interval rules |
 |`components/logger_receiver/`     |Receive task ownership of UART adapter + parser, diagnostics, RAM telegram history     |
 |`components/logger_web/`          |esp_http_server: SPA assets and JSON API                                               |
+|`components/logger_tariffs/`      |Dynamic electricity tariffs: JSON validation, atomic apply, LittleFS persistence, aggregation |
 |`components/logger_board/`        |On-device TFT debug lines through the esp32_s3_piggyback component                     |
 |`components/esp32_s3_piggyback/`  |Vendored board component from mrWheel (pinned, see section 3)                          |
 |`managed_components/mrwheel__parserdsmr/` |Parser dependency from the ESP Component Registry (see section 3)                |
@@ -53,6 +54,7 @@ automatically.
 |ring_file_store           |ESP Component Registry `mrwheel/ring_file_store`                                                            |`^0.1.3` |
 |littlefs                  |ESP Component Registry `joltwallet/littlefs`                                                                |`^1.23.1` |
 |smb_server                |ESP Component Registry `mrwheel/smb_server`                                                                 |`^0.3.0` (GPL-3.0, guest-only SMB2/SMB3 file server) |
+|cjson                     |ESP Component Registry `espressif/cjson`                                                                    |`^1.7.19` (tariff document parsing) |
 
 parserDSMR is consumed as the ESP Component Registry release
 `mrwheel/parserdsmr`, resolved into `managed_components/` by the component
@@ -180,7 +182,15 @@ the device.
   password is never shown by the device: the password field starts empty
   and a save only sends it when the operator typed a new one)
   (0 = no broadcast); a **Network** group enters the hostname and the fixed
-  IP (only the last part — empty or 0 means plain DHCP). Save validates and
+  IP (only the last part — empty or 0 means plain DHCP); a **Meter store**
+  group sets the **rfs Sync Interval (minutes)** (1–60, default 10) — the
+  store task commits its staged ring records at least this often, and a
+  span behind the field shows a rough LittleFS wear estimate for the
+  entered value (device-published volume block count, estimated block-sized
+  writes per synchronisation and flash cycle rating, uniform wear assumed);
+  a **Tariffs** group carries the **Dynamic Tariffs** switch and the manual
+  prices **Tariff 1 (kWh)**, **Tariff 2 (kWh)** and **Tariff Gas (m3)** in
+  EUR (see *Dynamic electricity tariffs*). Save validates and
   applies the complete configuration as one operation and stores it in NVS;
   on any failure the active configuration is preserved and the reason is
   shown.
@@ -559,6 +569,134 @@ touches the lease itself — re-requesting it for a new name, pinning or
 withdrawing a fixed address — is performed by the Wi-Fi task within seconds
 after the save replies, because it briefly leaves the station interface and
 would otherwise abort the very browser request that saved it.
+
+### Dynamic electricity tariffs
+
+The device keeps **per-kWh electricity prices** for imported and exported
+energy so tariff-aware views and automations can ask what a kWh costs (or
+earned) at any instant. The logger does not fetch prices itself: an
+application on the network publishes them — the supplier feed, Home
+Assistant, Node-RED or the example script `tools/publishEnergyTariffs.py`.
+Both delivery paths share one validator and one store (the
+`logger_tariffs` component), so a publisher does not need to know which
+path carried its document.
+
+**One document, two paths.** A batch is a single JSON document:
+
+```json
+{"schemaVersion":1,"currency":"EUR","intervals":[
+  {"start":"2026-12-01T00:00:00Z","end":"2026-12-01T00:15:00Z",
+   "importPricePerKwh":0.235,"exportPricePerKwh":0.08},
+  {"start":"2026-12-01T00:15:00Z","end":"2026-12-01T00:30:00Z",
+   "importPricePerKwh":-0.042}
+]}
+```
+
+- `schemaVersion` must be `1`; `currency` is a three-letter code.
+- Timestamps are exactly `YYYY-MM-DDTHH:MM:SSZ` in **UTC**. `start` is
+  inclusive, `end` exclusive; any positive duration is allowed (quarter
+  hours, hours, a whole day — whatever the feed delivers).
+- `importPricePerKwh` is required and finite; **zero and negative prices
+  are valid** (negative spot prices happen). `exportPricePerKwh` is
+  optional and a missing or `null` export price means **unknown, never
+  zero**.
+- Prices are per kWh in the document currency, taken as submitted:
+  whether VAT and taxes are included is the feed's choice and should be
+  documented by the publisher (the logger only echoes the currency).
+
+**Validation is all-or-nothing.** A batch failing any check is refused
+whole, the reply and the log carry the reason, and the stored schedule
+stays untouched. An interval whose start **and** end equal a stored
+interval replaces it (so re-delivering the same document — what a retained
+message does on every new subscription — is harmless); any other overlap
+with the stored schedule is a conflict and refuses the batch. Intervals
+outside the submitted batch keep standing, so history survives partial
+updates.
+
+**MQTT input.** The device subscribes (QoS 1) to
+`<top topic>/<deviceId>/tariffs/electricity` whenever a broker is
+configured and the station has joined; the top topic is the Settings value
+(empty selects `lastdsmrlogger`) and `<deviceId>` is the factory MAC in
+lowercase hex. The effective topic is reported by the current-price
+endpoint, so it never has to be assembled by hand. Large documents are
+reassembled from MQTT fragments before validation; oversized or malformed
+payloads are dropped with a log line naming the reason. **Publish
+retained** (`-r`) and the device recovers the last schedule on every boot
+without waiting for the next update. Publish whenever prices change —
+daily for day-ahead feeds, per update for intraday spot feeds; duplicate
+or overlapping redelivery of the same document is a no-op.
+
+```
+mosquitto_pub -h <broker> -p 1883 -q 1 -r \
+  -t 'lastdsmrlogger/1cdbd4a27714/tariffs/electricity' \
+  -s < batch.json
+```
+
+**HTTP API** (same document on the `POST`, route `/api/v3/tariffs`):
+
+```
+curl -s -X POST -H 'Content-Type: application/json' \
+  --data-binary @batch.json http://<device>/api/v3/tariffs
+# -> {"ok":true,"storedIntervals":192,"currency":"EUR"}
+#    400 (or 500 for store problems) with {"ok":false,"reason":"…"} on refusal
+
+curl -s http://<device>/api/v3/tariffs
+# -> current: mqttTopic, clockSynced, currency, storedIntervals and, when
+#    available, the interval active now with its start/end/prices
+
+curl -s 'http://<device>/api/v3/tariffs?from=2026-12-01T00:00:00Z&to=2026-12-02T00:00:00Z&resolution=raw'
+curl -s 'http://<device>/api/v3/tariffs?from=2026-12-01T00:00:00Z&to=2026-12-02T00:00:00Z&resolution=hour'
+curl -s '…&resolution=day'
+curl -s '…&resolution=month'
+```
+
+`from` and `to` use the same UTC form, `to` is exclusive; `resolution`
+defaults to `raw`.
+
+**Calendar buckets and averages.** Hour, day and month buckets follow the
+**local** calendar of the device time zone (CET/CEST), while their reported
+`start`/`end` stay authoritative UTC instants. On the autumn transition the
+repeated local hour returns as **two buckets with the same label and
+different UTC boundaries**; the spring-forward skipped hour produces no
+bucket at all. Prices aggregate as **time-weighted averages**: every bucket
+carries the seconds actually covered by an import (or export) price next to
+the bucket's total seconds, so partial coverage is distinguishable from
+full coverage; a bucket with no coverage reports `null` prices and 0
+covered seconds — unknown stays unknown.
+
+**Stored tariff amounts.** With the **Dynamic Tariffs** switch on (Settings
+view, **Tariffs** group) the meter store values every ring record from the
+table instead of the fictional demo amounts: each minute of energy
+consumed in tariff 1 or tariff 2 is priced with the import price the table
+holds for that instant, and periods the table does not cover fall back to
+the manual **Tariff 1 (kWh)** and **Tariff 2 (kWh)** prices. Gas always
+carries the manual **Tariff Gas (m3)** price — the electricity table has no
+gas price. With the switch off all three amounts use the manual prices. The
+amounts accumulate inside the current period and restart when a new period
+opens (or after a reboot, when the staged record is rewritten anyway);
+counter jumps (a meter replacement, or a meter that never published a
+telegram) move the baseline instead of producing a giant amount.
+
+**Persistence and retention.** The accepted schedule is stored on the
+meter store's LittleFS volume and reloaded after every reboot. At ingest
+time everything older than the start of the previous calendar month is
+pruned, so at least the current and the previous month always remain
+queryable.
+
+**Documented bounds.** Payload ≤ 96 KiB per document (both paths),
+≤ 1024 intervals per batch, ≤ 8192 stored intervals (over 60 days of
+quarter-hour prices), ≤ 744 buckets per aggregation (a full local month at
+hour resolution). A submission or query over a bound is refused — payload
+and batch problems as 400, storage problems as 500 — and never applies
+partially.
+
+**MQTT and HTTP together.** The paths are interchangeable for a single
+device: an HTTP `POST` and an MQTT publish validate and apply through the
+same code. The broker is not affected by an HTTP submission, so after a
+reboot a retained MQTT document is applied again: keep the retained
+message current (publish retained on every change) or do not use retained
+messages at all, otherwise an old retained document can re-apply prices a
+later HTTP `POST` had replaced.
 
 ### Importing historical periods (`populate`)
 

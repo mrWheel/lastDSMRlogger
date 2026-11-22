@@ -140,6 +140,50 @@
           </div>
         </fieldset>
 
+        <!-- Meter store group: the rfs synchronisation interval commits the
+             staged ring records to the LittleFS volume; the span beside the
+             field shows the rough wear estimate for the entered value
+             (computed by app.js from the wear inputs in the config frame). -->
+        <fieldset class="iosGroup">
+          <legend>Meter store</legend>
+          <div class="iosRow">
+            <label for="inpRfsSync">rfs Sync Interval (minutes)</label>
+            <input id="inpRfsSync" type="number" min="1" max="60" step="1" value="10" inputmode="numeric">
+            <span id="rfsWearEstimate" class="wearEstimate"></span>
+          </div>
+        </fieldset>
+
+        <!-- Tariffs group: with Dynamic Tariffs on the stored tariff
+             amounts come from the dynamic tariff table; periods the table
+             does not price fall back to the manual prices below (gas always
+             uses its manual price: the electricity table has no gas price). -->
+        <fieldset class="iosGroup">
+          <legend>Tariffs</legend>
+          <div class="iosRow">
+            <label for="inpDynamicTariffs">Dynamic Tariffs</label>
+            <input id="inpDynamicTariffs" type="checkbox"
+                   aria-label="Use the dynamic tariff table for the stored tariff amounts">
+          </div>
+
+          <div class="iosRow">
+            <label for="inpTariff1">Tariff 1 (kWh)</label>
+            <input id="inpTariff1" type="number" step="0.001" min="-5" max="5" value="0"
+                   inputmode="decimal" placeholder="EUR per kWh">
+          </div>
+
+          <div class="iosRow">
+            <label for="inpTariff2">Tariff 2 (kWh)</label>
+            <input id="inpTariff2" type="number" step="0.001" min="-5" max="5" value="0"
+                   inputmode="decimal" placeholder="EUR per kWh">
+          </div>
+
+          <div class="iosRow">
+            <label for="inpTariffGas">Tariff Gas (m3)</label>
+            <input id="inpTariffGas" type="number" step="0.001" min="-5" max="5" value="0"
+                   inputmode="decimal" placeholder="EUR per m3">
+          </div>
+        </fieldset>
+
         <button id="saveSettings" type="submit">Save</button>
       </form>
     </section>

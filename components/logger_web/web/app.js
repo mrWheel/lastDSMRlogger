@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-21 · Build: 29
+// Date: 2026-11-22 · Build: 30
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -114,6 +114,8 @@ function bindElements()
                "selCountry", "selProfile", "selMbus1", "selMbus2", "selMbus3", "selMbus4",
                "inpMqttBroker", "inpMqttPort", "inpMqttUser", "inpMqttPassword", "inpMqttTopic",
                "inpMqttInterval", "inpHostname", "inpFixedIp",
+               "inpRfsSync", "rfsWearEstimate", "inpDynamicTariffs",
+               "inpTariff1", "inpTariff2", "inpTariffGas",
                "saveSettings", "telegramState", "showTelegram", "telegramLog",
                "telegramDetail", "recordMeta", "recordNotes", "summaryTable", "rawView", "footerInfo",
                "powerPanel", "powerTelegram", "powerRows",
@@ -600,6 +602,101 @@ function updateRotationLabels()
   el.rotUpsideDownLabel.classList.toggle("active", isFlipped);
 }
 
+// The bounds of the rfs sync interval, taken from the published choices
+// with the documented fallback when the frame carries none.
+function rfsSyncBounds()
+{
+  const choices = (state.config && state.config.choices) ? state.config.choices : {};
+
+  return {
+    min: Number.isFinite(choices.rfsSyncMin) ? choices.rfsSyncMin : 1,
+    max: Number.isFinite(choices.rfsSyncMax) ? choices.rfsSyncMax : 60
+  };
+}
+
+// Clamps the entered rfs sync interval to the published bounds, writes the
+// accepted value back into the field and refreshes the wear estimate.
+function clampRfsSync()
+{
+  const bounds = rfsSyncBounds();
+  let minutes = parseInt(el.inpRfsSync.value, 10);
+
+  if (!Number.isFinite(minutes) || (minutes < bounds.min))
+  {
+    minutes = bounds.min;
+  }
+
+  if (minutes > bounds.max)
+  {
+    minutes = bounds.max;
+  }
+
+  el.inpRfsSync.value = String(minutes);
+  return minutes;
+}
+
+// Rough LittleFS lifetime estimate behind the sync interval field: one
+// synchronisation is estimated (from the device-published inputs) to cause
+// blockWritesPerSync block-sized writes, spread uniformly over the volume's
+// blocks, against the flash program/erase cycle rating. A deliberately
+// pessimistic figure, worded as the estimate it is.
+function updateRfsWearEstimate()
+{
+  if (!el.rfsWearEstimate)
+  {
+    return;
+  }
+
+  const choices = (state.config && state.config.choices) ? state.config.choices : {};
+  const wear = choices.rfsWear;
+
+  if (!wear || !Number.isFinite(wear.totalBlocks) || (wear.totalBlocks <= 0) ||
+      !Number.isFinite(wear.blockWritesPerSync) || !Number.isFinite(wear.flashWriteCycles))
+  {
+    el.rfsWearEstimate.textContent = "";
+    return;
+  }
+
+  const minutes = clampRfsSync();
+  const syncsPerYear = (365 * 24 * 60) / minutes;
+  const cyclesPerBlockPerYear = (syncsPerYear * wear.blockWritesPerSync) / wear.totalBlocks;
+  const years = wear.flashWriteCycles / cyclesPerBlockPerYear;
+
+  if (!Number.isFinite(years) || (years <= 0))
+  {
+    el.rfsWearEstimate.textContent = "";
+    return;
+  }
+
+  const shown = (years >= 10) ? String(Math.round(years)) : years.toFixed(1);
+  el.rfsWearEstimate.textContent = "~ " + shown + " year LittleFS wear estimate";
+}
+
+// Clamps one manual tariff price to the device bounds and writes the
+// accepted value back into the field.
+function clampTariff(input)
+{
+  let value = parseFloat(input.value);
+
+  if (!Number.isFinite(value))
+  {
+    value = 0;
+  }
+
+  if (value < -5)
+  {
+    value = -5;
+  }
+
+  if (value > 5)
+  {
+    value = 5;
+  }
+
+  input.value = String(value);
+  return value;
+}
+
 function renderSettings(message)
 {
   state.config = message;
@@ -658,6 +755,19 @@ function renderSettings(message)
       (settings && settings.mqttIntervalSeconds) ? String(settings.mqttIntervalSeconds) : "0";
   el.inpHostname.value = (settings && settings.hostname) ? settings.hostname : "";
   el.inpFixedIp.value = (settings && settings.fixedIpLastOctet) ? String(settings.fixedIpLastOctet) : "0";
+
+  // Meter store and tariffs prefill from storage: the sync interval, the
+  // manual tariff prices and the dynamic tariffs switch.
+  el.inpRfsSync.value =
+      (settings && settings.rfsSyncIntervalMinutes) ? String(settings.rfsSyncIntervalMinutes) : "10";
+  el.inpTariff1.value =
+      (settings && Number.isFinite(settings.tariff1PricePerKwh)) ? String(settings.tariff1PricePerKwh) : "0";
+  el.inpTariff2.value =
+      (settings && Number.isFinite(settings.tariff2PricePerKwh)) ? String(settings.tariff2PricePerKwh) : "0";
+  el.inpTariffGas.value =
+      (settings && Number.isFinite(settings.tariffGasPricePerM3)) ? String(settings.tariffGasPricePerM3) : "0";
+  el.inpDynamicTariffs.checked = !!(settings && settings.dynamicTariffsEnabled);
+  updateRfsWearEstimate();
 
   fillSelect(el.selCountry, choices.countries);
 
@@ -774,6 +884,17 @@ function saveSettings(event)
 
   el.inpFixedIp.value = String(fixedIp);
 
+  // The rfs sync interval and the manual tariff prices are clamped to the
+  // published bounds; the wear estimate follows the value that will be
+  // applied. The switch position maps to the stored dynamicTariffsEnabled
+  // flag.
+  const rfsSyncMinutes = clampRfsSync();
+  updateRfsWearEstimate();
+  const tariff1 = clampTariff(el.inpTariff1);
+  const tariff2 = clampTariff(el.inpTariff2);
+  const tariffGas = clampTariff(el.inpTariffGas);
+  const dynamicTariffs = el.inpDynamicTariffs.checked ? "1" : "0";
+
   const body = "cmd=save" +
                "&rxGpio=" + encodeURIComponent(rxGpio) +
                "&rxInverted=" + rxInverted +
@@ -798,7 +919,12 @@ function saveSettings(event)
                "&mqttTopTopic=" + encodeURIComponent((el.inpMqttTopic.value || "").trim()) +
                "&mqttInterval=" + encodeURIComponent(mqttInterval) +
                "&hostname=" + encodeURIComponent(hostname) +
-               "&fixedIp=" + encodeURIComponent(fixedIp);
+               "&fixedIp=" + encodeURIComponent(fixedIp) +
+               "&rfsSyncMinutes=" + encodeURIComponent(rfsSyncMinutes) +
+               "&tariff1=" + encodeURIComponent(tariff1) +
+               "&tariff2=" + encodeURIComponent(tariff2) +
+               "&tariffGas=" + encodeURIComponent(tariffGas) +
+               "&dynamicTariffs=" + dynamicTariffs;
 
   wsSend(body);
 }
@@ -3233,6 +3359,7 @@ function boot()
   el.rxPolarityToggle.addEventListener("change", updatePolarityLabels);
   el.txPolarityToggle.addEventListener("change", updateTxPolarityLabels);
   el.displayRotationToggle.addEventListener("change", updateRotationLabels);
+  el.inpRfsSync.addEventListener("input", updateRfsWearEstimate);
 
   // Show starts the live follow of every newly accepted telegram (the
   // button becomes Pause); Pause freezes the shown telegram again.

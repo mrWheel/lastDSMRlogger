@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.c - hour, day and month smart meter ring file store
-//-- Date: 2026-11-21 · Build: 11
+//-- Date: 2026-11-22 · Build: 12
 //--
 //-- The store task owns all ring_file_store work: it mounts the LittleFS
 //-- storage partition, removes the ring file of the retired minute store,
@@ -9,12 +9,17 @@
 //-- files on first boot and reopens the retained ones after that. All three
 //-- are opened in buffered persistence with a one-record staging buffer.
 //-- Every minute the task reads the five meter counters of the most
-//-- recently accepted telegram (a reading no telegram published stays 0.0),
-//-- adds the three fictional random-cent tariff amounts and upserts the
-//-- same snapshot into the current hour, day and month record. An upsert of
-//-- the same period updates the active record instead of failing, which
-//-- keeps reboots and clock nudges harmless. At every hour change the task
-//-- synchronizes all three files so the staged records reach storage.
+//-- recently accepted telegram (a reading no telegram published stays 0.0)
+//-- and upserts the snapshot into the current hour, day and month record.
+//-- The three tariff amounts of each ring record are filled by the
+//-- registered tariff calculator (the tariff component's calculator values
+//-- the energy consumed inside the ring's period with the dynamic tariff
+//-- table and the manual prices); without a calculator the task adds the
+//-- fictional random-cent demo amounts. An upsert of the same period
+//-- updates the active record instead of failing, which keeps reboots and
+//-- clock nudges harmless. The task synchronizes all three files at least
+//-- once per configured rfs synchronisation interval so the staged records
+//-- reach storage; snapshots of one period coalesce in the staging buffers.
 //-- The console's populate command feeds historical periods in through
 //-- loggerStorePopulateRing(): a semicolon separated csv file from the
 //-- volume root (the import csv files are shipped there by the storage
@@ -48,13 +53,18 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "logger_receiver.h"
+#include "logger_settings.h"
 #include "ring_file_store.h"
 
 static const char* tag = "meterStore";
 
-//-- Ring files on the LittleFS volume of the storage partition.
+//-- Ring files on the LittleFS volume of the storage partition. The block
+//-- size is the one the storage partition image is built with (see the
+//-- littlefs build step); it scales the volume block count for the wear
+//-- estimate.
 #define STORE_PARTITION_LABEL "storage"
 #define STORE_MOUNT_POINT "/rfs"
+#define STORE_LITTLEFS_BLOCK_SIZE 4096u
 
 //-- The ring file of the retired per-minute store; it has no reader
 //-- anymore and is removed from the volume when it is still present.
@@ -79,8 +89,28 @@ static const char* tag = "meterStore";
 #define STORE_CLOCK_SYNCED_EPOCH 1700000000
 
 //-- The fictional tariff amounts are a random few cents: 0.01 .. 0.09 EUR.
+//-- Only used while no tariff calculator is registered.
 #define STORE_TARIFF_CENT_MIN 1u
 #define STORE_TARIFF_CENT_SPAN 9u
+
+//-- One snapshot coalesces into a single staged record per ring, so one
+//-- synchronisation commits at most one slot image per ring plus the
+//-- file-system metadata those writes commit (a pair per file). The block
+//-- figures feed the settings view's wear estimate and are deliberately
+//-- rounded up. The flash cycle rating is the datasheet minimum of the
+//-- ESP32-S3 embedded flash.
+#define STORE_SYNC_DATA_BLOCKS_PER_RING 1u
+#define STORE_SYNC_METADATA_BLOCKS_PER_RING 2u
+#define STORE_FLASH_WRITE_CYCLES 100000u
+
+//-- Calculator filling the tariff amounts of every snapshot record; set
+//-- once at boot (see loggerStoreSetTariffCalculator).
+static loggerStoreTariffCalculator tariffCalculator = NULL;
+
+void loggerStoreSetTariffCalculator(loggerStoreTariffCalculator calculator)
+{
+  tariffCalculator = calculator;
+}
 
 //-- --------------------------------------------------------------------------
 //-- The three rings
@@ -1343,38 +1373,58 @@ static bool storeSnapshot(uint64_t* outTimeStamp)
   loggerMeterRecord record;
   bool telegramSeen = readLatestMeterCounters(&record);
 
-  //-- The fictional tariff amounts: a random few cents per tariff.
-  record.tariffAmount1Euro =
-      (float)(STORE_TARIFF_CENT_MIN + (esp_random() % STORE_TARIFF_CENT_SPAN)) / 100.0f;
-  record.tariffAmount2Euro =
-      (float)(STORE_TARIFF_CENT_MIN + (esp_random() % STORE_TARIFF_CENT_SPAN)) / 100.0f;
-  record.tariffAmountGasEuro =
-      (float)(STORE_TARIFF_CENT_MIN + (esp_random() % STORE_TARIFF_CENT_SPAN)) / 100.0f;
+  uint64_t hourKey = 0u;
+  (void)meterRingKey(&rings[LOGGER_RING_HOURS], timeStamp, &hourKey);
+
+  //-- The hours ring amounts name the tariffs in the one summary line.
+  loggerMeterRecord logged = record;
 
   for (loggerMeterRing_t ring = LOGGER_RING_HOURS; ring < LOGGER_RING_COUNT; ring++)
   {
-    esp_err_t result = ringFileUpsert(rings[ring].handle, timeStamp, &record);
+    //-- The tariff amounts belong to the ring's own period: every ring gets
+    //-- its own copy of the snapshot for the calculator (or the demo
+    //-- amounts while no calculator is registered).
+    loggerMeterRecord ringRecord = record;
+    uint64_t ringKey = 0u;
+    (void)meterRingKey(&rings[ring], timeStamp, &ringKey);
+
+    if (tariffCalculator != NULL)
+    {
+      tariffCalculator(ring, ringKey, &ringRecord);
+    }
+    else
+    {
+      //-- The fictional tariff amounts: a random few cents per tariff.
+      ringRecord.tariffAmount1Euro =
+          (float)(STORE_TARIFF_CENT_MIN + (esp_random() % STORE_TARIFF_CENT_SPAN)) / 100.0f;
+      ringRecord.tariffAmount2Euro =
+          (float)(STORE_TARIFF_CENT_MIN + (esp_random() % STORE_TARIFF_CENT_SPAN)) / 100.0f;
+      ringRecord.tariffAmountGasEuro =
+          (float)(STORE_TARIFF_CENT_MIN + (esp_random() % STORE_TARIFF_CENT_SPAN)) / 100.0f;
+    }
+
+    esp_err_t result = ringFileUpsert(rings[ring].handle, timeStamp, &ringRecord);
 
     if (result != ESP_OK)
     {
-      uint64_t key = 0u;
-      (void)meterRingKey(&rings[ring], timeStamp, &key);
-      ESP_LOGW(tag, "%s ring record for key %" PRIu64 " refused: %s", rings[ring].name, key,
+      ESP_LOGW(tag, "%s ring record for key %" PRIu64 " refused: %s", rings[ring].name, ringKey,
                esp_err_to_name(result));
+    }
+
+    if (ring == LOGGER_RING_HOURS)
+    {
+      logged = ringRecord;
     }
   }
 
   //-- One summary line per snapshot: the hour key leads, the counters keep
   //-- the units of the telegram (kWh and m³), the tariffs are in EUR.
-  uint64_t hourKey = 0u;
-  (void)meterRingKey(&rings[LOGGER_RING_HOURS], timeStamp, &hourKey);
-
   ESP_LOGI(tag,
            "stored h=%08" PRIu64 " edT1=%8.3f edT2=%8.3f erT1=%8.3f erT2=%8.3f "
            "gas=%8.3f t1=%5.2f t2=%5.2f tg=%5.2f%s",
            hourKey, record.energyDeliveredTariff1Kwh, record.energyDeliveredTariff2Kwh,
            record.energyReturnedTariff1Kwh, record.energyReturnedTariff2Kwh, record.gasDeliveredM3,
-           record.tariffAmount1Euro, record.tariffAmount2Euro, record.tariffAmountGasEuro,
+           logged.tariffAmount1Euro, logged.tariffAmount2Euro, logged.tariffAmountGasEuro,
            telegramSeen ? "" : " (no telegram yet)");
 
   *outTimeStamp = timeStamp;
@@ -1410,10 +1460,12 @@ static void storeTask(void* argument)
     return;
   }
 
-  //-- Publish the hour key of the last hourly synchronization; a new hour
-  //-- triggers the next one, so the very first snapshot is synchronized
-  //-- with the hour it belongs to.
-  uint64_t lastSyncedHour = 0u;
+  //-- Time of the last synchronization and whether one has happened yet:
+  //-- the very first snapshot is synchronized immediately (the behaviour
+  //-- the old hour-change trigger gave), later ones at most once per
+  //-- configured rfs synchronisation interval.
+  uint64_t lastSyncMs = 0u;
+  bool syncedOnce = false;
 
   for (;;)
   {
@@ -1433,11 +1485,34 @@ static void storeTask(void* argument)
       continue;
     }
 
-    if (hourKey != lastSyncedHour)
+    //-- The interval is re-read with every snapshot so a saved change takes
+    //-- effect within one minute; an unusable stored value falls back to the
+    //-- documented default.
+    loggerSettingsConfig settings;
+
+    if (loggerSettingsLoad(&settings) != ESP_OK)
     {
-      syncRings(hourKey);
-      lastSyncedHour = hourKey;
+      memset(&settings, 0, sizeof settings);
+      settings.rfsSyncIntervalMinutes = LOGGER_SETTINGS_RFS_SYNC_DEFAULT_MINUTES;
     }
+
+    if ((settings.rfsSyncIntervalMinutes < LOGGER_SETTINGS_RFS_SYNC_MIN_MINUTES) ||
+        (settings.rfsSyncIntervalMinutes > LOGGER_SETTINGS_RFS_SYNC_MAX_MINUTES))
+    {
+      settings.rfsSyncIntervalMinutes = LOGGER_SETTINGS_RFS_SYNC_DEFAULT_MINUTES;
+    }
+
+    uint64_t nowMs = (uint64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint64_t syncPeriodMs = (uint64_t)settings.rfsSyncIntervalMinutes * 60000u;
+
+    if (syncedOnce && ((nowMs - lastSyncMs) < syncPeriodMs))
+    {
+      continue;
+    }
+
+    syncRings(hourKey);
+    lastSyncMs = nowMs;
+    syncedOnce = true;
   }
 }
 
@@ -1470,6 +1545,31 @@ bool loggerStoreVolumeInfo(size_t* totalBytes, size_t* usedBytes)
 
   *totalBytes = total;
   *usedBytes = used;
+  return true;
+}
+
+bool loggerStoreRfsWearInfo(uint32_t* totalBlocks, uint32_t* blockWritesPerSync,
+                            uint32_t* flashWriteCycles)
+{
+  if ((totalBlocks == NULL) || (blockWritesPerSync == NULL) || (flashWriteCycles == NULL))
+  {
+    return false;
+  }
+
+  size_t total = 0u;
+  size_t used = 0u;
+
+  if ((rings[LOGGER_RING_HOURS].handle == NULL) ||
+      (esp_littlefs_info(STORE_PARTITION_LABEL, &total, &used) != ESP_OK) ||
+      (total < STORE_LITTLEFS_BLOCK_SIZE))
+  {
+    return false;
+  }
+
+  *totalBlocks = (uint32_t)(total / STORE_LITTLEFS_BLOCK_SIZE);
+  *blockWritesPerSync = (uint32_t)LOGGER_RING_COUNT *
+                        (STORE_SYNC_DATA_BLOCKS_PER_RING + STORE_SYNC_METADATA_BLOCKS_PER_RING);
+  *flashWriteCycles = STORE_FLASH_WRITE_CYCLES;
   return true;
 }
 

@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
-//-- File: logger_mqtt.h - MQTT publication of the latest accepted telegram
-//-- Date: 2026-11-21 · Build: 4
+//-- File: logger_mqtt.h - MQTT telegram publication and tariff ingestion
+//-- Date: 2026-11-22 · Build: 5
 //--
 //-- When the stored configuration names a broker and a broadcast interval
 //-- above zero, a background task publishes the most recently accepted
@@ -42,5 +42,14 @@ void loggerMqttSetNetworkReady(bool ready);
 //-- True when publication is configured (broker named and interval above
 //-- zero) and the client is connected to the broker.
 bool loggerMqttIsConnected(void);
+
+//-- The MQTT client also carries the dynamic tariff ingestion path: while
+//-- a broker is named (even with the broadcast interval at zero) the client
+//-- connects and subscribes to the effective tariff topic
+//-- "<top topic|lastdsmrlogger>/<deviceId>/tariffs/electricity" (the shared
+//-- logger_tariffs component names it), reassembles fragmented payloads and
+//-- feeds complete documents into the shared tariff ingestion. Invalid
+//-- messages are logged with their reason and leave the stored schedule
+//-- untouched. Publication of the telegram topic is unchanged.
 
 #endif //-- LOGGER_MQTT_H

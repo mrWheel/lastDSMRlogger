@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.c - versioned settings service
-//-- Date: 2026-11-21 · Build: 6
+//-- Date: 2026-11-22 · Build: 7
 //--
 //-- The complete configuration is stored as one versioned blob so a save is
 //-- atomic. A stored blob that fails validation is treated as absent: the
@@ -12,6 +12,7 @@
 
 #include <ctype.h>
 #include <inttypes.h>
+#include <math.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -40,6 +41,33 @@ typedef struct
   dsmrMbusDeviceType mbusType[DSMR_MBUS_CHANNEL_MAX + 1];
   bool displayFlipped;
 } loggerSettingsConfigV5;
+
+//-- Layout of the stored blob before the rfs synchronisation interval and
+//-- the manual tariff prices were appended. A stored blob of exactly this
+//-- size migrates like the one above: its fields land in the identical
+//-- prefix of the current struct and the appended fields get their
+//-- defaults.
+typedef struct
+{
+  uint32_t structVersion;
+  int rxGpio;
+  bool rxInverted;
+  bool txInverted;
+  uint32_t intervalSeconds;
+  char countryCode[LOGGER_SETTINGS_COUNTRY_MAX];
+  char profileId[LOGGER_SETTINGS_PROFILE_ID_MAX];
+  loggerMbusMode mbusMode[DSMR_MBUS_CHANNEL_MAX + 1];
+  dsmrMbusDeviceType mbusType[DSMR_MBUS_CHANNEL_MAX + 1];
+  bool displayFlipped;
+  char mqttBroker[LOGGER_MQTT_BROKER_MAX];
+  uint16_t mqttPort;
+  char mqttUser[LOGGER_MQTT_USER_MAX];
+  char mqttPassword[LOGGER_MQTT_PASSWORD_MAX];
+  char mqttTopTopic[LOGGER_MQTT_TOPIC_MAX];
+  uint32_t mqttIntervalSeconds;
+  char hostname[LOGGER_HOSTNAME_MAX];
+  uint8_t fixedIpLastOctet;
+} loggerSettingsConfigPreTariff;
 
 //-- Human readable protocol version labels for the built-in profiles. The
 //-- stable profile identifier is what gets persisted.
@@ -291,6 +319,39 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
     return false;
   }
 
+  //-- The rfs synchronisation interval is a whole number of minutes within
+  //-- the documented bounds.
+  if ((config->rfsSyncIntervalMinutes < LOGGER_SETTINGS_RFS_SYNC_MIN_MINUTES) ||
+      (config->rfsSyncIntervalMinutes > LOGGER_SETTINGS_RFS_SYNC_MAX_MINUTES))
+  {
+    ESP_LOGW(tag, "rejecting rfs sync interval %u min: outside %u..%u min",
+             (unsigned)config->rfsSyncIntervalMinutes,
+             (unsigned)LOGGER_SETTINGS_RFS_SYNC_MIN_MINUTES,
+             (unsigned)LOGGER_SETTINGS_RFS_SYNC_MAX_MINUTES);
+    return false;
+  }
+
+  //-- The manual tariff prices must be finite and within the sanity bounds;
+  //-- negative prices are valid (negative spot prices occur).
+  if (!isfinite(config->tariff1PricePerKwh) || !isfinite(config->tariff2PricePerKwh) ||
+      !isfinite(config->tariffGasPricePerM3))
+  {
+    ESP_LOGW(tag, "rejecting non-finite manual tariff prices");
+    return false;
+  }
+
+  if ((config->tariff1PricePerKwh < LOGGER_SETTINGS_TARIFF_PRICE_MIN) ||
+      (config->tariff1PricePerKwh > LOGGER_SETTINGS_TARIFF_PRICE_MAX) ||
+      (config->tariff2PricePerKwh < LOGGER_SETTINGS_TARIFF_PRICE_MIN) ||
+      (config->tariff2PricePerKwh > LOGGER_SETTINGS_TARIFF_PRICE_MAX) ||
+      (config->tariffGasPricePerM3 < LOGGER_SETTINGS_TARIFF_PRICE_MIN) ||
+      (config->tariffGasPricePerM3 > LOGGER_SETTINGS_TARIFF_PRICE_MAX))
+  {
+    ESP_LOGW(tag, "rejecting manual tariff price outside %g..%g",
+             (double)LOGGER_SETTINGS_TARIFF_PRICE_MIN, (double)LOGGER_SETTINGS_TARIFF_PRICE_MAX);
+    return false;
+  }
+
   return true;
 }
 
@@ -313,12 +374,14 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
   size_t blobSize = 0u;
   result = nvs_get_blob(handle, NVS_KEY_CONFIG, NULL, &blobSize);
 
-  //-- A blob of the current size is read as-is; a blob of the pre-extension
+  //-- A blob of the current size is read as-is; a blob of either earlier
   //-- size migrates (the appended fields get their defaults below). Anything
   //-- else cannot be trusted.
   bool migrated = (blobSize == sizeof(loggerSettingsConfigV5));
+  bool migratedTariff = (blobSize == sizeof(loggerSettingsConfigPreTariff));
 
-  if ((result != ESP_OK) || ((blobSize != sizeof(loggerSettingsConfig)) && !migrated))
+  if ((result != ESP_OK) ||
+      ((blobSize != sizeof(loggerSettingsConfig)) && !migrated && !migratedTariff))
   {
     nvs_close(handle);
 
@@ -337,10 +400,21 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
   result = nvs_get_blob(handle, NVS_KEY_CONFIG, config, &blobSize);
   nvs_close(handle);
 
-  if (migrated && (result == ESP_OK))
+  if ((migrated || migratedTariff) && (result == ESP_OK))
   {
-    config->mqttPort = LOGGER_SETTINGS_MQTT_PORT_DEFAULT;
-    ESP_LOGI(tag, "stored settings migrated: MQTT and network fields take their defaults");
+    config->rfsSyncIntervalMinutes = LOGGER_SETTINGS_RFS_SYNC_DEFAULT_MINUTES;
+
+    if (migrated)
+    {
+      config->mqttPort = LOGGER_SETTINGS_MQTT_PORT_DEFAULT;
+      ESP_LOGI(
+          tag,
+          "stored settings migrated: MQTT, network, store and tariff fields take their defaults");
+    }
+    else
+    {
+      ESP_LOGI(tag, "stored settings migrated: store and tariff fields take their defaults");
+    }
   }
 
   if (result != ESP_OK)

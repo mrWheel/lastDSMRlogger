@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-21 · Build: 24 */
+   Date: 2026-11-22 · Build: 25 */
 
 :root
 {
@@ -503,6 +503,26 @@ fieldset.iosGroup legend
 .iosRow > input:focus-visible
 {
   outline: none;
+}
+
+/* The checkbox row (Dynamic Tariffs): the box keeps its natural size at
+   the trailing edge, where the text inputs align. */
+.iosRow > input[type="checkbox"]
+{
+  flex: none;
+  width: 22px;
+  height: 22px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+/* Rough LittleFS wear estimate shown behind the rfs sync interval. */
+.iosRow .wearEstimate
+{
+  flex: none;
+  font-size: 0.78rem;
+  color: var(--secondary);
+  white-space: nowrap;
 }
 
 /* No spinner buttons on the numeric rows (port, intervals, fixed IP): the
