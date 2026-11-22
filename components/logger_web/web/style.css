@@ -639,9 +639,11 @@ tbody tr:last-child td
   border-bottom: none;
 }
 
-/* Decoded summary value column: measured numbers align right so the
-   digits of successive readings line up; text values and unavailable
-   readings stay left aligned. */
+/* Numeric columns of every table (decoded summary value column, ring file
+   and period graph counters): measured numbers align right so the digits
+   of successive rows line up and their header rides along above them;
+   text values and unavailable readings stay left aligned. */
+th.valueNumeric,
 td.valueNumeric
 {
   text-align: right;
@@ -1042,8 +1044,23 @@ footer
   cursor: pointer;
 }
 
+/* Bold caption leading the Graph/Table presentation radio group of the
+   period views (the old DSMRlogger32 history pages carried the same
+   "Presentatie:" lead-in). */
+.graphModeCaption
+{
+  font-weight: 600;
+  color: var(--secondary);
+}
+
 #ringFileTable th,
-#ringFileTable td
+#ringFileTable td,
+#hoursGraphTable th,
+#hoursGraphTable td,
+#daysGraphTable th,
+#daysGraphTable td,
+#monthsGraphTable th,
+#monthsGraphTable td
 {
   white-space: nowrap;
 }

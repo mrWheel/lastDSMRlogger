@@ -1540,8 +1540,10 @@ static uint64_t nextPeriodKey(loggerMeterRing_t ring, uint64_t key)
 
 //-- Emits one period graph frame under a caller-chosen type name: one line
 //-- per retained period (except the oldest) with the per-period
-//-- used/returned kWh and gas m³, oldest first, plus the ring's selector
-//-- name as the walk echoed it.
+//-- used/returned kWh and gas m³ plus that period's three tariff amounts
+//-- in EUR (the fictional billing figures the ring stores per record, as
+//-- the RingFile table prints them), oldest first, plus the ring's
+//-- selector name as the walk echoed it.
 static void appendPeriodGraphFrame(stringBuilder* sb, loggerMeterRing_t ring, const char* typeName)
 {
   PeriodGraphCollect* collect = calloc(1u, sizeof *collect);
@@ -1585,8 +1587,11 @@ static void appendPeriodGraphFrame(stringBuilder* sb, loggerMeterRing_t ring, co
                    older->energyReturnedTariff1Kwh + older->energyReturnedTariff2Kwh);
     float gasM3 = usageDelta(newer->gasDeliveredM3, older->gasDeliveredM3);
 
-    sbAppendFmt(sb, "%s{\"key\":%" PRIu64 ",\"used\":%.3f,\"returned\":%.3f,\"gas\":%.3f}",
-                (emitted > 0u) ? "," : "", collect->keys[index - 1u], usedKwh, returnedKwh, gasM3);
+    sbAppendFmt(sb,
+                "%s{\"key\":%" PRIu64 ",\"used\":%.3f,\"returned\":%.3f,\"gas\":%.3f"
+                ",\"t1\":%.2f,\"t2\":%.2f,\"tG\":%.2f}",
+                (emitted > 0u) ? "," : "", collect->keys[index - 1u], usedKwh, returnedKwh, gasM3,
+                newer->tariffAmount1Euro, newer->tariffAmount2Euro, newer->tariffAmountGasEuro);
     emitted++;
   }
 

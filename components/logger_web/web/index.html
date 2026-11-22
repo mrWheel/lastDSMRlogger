@@ -161,7 +161,7 @@
         <div class="tableWrap">
           <table id="summaryTable">
             <thead>
-              <tr><th>OBIS</th><th>Name</th><th>Value</th><th>Unit</th><th>Timestamp</th><th>M-Bus</th></tr>
+              <tr><th>OBIS</th><th>Name</th><th class="valueNumeric">Value</th><th>Unit</th><th>Timestamp</th><th>M-Bus</th></tr>
             </thead>
             <tbody></tbody>
           </table>
@@ -217,7 +217,7 @@
       <div class="tableWrap">
         <table id="ringFileTable">
           <thead>
-            <tr><th id="ringFileKeyHeader">Hour</th><th>Ed T1 kWh</th><th>Ed T2 kWh</th><th>Er T1 kWh</th><th>Er T2 kWh</th><th>Gas m³</th><th>Tariff 1 €</th><th>Tariff 2 €</th><th>Tariff Gas €</th></tr>
+            <tr><th id="ringFileKeyHeader">Hour</th><th class="valueNumeric">Ed T1 kWh</th><th class="valueNumeric">Ed T2 kWh</th><th class="valueNumeric">Er T1 kWh</th><th class="valueNumeric">Er T2 kWh</th><th class="valueNumeric">Gas m³</th><th class="valueNumeric">Tariff 1 €</th><th class="valueNumeric">Tariff 2 €</th><th class="valueNumeric">Tariff Gas €</th></tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -228,6 +228,14 @@
       <h2>Hours Graph</h2>
       <div id="hoursGraphState" class="message"></div>
       <div class="listToolbar">
+        <!-- Presentation radio group (see app.js): the view shows either
+             the usage canvas or the table of the same per-period records;
+             the graph is the default. -->
+        <div class="ringRadioGroup">
+          <span class="graphModeCaption">Presentation:</span>
+          <label><input type="radio" name="hoursGraphMode" value="graph" checked> Graph</label>
+          <label><input type="radio" name="hoursGraphMode" value="table"> Table</label>
+        </div>
         <button id="refreshHoursGraph" type="button">Refresh</button>
       </div>
       <!-- The hourly usage overview of the hours ring (see app.js): the
@@ -242,8 +250,19 @@
            kWh (upper panel) or the gas m³ (lower panel); the state line
            names the API the records come from (/api/ringfile?ring=hours).
            (app.js). -->
-      <div class="hoursGraphWrap">
+      <div class="hoursGraphWrap" id="hoursGraphCanvasWrap">
         <canvas id="hoursGraphCanvas" class="graphCanvas"></canvas>
+      </div>
+      <!-- The table presentation of the same frame: one row per retained
+           period, newest first, with the per-period used/returned kWh and
+           gas m³ the bars are drawn from. Rows are built by app.js. -->
+      <div class="tableWrap" id="hoursGraphTableWrap" hidden>
+        <table id="hoursGraphTable">
+          <thead>
+            <tr><th>Period</th><th class="valueNumeric">Used (kWh)</th><th class="valueNumeric">Returned (kWh)</th><th class="valueNumeric">Gas (m³)</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
       </div>
     </section>
 
@@ -251,14 +270,33 @@
       <h2>Days Graph</h2>
       <div id="daysGraphState" class="message"></div>
       <div class="listToolbar">
+        <!-- Presentation radio group (see app.js): the view shows either
+             the usage canvas or the table of the same per-period records;
+             the graph is the default. -->
+        <div class="ringRadioGroup">
+          <span class="graphModeCaption">Presentation:</span>
+          <label><input type="radio" name="daysGraphMode" value="graph" checked> Graph</label>
+          <label><input type="radio" name="daysGraphMode" value="table"> Table</label>
+        </div>
         <button id="refreshDaysGraph" type="button">Refresh</button>
       </div>
       <!-- The daily usage overview of the days ring (see app.js): the same
            two stacked panels as the Hours Graph on a shared day axis,
            rotated weekday labels ("Thursday 22-10") and the API named in
            the state line (/api/ringfile?ring=days). -->
-      <div class="hoursGraphWrap">
+      <div class="hoursGraphWrap" id="daysGraphCanvasWrap">
         <canvas id="daysGraphCanvas" class="graphCanvas"></canvas>
+      </div>
+      <!-- The table presentation of the same frame: one row per retained
+           period, newest first, with the per-period used/returned kWh and
+           gas m³ the bars are drawn from. Rows are built by app.js. -->
+      <div class="tableWrap" id="daysGraphTableWrap" hidden>
+        <table id="daysGraphTable">
+          <thead>
+            <tr><th>Period</th><th class="valueNumeric">Used (kWh)</th><th class="valueNumeric">Returned (kWh)</th><th class="valueNumeric">Gas (m³)</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
       </div>
     </section>
 
@@ -266,6 +304,14 @@
       <h2>Months Graph</h2>
       <div id="monthsGraphState" class="message"></div>
       <div class="listToolbar">
+        <!-- Presentation radio group (see app.js): the view shows either
+             the usage canvas or the table of the same per-period records;
+             the graph is the default. -->
+        <div class="ringRadioGroup">
+          <span class="graphModeCaption">Presentation:</span>
+          <label><input type="radio" name="monthsGraphMode" value="graph" checked> Graph</label>
+          <label><input type="radio" name="monthsGraphMode" value="table"> Table</label>
+        </div>
         <button id="refreshMonthsGraph" type="button">Refresh</button>
       </div>
       <!-- The monthly overview of the months ring (see app.js), styled
@@ -275,8 +321,22 @@
            dark green next to returned (previous) light green below it —
            and the gas panel draws this and the previous months' lines. The
            state line names the API (/api/ringfile?ring=months). -->
-      <div class="hoursGraphWrap">
+      <div class="hoursGraphWrap" id="monthsGraphCanvasWrap">
         <canvas id="monthsGraphCanvas" class="graphCanvas"></canvas>
+      </div>
+      <!-- The table presentation of the same frame: one row per retained
+           period, newest first, with the per-period used/returned kWh and
+           gas m³ the bars are drawn from (the whole ring, not only the
+           twelve months the graph pairs) plus the month's three tariff
+           amounts in EUR (the same billing figures the RingFile table
+           prints). Rows are built by app.js. -->
+      <div class="tableWrap" id="monthsGraphTableWrap" hidden>
+        <table id="monthsGraphTable">
+          <thead>
+            <tr><th>Period</th><th class="valueNumeric">Used (kWh)</th><th class="valueNumeric">Returned (kWh)</th><th class="valueNumeric">Gas (m³)</th><th class="valueNumeric">Tariff 1 €</th><th class="valueNumeric">Tariff 2 €</th><th class="valueNumeric">Tariff Gas €</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
       </div>
     </section>
 

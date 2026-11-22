@@ -120,8 +120,11 @@ function bindElements()
                "powerScaleLabel", "powerSpark",
                "ringFileState", "refreshRingFile", "ringFileTable", "ringFileKeyHeader",
                "hoursGraphState", "refreshHoursGraph", "hoursGraphCanvas",
+               "hoursGraphCanvasWrap", "hoursGraphTableWrap", "hoursGraphTable",
                "daysGraphState", "refreshDaysGraph", "daysGraphCanvas",
+               "daysGraphCanvasWrap", "daysGraphTableWrap", "daysGraphTable",
                "monthsGraphState", "refreshMonthsGraph", "monthsGraphCanvas",
+               "monthsGraphCanvasWrap", "monthsGraphTableWrap", "monthsGraphTable",
                "actualGraphState", "refreshActualGraph", "actualGraphCanvas", "actualGraphChecks",
                "viewSettings", "viewTelegrams", "viewPower", "viewRingFile", "viewHoursGraph",
                "viewDaysGraph", "viewMonthsGraph", "viewActualGraph", "viewApi",
@@ -1552,7 +1555,12 @@ function renderRingFileList(message)
 // the cursor sits on. The gas m³ gets one chip over the gas panel.
 // The state line names the on-device API that serves the underlying ring
 // records. Everything is drawn straight from the frame's numbers, nothing
-// is interpreted.
+// is interpreted. The toolbar radio group picks the presentation (see
+// showPeriodGraphView): Graph draws the canvas above, Table lists the very
+// same per-period amounts as a newest-first table (period, used kWh,
+// returned kWh, gas m³, and for the months view the month's three tariff
+// amounts in EUR), built by renderPeriodGraphTable from the cached frame —
+// like the old DSMRlogger32 history tables.
 
 const PERIOD_GRAPHS =
 {
@@ -1587,14 +1595,17 @@ const GRAPH_LAYOUT =
 const KWH_STEPS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
 const WATT_STEPS = [50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000];
 
-// Per-view rendering state: the newest frame's records, the drawing
-// geometry of the newest canvas frame (for the hover popup), the mouse
-// position inside the canvas (null: outside) and the popup chips.
+// Per-view rendering state: the newest frame's records and availability
+// flag, the presentation mode picked by the view's radio group ("graph"
+// draws the canvas, "table" fills the record table), the drawing geometry
+// of the newest canvas frame (for the hover popup), the mouse position
+// inside the canvas (null: outside) and the popup chips.
 const periodGraphs = {};
 
 Object.keys(PERIOD_GRAPHS).forEach((viewId) =>
 {
-  periodGraphs[viewId] = {records: [], layout: null, hoverX: null, hoverY: null, tips: null};
+  periodGraphs[viewId] = {records: [], available: false, mode: "graph",
+                          layout: null, hoverX: null, hoverY: null, tips: null};
 });
 
 function graphStep(maxValue, steps, emptyStep)
@@ -1644,32 +1655,148 @@ function handleGraphMessage(message)
 
 function renderPeriodGraph(viewId, message)
 {
-  const config = PERIOD_GRAPHS[viewId];
   const graph = periodGraphs[viewId];
   graph.records = Array.isArray(message.records) ? message.records : [];
+  graph.available = Boolean(message.available);
+
+  showPeriodGraphView(viewId);
+}
+
+// Puts the view in the presentation its radio group selects: the record
+// table or the canvas with the two stacked panels. The newest frame stays
+// in periodGraphs, so switching modes never needs a device round trip.
+function showPeriodGraphView(viewId)
+{
+  const config = PERIOD_GRAPHS[viewId];
+  const graph = periodGraphs[viewId];
+  const tableMode = (graph.mode === "table");
+
+  el[viewId + "CanvasWrap"].hidden = tableMode;
+  el[viewId + "TableWrap"].hidden = !tableMode;
 
   if (graph.records.length === 0)
   {
-    setPeriodGraphState(viewId, message.available
+    setPeriodGraphState(viewId, graph.available
                                 ? "No complete " + config.unitWord +
                                   " records stored yet (is the clock synchronised?)."
                                 : "The meter store is not running on the device.");
+    return;
   }
-  else
-  {
-    //-- The months view plots the newest twelve only, each paired with the
-    // same month one year back; the state line names the drawn groups.
-    const plotted = periodGraphWindow(viewId, graph.records).length;
 
-    setPeriodGraphState(viewId, plotted + " " + config.unitWord + "(s) plotted" +
-                                ((viewId === "monthsGraph")
-                                 ? ", each paired with the same month one year back"
-                                 : "") +
-                                " · " + config.api +
-                                (message.available ? "" : " (the device walk did not finish)"));
+  if (tableMode)
+  {
+    setPeriodGraphState(viewId, graph.records.length + " " + config.unitWord +
+                                " records shown, newest first · " + config.api +
+                                (graph.available ? "" : " (the device walk did not finish)"));
+    renderPeriodGraphTable(viewId);
+    return;
   }
+
+  //-- The months view plots the newest twelve only, each paired with the
+  // same month one year back; the state line names the drawn groups.
+  const plotted = periodGraphWindow(viewId, graph.records).length;
+
+  setPeriodGraphState(viewId, plotted + " " + config.unitWord + "(s) plotted" +
+                              ((viewId === "monthsGraph")
+                               ? ", each paired with the same month one year back"
+                               : "") +
+                              " · " + config.api +
+                              (graph.available ? "" : " (the device walk did not finish)"));
 
   drawPeriodGraph(viewId);
+}
+
+// The period key as the table's first column reads it, styled after the
+// old DSMRlogger32 history tables: "19-11 16:00 - 16:59" in the hours
+// ring, "Friday 21-11-2026" in the days ring and "November 2026" in the
+// months ring. Text that is not the ring's digit pattern is returned
+// unchanged.
+function periodGraphTableLabel(ring, key)
+{
+  const digits = (ring === "hours") ? 8 : ((ring === "days") ? 6 : 4);
+  const text = String(key).padStart(digits, "0");
+
+  if (!new RegExp("^\\d{" + digits + "}$").test(text))
+  {
+    return String(key);
+  }
+
+  const year2 = Number(text.slice(0, 2));
+  const month = Number(text.slice(2, 4));
+
+  if (ring === "months")
+  {
+    if (month < 1 || month > 12)
+    {
+      return text;
+    }
+
+    return MONTH_NAMES[month - 1] + " 20" + text.slice(0, 2);
+  }
+
+  const day = Number(text.slice(4, 6));
+
+  if (ring === "days")
+  {
+    if (month < 1 || month > 12 || day < 1 || day > daysInMonth2000(year2, month))
+    {
+      return text;
+    }
+
+    return dayNameOf2000(year2, month, day) + " " + text.slice(4, 6) + "-" +
+           text.slice(2, 4) + "-20" + text.slice(0, 2);
+  }
+
+  return text.slice(4, 6) + "-" + text.slice(2, 4) + " " + text.slice(6, 8) +
+         ":00 - " + text.slice(6, 8) + ":59";
+}
+
+// The table presentation of a period view: one row per retained period,
+// newest first (the frame arrives oldest first, so the cached array is
+// walked reversed), carrying the same per-period amounts the bars are
+// drawn from; the months table appends the month's three tariff amounts
+// in EUR (the fictional billing figures the ring stores per record, as
+// the RingFile table prints them). Rows are built with textContent only.
+function renderPeriodGraphTable(viewId)
+{
+  const config = PERIOD_GRAPHS[viewId];
+  const tbody = el[viewId + "Table"].tBodies[0];
+  tbody.textContent = "";
+
+  periodGraphs[viewId].records.slice().reverse().forEach((record) =>
+  {
+    const row = document.createElement("tr");
+    const cells = [
+      periodGraphTableLabel(config.ring, record.key),
+      (typeof record.used === "number") ? record.used.toFixed(3) : "-",
+      (typeof record.returned === "number") ? record.returned.toFixed(3) : "-",
+      (typeof record.gas === "number") ? record.gas.toFixed(3) : "-",
+    ];
+
+    if (viewId === "monthsGraph")
+    {
+      cells.push((typeof record.t1 === "number") ? record.t1.toFixed(2) : "-");
+      cells.push((typeof record.t2 === "number") ? record.t2.toFixed(2) : "-");
+      cells.push((typeof record.tG === "number") ? record.tG.toFixed(2) : "-");
+    }
+
+    cells.forEach((text, index) =>
+    {
+      const cell = document.createElement("td");
+      cell.textContent = text;
+
+      // The measured columns align right so the digits of successive
+      // periods line up; the period column keeps the default left.
+      if (index > 0)
+      {
+        cell.className = "valueNumeric";
+      }
+
+      row.appendChild(cell);
+    });
+
+    tbody.appendChild(row);
+  });
 }
 
 const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
@@ -3144,7 +3271,9 @@ function boot()
 
   // The period records follow the ring: the period views do not poll, these
   // buttons re-request the usage series on demand (switching to a view
-  // requests it as well, like every other view command).
+  // requests it as well, like every other view command). The presentation
+  // radio group switches the same cached frame between canvas and table, so
+  // it only redraws without asking the device again.
   Object.keys(PERIOD_GRAPHS).forEach((viewId) =>
   {
     el["refresh" + viewId.charAt(0).toUpperCase() + viewId.slice(1)]
@@ -3152,6 +3281,15 @@ function boot()
       {
         wsSend("cmd=graph&ring=" + PERIOD_GRAPHS[viewId].ring);
       });
+
+    document.querySelectorAll('input[name="' + viewId + 'Mode"]').forEach((radio) =>
+    {
+      radio.addEventListener("change", () =>
+      {
+        periodGraphs[viewId].mode = (radio.value === "table") ? "table" : "graph";
+        showPeriodGraphView(viewId);
+      });
+    });
   });
 
   // The Actual Graph polls while it is open; this button re-requests the
