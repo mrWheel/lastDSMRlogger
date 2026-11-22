@@ -75,13 +75,13 @@ const VIEWS =
   {id: "power", label: "Phase Load", section: "viewPower", command: "cmd=power"},
   {id: "ringfile", label: "Show RingFile", section: "viewRingFile",
    command: () => "cmd=ringfile&ring=" + selectedRing()},
-  {id: "hoursGraph", label: "Hours Graph", section: "viewHoursGraph",
+  {id: "hoursGraph", label: "Hours", section: "viewHoursGraph",
    command: "cmd=graph&ring=hours"},
-  {id: "daysGraph", label: "Days Graph", section: "viewDaysGraph",
+  {id: "daysGraph", label: "Days", section: "viewDaysGraph",
    command: "cmd=graph&ring=days"},
-  {id: "monthsGraph", label: "Months Graph", section: "viewMonthsGraph",
+  {id: "monthsGraph", label: "Months", section: "viewMonthsGraph",
    command: "cmd=graph&ring=months"},
-  {id: "actualGraph", label: "Actual Graph", section: "viewActualGraph",
+  {id: "actualGraph", label: "Actual", section: "viewActualGraph",
    command: "cmd=actualgraph"},
   // The API view needs no WebSocket command: it fetches the device's own
   // endpoint index from GET /api/v3 (see refreshApiList), so it carries a
