@@ -1,7 +1,7 @@
 lastDSMRlogger — Project Specification
 
-Buildnumber: 7
-Last update-date: 2026-11-21
+Buildnumber: 8
+Last update-date: 2026-11-22
 
 Every Markdown document in the project shall include `Buildnumber` and `Last update-date` metadata near the beginning. Keep both values current whenever a Markdown document is created or edited.
 
@@ -20,14 +20,14 @@ The project shall target the ESP32-S3 on the TFT LCD Display EC11 Piggyback Boar
 
 |Reference                                                                                                                      |Role                                                                                                                                                                                                                                 |
 |-------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-|[parserDSMR](https://github.com/mrWheel/parserDSMR)                                                                            |P1 framing, CRC, protocol profiles, OBIS decoding, M-Bus interpretation, and the ESP-IDF receive adapter. Last version/commit.                    |
+|[parserDSMR](https://github.com/mrWheel/parserDSMR)                                                                            |P1 framing, CRC, protocol profiles, OBIS decoding, M-Bus interpretation, and the ESP-IDF receive adapter, consumed as the ESP Component Registry component mrwheel/parserdsmr. |
 |[DSMRlogger32 firmware](https://github.com/mrWheel/DSMRlogger32/tree/main/DSMRlogger32)                                        |Functional reference for displaying raw telegrams and configuring device types per M-Bus channel. See `data/DSMRindex.js`, `src/restAPI.cpp`, `src/settingsStuff.cpp`, and `src/handleSlimmeMeter.cpp`. Reference revision `b9e401a`.|
 |[TFT LCD Display EC11 Piggyback Board](https://willem.aandewiel.nl/index.php/2026/05/19/tft-lcd-display-ec11-piggy-back-board/)|Hardware target and authoritative board pinout.                                                                                                                                                                                      |
 |[esp32_s3_piggyback](https://github.com/mrWheel/esp32-s3-Piggyback)   v1.3.0 or newer                                                    |Board integration component. Follow the API documented in its `README.md`; do not drive the board directly.                                                                                                                         |
 |[esp-idf-wifi-provisioner](https://github.com/MichMich/esp-idf-wifi-provisioner)                                               |Wi-Fi connection using saved credentials and captive-portal provisioning fallback.                                                                                                                                                  |
 |[ESP-IDF UART driver](https://docs.espressif.com/projects/esp-idf/en/release-v6.0/esp32s3/api-reference/peripherals/uart.html) |UART routing and receive handling if an application-side adapter is required.                                                                                                                                                        |
 
-The project shall pin parserDSMR to a Git revision. For the inspected baseline, the ESP-IDF build shall add the checkout’s components/parserDSMR directory to EXTRA_COMPONENT_DIRS and require the parserDSMR component. The checkout shall preserve the relative symlinks from that component directory to the root src/, include/ and adapter/ directories. When the raw-frame API is available in the dependency, the production build shall pin the revision containing it. The pinned dependency shall retain its MIT license.
+The project shall pin parserDSMR to an ESP Component Registry release, added with idf.py add-dependency "mrwheel/parserDSMR^<version>" and required under its lowercase registry name parserdsmr. The component manager resolves it into managed_components/ at configure time; no sibling checkout is involved. When the raw-frame API is available in the dependency, the production build shall pin the release containing it. The pinned dependency shall retain its license.
 
 The public integration headers are dsmr_parser.h and dsmr_uart_esp32.h. The parser test fixtures are in test/fixtures/. The baseline README describes the Belgian fixtures as pending verification against Fluvius publications and the profile field tables as covering core fields. Acceptance for the logger shall use independently verified Belgian fixtures and shall restrict the decoded summary to fields the dependency exposes.
 

@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-21 · Build: 20
+//-- Date: 2026-11-22 · Build: 21
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -89,8 +89,12 @@ extern const char styleCssEnd[] asm("_binary_style_css_end");
 #define WEB_HOURSGRAPH_JSON_BYTES 8192
 
 //-- The Actual Graph frame carries up to the full receiver power history
-//-- (a hundred samples) with six phase figures and the gas rate each.
-#define WEB_ACTUALGRAPH_JSON_BYTES 12288
+//-- (a hundred samples, twice that when the heap carried the wider table at
+//-- boot) with six phase figures and the gas rate each. One record costs up
+//-- to about 105 bytes, so two hundred of them plus the frame tail need
+//-- well past the original 12 kB: a truncated frame used to reach the SPA
+//-- as malformed JSON and left the view blank.
+#define WEB_ACTUALGRAPH_JSON_BYTES 24576
 
 //-- The v3 status frame carries the reception status plus the Wi-Fi and
 //-- control owner fields the console's status command reports next to it.
@@ -1958,6 +1962,8 @@ static esp_err_t handleActualGraphGet(httpd_req_t* req)
   if (sb.overflow)
   {
     ESP_LOGE(tag, "actual graph json overflow");
+    free(buffer);
+    return sendError(req, 500, "actual graph json overflow");
   }
 
   esp_err_t result = sendJson(req, buffer);
@@ -2014,7 +2020,8 @@ static const ApiV3Entry apiV3Entries[] = {
     {"POST", "/api/v3/config",
      "save form-urlencoded settings; omitting mqttPassword keeps the stored password"},
     {"GET", "/api/v3/status", "reception state, counters, clock, Wi-Fi and control owners"},
-    {"GET", "/api/v3/version", "firmware, parser, ESP-IDF and compiler versions"},
+    {"GET", "/api/v3/version",
+     "firmware, parser, ESP-IDF and compiler versions plus the managed component versions"},
     {"GET", "/api/v3/device",
      "device state block: identity, versions, memory, chip and flash facts"},
     {"GET", "/api/v3/telegrams", "metadata of the retained telegram records, newest first"},
@@ -2124,7 +2131,7 @@ static esp_err_t handleApiV3VersionGet(httpd_req_t* req)
   char compileStamp[32];
   snprintf(compileStamp, sizeof compileStamp, "%s %s", __DATE__, __TIME__);
 
-  char buffer[512];
+  char buffer[1024];
   stringBuilder sb;
   sbInit(&sb, buffer, sizeof buffer);
   sbAppend(&sb, "{\"type\":\"version\",\"firmwareVersion\":");
@@ -2137,7 +2144,32 @@ static esp_err_t handleApiV3VersionGet(httpd_req_t* req)
   sbAppendJsonString(&sb, __VERSION__);
   sbAppend(&sb, ",\"compileStamp\":");
   sbAppendJsonString(&sb, compileStamp);
-  sbAppend(&sb, "}");
+
+  //-- The managed component list the console's status and version commands
+  //-- print, from the very table the console uses (logger_telnet owns it
+  //-- together with the state block).
+  size_t componentCount = 0u;
+  const loggerTelnetComponentVersion* components =
+      loggerTelnetGetComponentVersions(&componentCount);
+
+  sbAppend(&sb, ",\"components\":[");
+
+  for (size_t componentIndex = 0u; components != NULL && componentIndex < componentCount;
+       componentIndex++)
+  {
+    if (componentIndex > 0u)
+    {
+      sbAppend(&sb, ",");
+    }
+
+    sbAppend(&sb, "{\"name\":");
+    sbAppendJsonString(&sb, components[componentIndex].name);
+    sbAppend(&sb, ",\"version\":");
+    sbAppendJsonString(&sb, components[componentIndex].version);
+    sbAppend(&sb, "}");
+  }
+
+  sbAppend(&sb, "]}");
 
   return sendJson(req, buffer);
 }
@@ -2583,10 +2615,18 @@ static void wsHandleCommand(httpd_req_t* req, const char* body)
 
     if (sb.overflow)
     {
+      //-- A truncated frame is malformed JSON: the SPA could not parse it
+      //-- and the view stayed blank. Answer a clean error instead, which the
+      //-- SPA shows as the view's state line.
       ESP_LOGE(tag, "actual graph json overflow");
+      wsSendReply(req, "{\"type\":\"error\",\"request\":\"actualgraph\","
+                       "\"error\":\"frame too large\"}");
+    }
+    else
+    {
+      wsSendReply(req, buffer);
     }
 
-    wsSendReply(req, buffer);
     free(buffer);
     return;
   }

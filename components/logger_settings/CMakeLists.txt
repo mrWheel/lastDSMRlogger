@@ -4,5 +4,5 @@
 idf_component_register(
   SRCS "logger_settings.c"
   INCLUDE_DIRS "include"
-  REQUIRES nvs_flash parserDSMR
+  REQUIRES nvs_flash parserdsmr
 )

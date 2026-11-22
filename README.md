@@ -1,7 +1,7 @@
 # lastDSMRlogger
 
-Buildnumber: 39
-Last update-date: 2026-11-21
+Buildnumber: 41
+Last update-date: 2026-11-22
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -21,7 +21,7 @@ telegram history lives in RAM.
 |`components/logger_web/`          |esp_http_server: SPA assets and JSON API                                               |
 |`components/logger_board/`        |On-device TFT debug lines through the esp32_s3_piggyback component                     |
 |`components/esp32_s3_piggyback/`  |Vendored board component from mrWheel (pinned, see section 3)                          |
-|`../parserDSMR/components/parserDSMR/` |Pinned parser dependency via EXTRA_COMPONENT_DIRS (see section 3)                 |
+|`managed_components/mrwheel__parserdsmr/` |Parser dependency from the ESP Component Registry (see section 3)                |
 
 ## 2. Build, flash, monitor
 
@@ -47,29 +47,32 @@ automatically.
 
 |Dependency                |Source                                                                                                     |Pin                                                          |
 |--------------------------|-----------------------------------------------------------------------------------------------------------|-------------------------------------------------------------|
-|parserDSMR                |`https://github.com/mrWheel/parserDSMR` checkout at `../parserDSMR`                                         |revision `686a3aeefb5c4b107ce9884023fab4014b184b31` (v0.9.1, includes the raw-frame API and `dsmrParserVersion()`; `PROG_VERSION` now has internal linkage, so it no longer clashes with the application's own symbol) |
+|parserDSMR                |ESP Component Registry `mrwheel/parserdsmr`, published from `https://github.com/mrWheel/parserDSMR`           |`^0.9.2` — added with `idf.py add-dependency "mrwheel/parserDSMR^0.9.2"` (registry names are lowercase; the `REQUIRES` name and the status console report the lowercase `parserdsmr`) |
 |esp32_s3_piggyback        |`https://github.com/mrWheel/esp32-s3-Piggyback`, component directory `components/esp32_s3_piggyback`       |commit `912fa25b86fdb62d8f1005ae57e227c5803db373` (v1.3.0), vendored under `components/` |
 |esp-idf-wifi-provisioner  |ESP Component Registry `michmich/esp-idf-wifi-provisioner`                                                  |version `0.4.0` (upstream commit `2c7aaa6aa0e319a429186ee470e137b8579f632f`) |
 |ring_file_store           |ESP Component Registry `mrwheel/ring_file_store`                                                            |`^0.1.3` |
 |littlefs                  |ESP Component Registry `joltwallet/littlefs`                                                                |`^1.23.1` |
 |smb_server                |ESP Component Registry `mrwheel/smb_server`                                                                 |`^0.3.0` (GPL-3.0, guest-only SMB2/SMB3 file server) |
 
-parserDSMR is consumed as the checkout's `components/parserDSMR` directory
-through `EXTRA_COMPONENT_DIRS` in the root `CMakeLists.txt`. The checkout
-preserves the relative symlinks from that component directory to the root
-`src/`, `include/` and `adapter/` directories. Clone it beside this project:
+parserDSMR is consumed as the ESP Component Registry release
+`mrwheel/parserdsmr`, resolved into `managed_components/` by the component
+manager at configure time. Add or bump it with:
 
 ```
-cd ..
-git clone https://github.com/mrWheel/parserDSMR.git
+idf.py add-dependency "mrwheel/parserDSMR^<version>"
 ```
+
+The registry component name is lowercase: `idf.py add-dependency`
+normalises `parserDSMR` to `parserdsmr`, `REQUIRES` must name the component
+`parserdsmr`, and the status console reports it under that name. No sibling
+checkout is involved any more.
 
 The raw byte view on `dsmrTelegramResult` (`rawBytes`/`rawLength`, the exact
 accepted frame including every original line ending and trailer byte), the
 UART overflow/framing error reporting in the adapter and the corrected phase
-tables are committed in the parser repository at the pinned revision. The
-same revision exposes `dsmrParserVersion()`; the application logs that
-version at boot and shows it on the display's boot debug lines.
+tables are part of the 0.9.2 release. The same release exposes
+`dsmrParserVersion()`; the application logs that version at boot and shows
+it on the display's boot debug lines.
 
 The Dutch and Belgian phase tables publish the objects the meters really use
 and that dsmr2Lib and the verified sample fixture confirm — per-phase
@@ -358,7 +361,7 @@ and a save that omits the `mqttPassword` field keeps the stored password
 |GET    |`/api/v3/config`                        |NVS settings + active state + valid choices (data sources, interval bounds, countries, profiles); never includes `mqttPassword` |
 |POST   |`/api/v3/config`                        |Save form-urlencoded settings incl. `rxGpio`, `rxInverted` (0/1) and `interval` (interval clamped to 2..600; one atomic operation; omitted `mqttPassword` keeps the stored password) |
 |GET    |`/api/v3/status`                        |Reception state, counters, last diagnostic, uptime **plus** the console's extra facts: `wifiSsid`, `wifiIp`, `wifiConnected`, `controlWebClaimed`, `controlTelnetClaimed` |
-|GET    |`/api/v3/version`                       |Console version line as JSON: firmware, parserDSMR, ESP-IDF and gcc versions, compile stamp |
+|GET    |`/api/v3/version`                       |Console version line as JSON: firmware, parserDSMR, ESP-IDF and gcc versions, compile stamp **and** the managed component versions |
 |GET    |`/api/v3/device`                        |Console state block as JSON: copyright, hostname, versions, chip, heap, PSRAM, image and flash facts |
 |GET    |`/api/v3/telegrams`                     |Metadata of retained records (incl. `meterTimeText` from OBIS `0-0:1.0.0`), newest first |
 |GET    |`/api/v3/telegram`                      |Decoded fields of the most recently accepted telegram         |
@@ -470,7 +473,7 @@ the LittleFS volume):
 |-----------------|-----------------------------------------------------------------|
 |`help`           |the command list                                                 |
 |`status`         |reception state, counters, clock, Wi-Fi, control owner **and** the device state block (copyright, hostname, versions, memory, chip, flash) |
-|`version`        |firmware and parserDSMR versions                                 |
+|`version`        |firmware, parserDSMR and managed component versions              |
 |`telegrams`      |the telegrams retained in RAM                                    |
 |`telegram [<seq>]`|decoded fields of one retained telegram; without a sequence the most recently accepted telegram |
 |`raw [<seq>]`    |exact accepted bytes of one retained telegram; without a sequence the most recently accepted telegram |

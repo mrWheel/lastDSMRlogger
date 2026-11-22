@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_telnet.c - telnet console server on port 23
-//-- Date: 2026-11-21 · Build: 14
+//-- Date: 2026-11-22 · Build: 15
 //--
 //-- A plain BSD-socket console task: it listens on port 23, serves exactly
 //-- one session at a time and answers a command set from the receiver,
@@ -110,6 +110,7 @@ static const char* const telnetCommands[] = {
 //-- state block (part of the status command) further up than its user.
 static bool telnetPrintf(int fd, const char* format, ...);
 static void printState(int fd);
+static void printComponentVersions(int fd);
 
 //-- Resolves one typed command word to the command it names: a
 //-- case-insensitive exact match always wins, otherwise the word must be an
@@ -289,7 +290,7 @@ static void printHelp(int fd)
           "  status             reception, counters, clock, Wi-Fi, control owner\r\n"
           "                     and device state: copyright, identity, versions,\r\n"
           "                     memory, flash\r\n"
-          "  version            firmware and parser versions\r\n"
+          "  version            firmware, parser and managed component versions\r\n"
           "  telegrams          the telegrams retained in RAM\r\n"
           "  telegram [seq]     decoded fields of one telegram (latest accepted)\r\n"
           "  raw [seq]          exact bytes of one telegram (latest accepted)\r\n"
@@ -397,6 +398,8 @@ static void printStatus(int fd)
 static void printVersion(int fd)
 {
   telnetPrintf(fd, "\r\nfirmware %s, parserDSMR %s\r\n", PROG_VERSION, dsmrParserVersion());
+
+  printComponentVersions(fd);
 }
 
 //-- --------------------------------------------------------------------------
@@ -586,6 +589,44 @@ bool loggerTelnetGetDeviceInfo(loggerTelnetDeviceInfo* out)
   return true;
 }
 
+//-- The managed component table the console and the /api/v3/version endpoint
+//-- report from (see logger_telnet.h). The name and version strings are
+//-- injected by this component's CMakeLists, which reads them from the
+//-- idf_component.yml manifests the component manager fetched, so both
+//-- report exactly the releases this firmware was built with.
+static const loggerTelnetComponentVersion COMPONENT_VERSIONS[] = {
+    {PARSERDSMR_COMPONENT_NAME, PARSERDSMR_COMPONENT_VERSION},
+    {WIFI_PROVISIONER_COMPONENT_NAME, WIFI_PROVISIONER_COMPONENT_VERSION},
+    {RING_FILE_STORE_COMPONENT_NAME, RING_FILE_STORE_COMPONENT_VERSION},
+    {LITTLEFS_COMPONENT_NAME, LITTLEFS_COMPONENT_VERSION},
+    {SMB_SERVER_COMPONENT_NAME, SMB_SERVER_COMPONENT_VERSION},
+    {MQTT_COMPONENT_NAME, MQTT_COMPONENT_VERSION},
+};
+
+//-- Lists the managed components and their resolved versions.
+static void printComponentVersions(int fd)
+{
+  telnetPrintf(fd, "\r\ncomponent versions:\r\n");
+
+  for (size_t index = 0u; index < (sizeof COMPONENT_VERSIONS / sizeof COMPONENT_VERSIONS[0]);
+       index++)
+  {
+    telnetPrintf(fd, "  %-36s %s\r\n", COMPONENT_VERSIONS[index].name,
+                 COMPONENT_VERSIONS[index].version);
+  }
+}
+
+const loggerTelnetComponentVersion* loggerTelnetGetComponentVersions(size_t* count)
+{
+  if (count == NULL)
+  {
+    return NULL;
+  }
+
+  *count = sizeof COMPONENT_VERSIONS / sizeof COMPONENT_VERSIONS[0];
+  return COMPONENT_VERSIONS;
+}
+
 static void printState(int fd)
 {
   loggerTelnetDeviceInfo info;
@@ -602,6 +643,9 @@ static void printState(int fd)
   telnetPrintf(fd, "compiled with  : ESP-IDF %s, parserDSMR %s, gcc %s\r\n", info.idfVersion,
                info.parserVersion, info.compilerVersion);
   telnetPrintf(fd, "sdk version    : %s\r\n", info.idfVersion);
+
+  printComponentVersions(fd);
+
   telnetPrintf(fd, "chip model     : %s (revision %u.%u, %d core(s))\r\n", info.chipModel,
                info.chipRevisionMajor, info.chipRevisionMinor, info.chipCores);
   telnetPrintf(fd, "chip ID        : %" PRIu64 " (efuse mac)\r\n", info.chipId);

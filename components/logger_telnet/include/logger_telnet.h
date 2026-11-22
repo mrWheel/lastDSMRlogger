@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_telnet.h - telnet console server on port 23
-//-- Date: 2026-11-21 · Build: 2
+//-- Date: 2026-11-22 · Build: 3
 //--
 //-- One operator at a time: claiming a telnet session takes control away
 //-- from the web page (which shows its takeover popup) and a second telnet
@@ -14,6 +14,7 @@
 #define LOGGER_TELNET_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -72,5 +73,27 @@ typedef struct
 //-- any task and before (or without) a running console; false only for a
 //-- null pointer.
 bool loggerTelnetGetDeviceInfo(loggerTelnetDeviceInfo* out);
+
+//-- --------------------------------------------------------------------------
+//-- Managed component versions
+//-- --------------------------------------------------------------------------
+
+//-- One managed component with the release version the component manager
+//-- resolved for this build. The table is filled by this component's
+//-- CMakeLists from the fetched idf_component.yml manifests, so console and
+//-- API report exactly what the firmware was built against; a manifest that
+//-- could not be read reports "unknown".
+typedef struct
+{
+  const char* name;    //-- namespaced registry name, e.g. "mrwheel/parserdsmr"
+  const char* version; //-- resolved release version, e.g. "0.9.2"
+} loggerTelnetComponentVersion;
+
+//-- Access to the static table the console's status and version commands and
+//-- the /api/v3/version endpoint print from, so all answer the same list
+//-- from one source. The pointer stays valid for the lifetime of the
+//-- firmware; *count receives the number of entries. Safe from any task;
+//-- returns NULL for a null count pointer.
+const loggerTelnetComponentVersion* loggerTelnetGetComponentVersions(size_t* count);
 
 #endif //-- LOGGER_TELNET_H
