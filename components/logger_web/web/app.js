@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-22 · Build: 31
+// Date: 2026-11-22 · Build: 32
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -116,7 +116,7 @@ function bindElements()
                "inpMqttClientId", "inpMqttSubTopic",
                "inpMqttInterval", "inpHostname", "inpFixedIp",
                "inpRfsSync", "rfsWearEstimate", "inpDynamicTariffs",
-               "inpTariff1", "inpTariff2", "inpTariffGas",
+               "inpTariff1", "inpTariff2", "inpTariffGas", "inpNetworkCosts",
                "saveSettings", "telegramState", "showTelegram", "telegramLog",
                "telegramDetail", "recordMeta", "recordNotes", "summaryTable", "rawView", "footerInfo",
                "powerPanel", "powerTelegram", "powerRows",
@@ -128,6 +128,7 @@ function bindElements()
                "daysGraphCanvasWrap", "daysGraphTableWrap", "daysGraphTable",
                "monthsGraphState", "refreshMonthsGraph", "monthsGraphCanvas",
                "monthsGraphCanvasWrap", "monthsGraphTableWrap", "monthsGraphTable",
+               "monthsGraphCostsTableWrap", "monthsGraphCostsTable",
                "actualGraphState", "refreshActualGraph", "actualGraphCanvas", "actualGraphChecks",
                "viewSettings", "viewTelegrams", "viewPower", "viewRingFile", "viewHoursGraph",
                "viewDaysGraph", "viewMonthsGraph", "viewActualGraph", "viewApi",
@@ -698,6 +699,32 @@ function clampTariff(input)
   return value;
 }
 
+// Clamps the fixed monthly network and transport amount to the device
+// bounds (0 .. 1000 EUR) and writes the accepted value back into the
+// field.
+function clampNetworkCosts(input)
+{
+  let value = parseFloat(input.value);
+
+  if (!Number.isFinite(value))
+  {
+    value = 0;
+  }
+
+  if (value < 0)
+  {
+    value = 0;
+  }
+
+  if (value > 1000)
+  {
+    value = 1000;
+  }
+
+  input.value = String(value);
+  return value;
+}
+
 function renderSettings(message)
 {
   state.config = message;
@@ -772,6 +799,8 @@ function renderSettings(message)
       (settings && Number.isFinite(settings.tariff2PricePerKwh)) ? String(settings.tariff2PricePerKwh) : "0";
   el.inpTariffGas.value =
       (settings && Number.isFinite(settings.tariffGasPricePerM3)) ? String(settings.tariffGasPricePerM3) : "0";
+  el.inpNetworkCosts.value =
+      (settings && Number.isFinite(settings.networkCostsPerMonthEuro)) ? String(settings.networkCostsPerMonthEuro) : "0";
   el.inpDynamicTariffs.checked = !!(settings && settings.dynamicTariffsEnabled);
   updateRfsWearEstimate();
 
@@ -899,6 +928,7 @@ function saveSettings(event)
   const tariff1 = clampTariff(el.inpTariff1);
   const tariff2 = clampTariff(el.inpTariff2);
   const tariffGas = clampTariff(el.inpTariffGas);
+  const networkCosts = clampNetworkCosts(el.inpNetworkCosts);
   const dynamicTariffs = el.inpDynamicTariffs.checked ? "1" : "0";
 
   const body = "cmd=save" +
@@ -932,6 +962,7 @@ function saveSettings(event)
                "&tariff1=" + encodeURIComponent(tariff1) +
                "&tariff2=" + encodeURIComponent(tariff2) +
                "&tariffGas=" + encodeURIComponent(tariffGas) +
+               "&networkCosts=" + encodeURIComponent(networkCosts) +
                "&dynamicTariffs=" + dynamicTariffs;
 
   wsSend(body);
@@ -1692,9 +1723,17 @@ function renderRingFileList(message)
 // is interpreted. The toolbar radio group picks the presentation (see
 // showPeriodGraphView): Graph draws the canvas above, Table lists the very
 // same per-period amounts as a newest-first table (period, used kWh,
-// returned kWh, gas m³, and for the months view the month's three tariff
-// amounts in EUR), built by renderPeriodGraphTable from the cached frame —
-// like the old DSMRlogger32 history tables.
+// returned kWh and gas m³), built by renderPeriodGraphTable from the
+// cached frame — like the old DSMRlogger32 history tables. The months
+// view's Table is the two-year comparison of the old history page
+// (assets/oldMonthsTabel.png): the drawn twelve months, newest on top,
+// each row pairing every amount with the same month one year back and
+// closing with Total and Balance rows. Its third option Costs lists the
+// month's money amounts in the same paired layout (assets/
+// oldMonthsCosts.png): Electra (the ring's two tariff amounts added),
+// Gas, the fixed monthly Netw. fee from Settings and the Total, with an
+// Advance row of each half's total sum over twelve (the old page's
+// Voorschot Bedrag).
 
 const PERIOD_GRAPHS =
 {
@@ -1731,9 +1770,10 @@ const WATT_STEPS = [50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000];
 
 // Per-view rendering state: the newest frame's records and availability
 // flag, the presentation mode picked by the view's radio group ("graph"
-// draws the canvas, "table" fills the record table), the drawing geometry
-// of the newest canvas frame (for the hover popup), the mouse position
-// inside the canvas (null: outside) and the popup chips.
+// draws the canvas, "table" fills the record table, "costs" the months
+// view's money table), the drawing geometry of the newest canvas frame
+// (for the hover popup), the mouse position inside the canvas (null:
+// outside) and the popup chips.
 const periodGraphs = {};
 
 Object.keys(PERIOD_GRAPHS).forEach((viewId) =>
@@ -1804,9 +1844,16 @@ function showPeriodGraphView(viewId)
   const config = PERIOD_GRAPHS[viewId];
   const graph = periodGraphs[viewId];
   const tableMode = (graph.mode === "table");
+  const costsMode = (graph.mode === "costs");
+  const recordMode = tableMode || costsMode;
 
-  el[viewId + "CanvasWrap"].hidden = tableMode;
+  el[viewId + "CanvasWrap"].hidden = recordMode;
   el[viewId + "TableWrap"].hidden = !tableMode;
+
+  if (viewId === "monthsGraph")
+  {
+    el.monthsGraphCostsTableWrap.hidden = !costsMode;
+  }
 
   if (graph.records.length === 0)
   {
@@ -1817,12 +1864,26 @@ function showPeriodGraphView(viewId)
     return;
   }
 
-  if (tableMode)
+  if (recordMode)
   {
-    setPeriodGraphState(viewId, graph.records.length + " " + config.unitWord +
+    //-- The months tables show the drawn twelve, the other views every
+    // retained period.
+    const shown = (viewId === "monthsGraph")
+                ? periodGraphWindow(viewId, graph.records).length
+                : graph.records.length;
+
+    setPeriodGraphState(viewId, shown + " " + config.unitWord +
                                 " records shown, newest first · " + config.api +
                                 (graph.available ? "" : " (the device walk did not finish)"));
-    renderPeriodGraphTable(viewId);
+
+    if (costsMode)
+    {
+      renderMonthsCostsTable();
+    }
+    else
+    {
+      renderPeriodGraphTable(viewId);
+    }
     return;
   }
 
@@ -1885,21 +1946,26 @@ function periodGraphTableLabel(ring, key)
          ":00 - " + text.slice(6, 8) + ":59";
 }
 
-// The table presentation of a period view: one row per retained period,
-// newest first (the frame arrives oldest first, so the cached array is
-// walked reversed), carrying the same per-period amounts the bars are
-// drawn from; the months table appends the month's three tariff amounts
-// in EUR (the fictional billing figures the ring stores per record, as
-// the RingFile table prints them). Rows are built with textContent only.
+// The table presentation of the Hours and Days views: one row per
+// retained period, newest first (the frame arrives oldest first, so the
+// cached array is walked reversed), carrying the same per-period amounts
+// the bars are drawn from. The months view's table is the two-year
+// comparison built by renderMonthsCompareTable. Rows are built with
+// textContent only.
 function renderPeriodGraphTable(viewId)
 {
+  if (viewId === "monthsGraph")
+  {
+    renderMonthsCompareTable();
+    return;
+  }
+
   const config = PERIOD_GRAPHS[viewId];
   const tbody = el[viewId + "Table"].tBodies[0];
   tbody.textContent = "";
 
   periodGraphs[viewId].records.slice().reverse().forEach((record) =>
   {
-    const row = document.createElement("tr");
     const cells = [
       periodGraphTableLabel(config.ring, record.key),
       (typeof record.used === "number") ? record.used.toFixed(3) : "-",
@@ -1907,29 +1973,7 @@ function renderPeriodGraphTable(viewId)
       (typeof record.gas === "number") ? record.gas.toFixed(3) : "-",
     ];
 
-    if (viewId === "monthsGraph")
-    {
-      cells.push((typeof record.t1 === "number") ? record.t1.toFixed(2) : "-");
-      cells.push((typeof record.t2 === "number") ? record.t2.toFixed(2) : "-");
-      cells.push((typeof record.tG === "number") ? record.tG.toFixed(2) : "-");
-    }
-
-    cells.forEach((text, index) =>
-    {
-      const cell = document.createElement("td");
-      cell.textContent = text;
-
-      // The measured columns align right so the digits of successive
-      // periods line up; the period column keeps the default left.
-      if (index > 0)
-      {
-        cell.className = "valueNumeric";
-      }
-
-      row.appendChild(cell);
-    });
-
-    tbody.appendChild(row);
+    appendGraphTableRow(tbody, cells);
   });
 }
 
@@ -2232,6 +2276,231 @@ function periodGraphWindow(viewId, records)
   }
 
   return records.slice(records.length - MONTHS_WINDOW_SIZE);
+}
+
+// One table row for the period views: every cell carries plain text and
+// the value columns (everything but the leading label) align right so the
+// digits of successive periods line up. A footer row (the Total, Balance
+// and Advance rows of the months tables) gets the .tableFooterRow style.
+function appendGraphTableRow(tbody, cells, footer)
+{
+  const row = document.createElement("tr");
+
+  if (footer)
+  {
+    row.className = "tableFooterRow";
+  }
+
+  cells.forEach((text, index) =>
+  {
+    const cell = document.createElement("td");
+    cell.textContent = text;
+
+    if (index > 0)
+    {
+      cell.className = "valueNumeric";
+    }
+
+    row.appendChild(cell);
+  });
+
+  tbody.appendChild(row);
+}
+
+// Cell text of a measured amount: fixed decimals, or a dash when the
+// ring holds no value for it (a year the pairing has nothing for).
+function graphCellNumber(value, digits)
+{
+  return ((typeof value === "number") && Number.isFinite(value)) ? value.toFixed(digits) : "-";
+}
+
+// The months tables' period key split: the month name and the "20YY"
+// year labels of the month and of the same month one year back (year
+// wrap included) from a YYMM key; null when the text is not four digits.
+function monthsTableParts(key)
+{
+  const text = String(key).padStart(4, "0");
+
+  if (!new RegExp("^\\d{4}$").test(text))
+  {
+    return null;
+  }
+
+  const year2 = Number(text.slice(0, 2));
+  const month = Number(text.slice(2, 4));
+
+  if (month < 1 || month > 12)
+  {
+    return null;
+  }
+
+  return {monthName: MONTH_NAMES[month - 1],
+          yearLabel: "20" + text.slice(0, 2),
+          yearAgoLabel: "20" + String((year2 + 99) % 100).padStart(2, "0")};
+}
+
+// The months view's Table presentation (the old DSMRlogger32 history
+// page, assets/oldMonthsTabel.png): the drawn twelve months newest on
+// top, every row showing used, returned and gas twice — this month and
+// the same month one year back (the partner is looked up over all
+// retained records, so the year-ago months may live outside the window);
+// a year the ring no longer retains shows dashes. The Total row sums the
+// drawn rows column by column, the Balance row nets used against
+// returned for each year. Rows are built with textContent only.
+function renderMonthsCompareTable()
+{
+  const tbody = el.monthsGraphTable.tBodies[0];
+  tbody.textContent = "";
+
+  const records = periodGraphs.monthsGraph.records;
+  const drawn = periodGraphWindow("monthsGraph", records).slice().reverse();
+
+  const totals = {used: 0, returned: 0, gas: 0, yearAgoUsed: 0, yearAgoReturned: 0, yearAgoGas: 0};
+
+  const addTo = (value) => ((typeof value === "number") && Number.isFinite(value)) ? value : 0;
+
+  drawn.forEach((record) =>
+  {
+    const parts = monthsTableParts(record.key);
+
+    if (parts === null)
+    {
+      appendGraphTableRow(tbody, [String(record.key)]);
+      return;
+    }
+
+    const previous = periodYearAgoRecordByKey(records, record.key);
+
+    totals.used += addTo(record.used);
+    totals.returned += addTo(record.returned);
+    totals.gas += addTo(record.gas);
+    totals.yearAgoUsed += addTo(previous ? previous.used : null);
+    totals.yearAgoReturned += addTo(previous ? previous.returned : null);
+    totals.yearAgoGas += addTo(previous ? previous.gas : null);
+
+    appendGraphTableRow(tbody,
+    [
+      parts.monthName,
+      parts.yearLabel, graphCellNumber(record.used, 3),
+      parts.yearAgoLabel, graphCellNumber(previous ? previous.used : null, 3),
+      parts.yearLabel, graphCellNumber(record.returned, 3),
+      parts.yearAgoLabel, graphCellNumber(previous ? previous.returned : null, 3),
+      parts.yearLabel, graphCellNumber(record.gas, 3),
+      parts.yearAgoLabel, graphCellNumber(previous ? previous.gas : null, 3),
+    ]);
+  });
+
+  appendGraphTableRow(tbody,
+  [
+    "Total",
+    "", graphCellNumber(totals.used, 3), "", graphCellNumber(totals.yearAgoUsed, 3),
+    "", graphCellNumber(totals.returned, 3), "", graphCellNumber(totals.yearAgoReturned, 3),
+    "", graphCellNumber(totals.gas, 3), "", graphCellNumber(totals.yearAgoGas, 3),
+  ], true);
+
+  appendGraphTableRow(tbody,
+  [
+    "Balance",
+    "", graphCellNumber(totals.used - totals.returned, 3),
+    "", graphCellNumber(totals.yearAgoUsed - totals.yearAgoReturned, 3),
+    "", "", "", "", "", "", "", "",
+  ], true);
+}
+
+// The month's Electra amount in EUR: the two tariff amounts the ring
+// stores for the consumed energy (tariff 1 + tariff 2), or null when the
+// record carries neither.
+function monthsElectraEuro(record)
+{
+  const tariff1 = ((typeof record.t1 === "number") && Number.isFinite(record.t1)) ? record.t1 : null;
+  const tariff2 = ((typeof record.t2 === "number") && Number.isFinite(record.t2)) ? record.t2 : null;
+
+  if ((tariff1 === null) && (tariff2 === null))
+  {
+    return null;
+  }
+
+  return (tariff1 || 0) + (tariff2 || 0);
+}
+
+// The fixed monthly network and transport amount stored in Settings (the
+// Netw. column): 0 while it has never been saved.
+function monthsNetworkCostsEuro()
+{
+  const settings = (state.config && state.config.settings) || null;
+  const value = settings ? settings.networkCostsPerMonthEuro : 0;
+
+  return Number.isFinite(value) ? value : 0;
+}
+
+// The months view's Costs presentation (the old DSMRlogger32 history
+// page, assets/oldMonthsCosts.png): per drawn month the money amounts —
+// Electra (the ring's two tariff amounts added), Gas (the gas tariff
+// amount), Netw. (the fixed monthly network fee from Settings) and their
+// Total — each month paired with the same month one year back, the ring
+// partner supplying the right half. A month the ring does not retain
+// shows dashes. The Advance row prints each half's advance payment: that
+// column's total sum divided by twelve (the old page's Voorschot
+// Bedrag). Rows are built with textContent only.
+function renderMonthsCostsTable()
+{
+  const tbody = el.monthsGraphCostsTable.tBodies[0];
+  tbody.textContent = "";
+
+  const records = periodGraphs.monthsGraph.records;
+  const drawn = periodGraphWindow("monthsGraph", records).slice().reverse();
+  const netw = monthsNetworkCostsEuro();
+
+  const costsOf = (record) =>
+  {
+    const electra = monthsElectraEuro(record);
+    const gas = ((typeof record.tG === "number") && Number.isFinite(record.tG)) ? record.tG : null;
+
+    if ((electra === null) && (gas === null))
+    {
+      return {electra: null, gas: null, total: null};
+    }
+
+    return {electra: electra, gas: gas, total: (electra || 0) + (gas || 0) + netw};
+  };
+
+  let columnTotal = 0;
+  let columnTotalYearAgo = 0;
+
+  drawn.forEach((record) =>
+  {
+    const parts = monthsTableParts(record.key);
+
+    if (parts === null)
+    {
+      appendGraphTableRow(tbody, [String(record.key)]);
+      return;
+    }
+
+    const previous = periodYearAgoRecordByKey(records, record.key);
+    const costs = costsOf(record);
+    const yearAgo = previous ? costsOf(previous) : {electra: null, gas: null, total: null};
+
+    columnTotal += costs.total || 0;
+    columnTotalYearAgo += yearAgo.total || 0;
+
+    appendGraphTableRow(tbody,
+    [
+      parts.monthName,
+      parts.yearLabel,
+      graphCellNumber(costs.electra, 2), graphCellNumber(costs.gas, 2),
+      graphCellNumber(netw, 2), graphCellNumber(costs.total, 2),
+      parts.yearAgoLabel,
+      graphCellNumber(yearAgo.electra, 2), graphCellNumber(yearAgo.gas, 2),
+      previous ? graphCellNumber(netw, 2) : "-", graphCellNumber(yearAgo.total, 2),
+    ]);
+  });
+
+  appendGraphTableRow(tbody,
+  [
+    "", "", "", "", "Advance amount", graphCellNumber(columnTotal / 12, 2),
+    "", "", "", "Advance amount", graphCellNumber(columnTotalYearAgo / 12, 2),
+  ], true);
 }
 
 // Used/returned bars on the energy panel: one bar pair per record (red
@@ -3421,7 +3690,11 @@ function boot()
     {
       radio.addEventListener("change", () =>
       {
-        periodGraphs[viewId].mode = (radio.value === "table") ? "table" : "graph";
+        // The radio values are the modes themselves: graph, table and
+        // (months view only) costs; anything unexpected falls back to the
+        // canvas.
+        periodGraphs[viewId].mode = (radio.value === "table") ? "table"
+                                        : ((radio.value === "costs") ? "costs" : "graph");
         showPeriodGraphView(viewId);
       });
     });

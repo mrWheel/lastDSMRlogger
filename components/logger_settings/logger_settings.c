@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.c - versioned settings service
-//-- Date: 2026-11-22 · Build: 8
+//-- Date: 2026-11-22 · Build: 9
 //--
 //-- The complete configuration is stored as one versioned blob so a save is
 //-- atomic. A stored blob that fails validation is treated as absent: the
@@ -99,6 +99,39 @@ typedef struct
   float tariffGasPricePerM3;
   bool dynamicTariffsEnabled;
 } loggerSettingsConfigPreTopic;
+
+//-- Layout of the stored blob before the fixed monthly network and
+//-- transport costs were appended. A stored blob of exactly this size
+//-- migrates like the three above: its fields land in the identical prefix
+//-- of the current struct and the appended field gets its default.
+typedef struct
+{
+  uint32_t structVersion;
+  int rxGpio;
+  bool rxInverted;
+  bool txInverted;
+  uint32_t intervalSeconds;
+  char countryCode[LOGGER_SETTINGS_COUNTRY_MAX];
+  char profileId[LOGGER_SETTINGS_PROFILE_ID_MAX];
+  loggerMbusMode mbusMode[DSMR_MBUS_CHANNEL_MAX + 1];
+  dsmrMbusDeviceType mbusType[DSMR_MBUS_CHANNEL_MAX + 1];
+  bool displayFlipped;
+  char mqttBroker[LOGGER_MQTT_BROKER_MAX];
+  uint16_t mqttPort;
+  char mqttUser[LOGGER_MQTT_USER_MAX];
+  char mqttPassword[LOGGER_MQTT_PASSWORD_MAX];
+  char mqttTopTopic[LOGGER_MQTT_TOPIC_MAX];
+  uint32_t mqttIntervalSeconds;
+  char hostname[LOGGER_HOSTNAME_MAX];
+  uint8_t fixedIpLastOctet;
+  uint16_t rfsSyncIntervalMinutes;
+  float tariff1PricePerKwh;
+  float tariff2PricePerKwh;
+  float tariffGasPricePerM3;
+  bool dynamicTariffsEnabled;
+  char mqttClientId[LOGGER_MQTT_CLIENTID_MAX];
+  char mqttSubTopic[LOGGER_MQTT_TOPIC_MAX];
+} loggerSettingsConfigPreNetworkCosts;
 
 //-- Human readable protocol version labels for the built-in profiles. The
 //-- stable profile identifier is what gets persisted.
@@ -397,6 +430,19 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
     return false;
   }
 
+  //-- The fixed monthly network and transport amount must be finite and
+  //-- within the sanity bounds; it is a fee paid, so it is never negative.
+  if (!isfinite(config->networkCostsPerMonthEuro) ||
+      (config->networkCostsPerMonthEuro < LOGGER_SETTINGS_NETWORK_COST_MIN_EURO) ||
+      (config->networkCostsPerMonthEuro > LOGGER_SETTINGS_NETWORK_COST_MAX_EURO))
+  {
+    ESP_LOGW(tag, "rejecting network costs %g EUR: outside %g..%g",
+             (double)config->networkCostsPerMonthEuro,
+             (double)LOGGER_SETTINGS_NETWORK_COST_MIN_EURO,
+             (double)LOGGER_SETTINGS_NETWORK_COST_MAX_EURO);
+    return false;
+  }
+
   return true;
 }
 
@@ -425,9 +471,10 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
   bool migrated = (blobSize == sizeof(loggerSettingsConfigV5));
   bool migratedTariff = (blobSize == sizeof(loggerSettingsConfigPreTariff));
   bool migratedTopic = (blobSize == sizeof(loggerSettingsConfigPreTopic));
+  bool migratedCosts = (blobSize == sizeof(loggerSettingsConfigPreNetworkCosts));
 
   if ((result != ESP_OK) || ((blobSize != sizeof(loggerSettingsConfig)) && !migrated &&
-                             !migratedTariff && !migratedTopic))
+                             !migratedTariff && !migratedTopic && !migratedCosts))
   {
     nvs_close(handle);
 
@@ -465,6 +512,11 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
   else if (migratedTopic && (result == ESP_OK))
   {
     ESP_LOGI(tag, "stored settings migrated: the tariff topic fields take their defaults");
+  }
+  else if (migratedCosts && (result == ESP_OK))
+  {
+    config->networkCostsPerMonthEuro = 0.0f;
+    ESP_LOGI(tag, "stored settings migrated: the network costs field takes its default");
   }
 
   if (result != ESP_OK)

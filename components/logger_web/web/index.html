@@ -199,6 +199,16 @@
             <input id="inpTariffGas" type="number" step="0.001" min="-5" max="5" value="0"
                    inputmode="decimal" placeholder="EUR per m3">
           </div>
+
+          <!-- Fixed monthly network and transport fee: the Costs
+               presentation of the Months view adds this amount to every
+               month (its Netw. column). A more advanced treatment of the
+               network costs may follow later. -->
+          <div class="iosRow">
+            <label for="inpNetworkCosts">Network &amp; transport costs (month)</label>
+            <input id="inpNetworkCosts" type="number" step="0.01" min="0" max="1000" value="0"
+                   inputmode="decimal" placeholder="EUR per month">
+          </div>
         </fieldset>
 
         <button id="saveSettings" type="submit">Save</button>
@@ -366,12 +376,15 @@
       <div id="monthsGraphState" class="message"></div>
       <div class="listToolbar">
         <!-- Presentation radio group (see app.js): the view shows either
-             the usage canvas or the table of the same per-period records;
-             the graph is the default. -->
+             the usage canvas, the two-year comparison table of the same
+             per-period records, or the Costs table pairing every month's
+             amounts with those of the same month one year back; the graph
+             is the default. -->
         <div class="ringRadioGroup">
           <span class="graphModeCaption">Presentation:</span>
           <label><input type="radio" name="monthsGraphMode" value="graph" checked> Graph</label>
           <label><input type="radio" name="monthsGraphMode" value="table"> Table</label>
+          <label><input type="radio" name="monthsGraphMode" value="costs"> Costs</label>
         </div>
         <button id="refreshMonthsGraph" type="button">Refresh</button>
       </div>
@@ -385,16 +398,50 @@
       <div class="hoursGraphWrap" id="monthsGraphCanvasWrap">
         <canvas id="monthsGraphCanvas" class="graphCanvas"></canvas>
       </div>
-      <!-- The table presentation of the same frame: one row per retained
-           period, newest first, with the per-period used/returned kWh and
-           gas m³ the bars are drawn from (the whole ring, not only the
-           twelve months the graph pairs) plus the month's three tariff
-           amounts in EUR (the same billing figures the RingFile table
-           prints). Rows are built by app.js. -->
+      <!-- The table presentation of the same frame, styled after the old
+           DSMRlogger32 history page (assets/oldMonthsTabel.png): one row
+           per drawn month, newest first, always showing the same month of
+           the two retained years side by side — used, returned and gas
+           each carry a year/value column pair for this year and for the
+           year before; a year the ring no longer retains shows dashes.
+           The Total row sums the drawn rows per column, the Balance row
+           nets used against returned. Rows are built by app.js. -->
       <div class="tableWrap" id="monthsGraphTableWrap" hidden>
         <table id="monthsGraphTable">
           <thead>
-            <tr><th>Period</th><th class="valueNumeric">Used (kWh)</th><th class="valueNumeric">Returned (kWh)</th><th class="valueNumeric">Gas (m³)</th><th class="valueNumeric">Tariff 1 €</th><th class="valueNumeric">Tariff 2 €</th><th class="valueNumeric">Tariff Gas €</th></tr>
+            <tr>
+              <th rowspan="2">Month</th>
+              <th colspan="4" class="graphGroupHeader">Used (kWh)</th>
+              <th colspan="4" class="graphGroupHeader">Returned (kWh)</th>
+              <th colspan="4" class="graphGroupHeader">Gas (m³)</th>
+            </tr>
+            <tr>
+              <th class="valueNumeric">Year</th><th class="valueNumeric">(kWh)</th><th class="valueNumeric">Year</th><th class="valueNumeric">(kWh)</th>
+              <th class="valueNumeric">Year</th><th class="valueNumeric">(kWh)</th><th class="valueNumeric">Year</th><th class="valueNumeric">(kWh)</th>
+              <th class="valueNumeric">Year</th><th class="valueNumeric">(m³)</th><th class="valueNumeric">Year</th><th class="valueNumeric">(m³)</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <!-- The Costs presentation of the same frame, styled after the old
+           DSMRlogger32 history page (assets/oldMonthsCosts.png): per month
+           the electricity amount (the ring's two tariff amounts added),
+           the gas amount and the fixed monthly network fee from Settings
+           (its Netw. column), with the total, each month paired with the
+           same month of the year before. The Advance row prints each
+           half's advance payment: the sum of that column's totals over
+           twelve (the old page's Voorschot Bedrag). Rows are built by
+           app.js. -->
+      <div class="tableWrap" id="monthsGraphCostsTableWrap" hidden>
+        <table id="monthsGraphCostsTable">
+          <thead>
+            <tr>
+              <th>Month</th><th class="valueNumeric">Year</th>
+              <th class="valueNumeric">Electra (€)</th><th class="valueNumeric">Gas (€)</th><th class="valueNumeric">Netw. (€)</th><th class="valueNumeric">Total (€)</th>
+              <th class="valueNumeric">Year</th>
+              <th class="valueNumeric">Electra (€)</th><th class="valueNumeric">Gas (€)</th><th class="valueNumeric">Netw. (€)</th><th class="valueNumeric">Total (€)</th>
+            </tr>
           </thead>
           <tbody></tbody>
         </table>

@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.h - versioned settings service
-//-- Date: 2026-11-22 · Build: 8
+//-- Date: 2026-11-22 · Build: 9
 //--
 //-- The settings service stores the complete versioned configuration in
 //-- ESP-IDF NVS, validates it against the parserDSMR built-in profiles and
@@ -82,6 +82,10 @@ typedef enum
 //-- sub topic were appended at the end of the struct. Blobs of any earlier
 //-- size migrate on load: the appended fields get their defaults, so no
 //-- save is required after updating.
+//-- Version 5 (extended once more): the fixed monthly network and transport
+//-- costs were appended at the end of the struct. Blobs of any earlier size
+//-- migrate on load: the appended field gets its default, so no save is
+//-- required after updating.
 #define LOGGER_SETTINGS_VERSION 5u
 #define LOGGER_SETTINGS_PROFILE_ID_MAX 32
 #define LOGGER_SETTINGS_COUNTRY_MAX 3
@@ -114,6 +118,13 @@ typedef enum
 //-- no import price for the period, and always for gas.
 #define LOGGER_SETTINGS_TARIFF_PRICE_MIN (-5.0f)
 #define LOGGER_SETTINGS_TARIFF_PRICE_MAX 5.0f
+
+//-- Bounds of the fixed monthly network and transport amount in EUR (the
+//-- "Netw." column of the Months view's Costs presentation): a flat fee
+//-- added to every month's electricity and gas amounts. A more advanced
+//-- treatment of the network costs may follow later.
+#define LOGGER_SETTINGS_NETWORK_COST_MIN_EURO 0.0f
+#define LOGGER_SETTINGS_NETWORK_COST_MAX_EURO 1000.0f
 
 typedef struct
 {
@@ -219,6 +230,17 @@ typedef struct
   //-- Last segment of the tariff topic (formerly the fixed "newTariffs").
   //-- Empty selects the default "newTariffs".
   char mqttSubTopic[LOGGER_MQTT_TOPIC_MAX];
+
+  //-- ------------------------------------------------------------------------
+  //-- Network and transport costs (appended with the fourth version 5
+  //-- extension; older blobs leave this at its default)
+  //-- ------------------------------------------------------------------------
+
+  //-- Fixed monthly network and transport amount in EUR: the Costs
+  //-- presentation of the Months view adds it to every month's electricity
+  //-- and gas amounts (the "Netw." column, like the old DSMRlogger32
+  //-- history pages). 0 earns nothing until it is filled in.
+  float networkCostsPerMonthEuro;
 } loggerSettingsConfig;
 
 //-- Loads the stored configuration and validates it. Returns ESP_ERR_NOT_FOUND

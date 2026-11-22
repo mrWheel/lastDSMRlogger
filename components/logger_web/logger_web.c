@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-22 · Build: 24
+//-- Date: 2026-11-22 · Build: 25
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -681,6 +681,10 @@ static void appendSettingsJson(stringBuilder* sb, const loggerSettingsConfig* co
   sbAppend(sb, ",\"dynamicTariffsEnabled\":");
   sbAppend(sb, config->dynamicTariffsEnabled ? "true" : "false");
 
+  //-- The fixed monthly network and transport amount: prefilled into the
+  //-- settings view and read by the Months view's Costs presentation.
+  sbAppendFmt(sb, ",\"networkCostsPerMonthEuro\":%.2f", (double)config->networkCostsPerMonthEuro);
+
   sbAppend(sb, ",\"mbus\":[");
 
   for (uint8_t channel = DSMR_MBUS_CHANNEL_MIN; channel <= DSMR_MBUS_CHANNEL_MAX; channel++)
@@ -908,6 +912,21 @@ static float parseTariffPrice(const char* text)
   return (float)value;
 }
 
+//-- The fixed monthly network and transport amount from form text: an
+//-- unusable value (not a number, out of the sanity bounds) becomes 0.0.
+static float parseNetworkCosts(const char* text)
+{
+  double value = atof(text);
+
+  if (!isfinite(value) || (value < (double)LOGGER_SETTINGS_NETWORK_COST_MIN_EURO) ||
+      (value > (double)LOGGER_SETTINGS_NETWORK_COST_MAX_EURO))
+  {
+    return 0.0f;
+  }
+
+  return (float)value;
+}
+
 //-- Lowercases every letter of the buffer in place (hostname spelling).
 static void lowercaseText(char* text)
 {
@@ -1112,6 +1131,11 @@ static const char* applySettingsFromForm(const char* body)
       formGet(body, "tariff2", text, sizeof text) ? parseTariffPrice(text) : 0.0f;
   candidate.tariffGasPricePerM3 =
       formGet(body, "tariffGas", text, sizeof text) ? parseTariffPrice(text) : 0.0f;
+
+  //-- Fixed monthly network and transport costs: an unusable value becomes
+  //-- 0.0, which simply earns nothing in the Costs presentation.
+  candidate.networkCostsPerMonthEuro =
+      formGet(body, "networkCosts", text, sizeof text) ? parseNetworkCosts(text) : 0.0f;
 
   //-- Dynamic tariffs switch: 1 lets the tariff table price the ring
   //-- records (manual prices as the fallback), 0 or an absent field always

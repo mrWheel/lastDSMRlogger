@@ -1,6 +1,6 @@
 # lastDSMRlogger
 
-fileVersion: [44] - 22-11-2026 - 15:30
+fileVersion: [45] - 22-11-2026 - 16:43
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -190,9 +190,12 @@ the device.
   span behind the field shows a rough LittleFS wear estimate for the
   entered value (device-published volume block count, estimated block-sized
   writes per synchronisation and flash cycle rating, uniform wear assumed);
-  a **Tariffs** group carries the **Dynamic Tariffs** switch and the manual
+  a **Tariffs** group carries the **Dynamic Tariffs** switch, the manual
   prices **Tariff 1 (kWh)**, **Tariff 2 (kWh)** and **Tariff Gas (m3)** in
-  EUR (see *Dynamic electricity tariffs*). Save validates and
+  EUR (see *Dynamic electricity tariffs*) and a fixed monthly **Network &
+  transport costs (month)** amount in EUR — the *Netw.* column of the
+  Months Graph *Costs* presentation (a flat fee added to every month; a
+  more advanced treatment of the network costs may follow later). Save validates and
   applies the complete configuration as one operation and stores it in NVS;
   on any failure the active configuration is preserved and the reason is
   shown.
@@ -271,6 +274,24 @@ the device.
   requests it too). Note the P1 telegram publishes energy counters only as
   totals — the days and months graphs therefore aggregate all three phases
   (the per-phase mockup bars are not derivable from stored data).
+  A *Presentation:* radio group in each of the three views switches the
+  same cached frame between presentations without asking the device again:
+  **Graph** draws the panels described above, **Table** lists the same
+  per-period amounts newest first. The Hours and Days tables show one row
+  per retained period (period, used kWh, returned kWh, gas m³). The months
+  Table is the two-year comparison of the old DSMRlogger32 history page
+  (`assets/oldMonthsTabel.png`): the drawn twelve months, newest on top,
+  each row showing used, returned and gas twice — this month and the same
+  month one year back (a year the ring no longer retains shows dashes) —
+  closing with a **Total** row that sums the drawn rows column by column
+  and a **Balance** row that nets used against returned per year. The
+  months view has a third option **Costs** (`assets/oldMonthsCosts.png`):
+  per drawn month the *Electra* amount (the ring's two tariff amounts
+  added), the *Gas* amount (the gas tariff amount), *Netw.* (the fixed
+  monthly network and transport fee from the Settings view) and their
+  *Total*, each month paired with the same month one year back, and an
+  **Advance** row printing each half's advance payment: that column's
+  total sum divided by twelve (the old page's *Voorschot Bedrag*).
 - **Actual Graph**: the realtime per-phase power overview, styled after the
   `assets/actualGraph.png` mockup. The device keeps an internal rolling
   table of the newest ~100 accepted telegrams in RAM: per sample the

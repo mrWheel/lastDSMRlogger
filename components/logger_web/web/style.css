@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-22 · Build: 26 */
+   Date: 2026-11-22 · Build: 27 */
 
 :root
 {
@@ -1093,9 +1093,28 @@ footer
 #daysGraphTable th,
 #daysGraphTable td,
 #monthsGraphTable th,
-#monthsGraphTable td
+#monthsGraphTable td,
+#monthsGraphCostsTable th,
+#monthsGraphCostsTable td
 {
   white-space: nowrap;
+}
+
+/* Group caption of the months comparison table: the Used / Returned / Gas
+   titles centre over the two-year column sets they span. */
+.graphGroupHeader
+{
+  text-align: center;
+}
+
+/* The Total, Balance and Advance rows closing the months tables: bold
+   over a hairline, like the summary rows of the old DSMRlogger32 history
+   pages. */
+#monthsGraphTable tr.tableFooterRow td,
+#monthsGraphCostsTable tr.tableFooterRow td
+{
+  font-weight: 600;
+  border-top: 1px solid var(--hairline);
 }
 
 /* --------------------------------------------------------------------------
