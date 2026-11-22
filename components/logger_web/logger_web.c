@@ -2313,7 +2313,8 @@ static esp_err_t handleApiV3StoreGet(httpd_req_t* req)
                 (unsigned long)(totalBytes - usedBytes));
   }
 
-  sbAppend(&sb, "]}");
+  //-- Closes both the capacity object and the root object.
+  sbAppend(&sb, "}}");
 
   if (sb.overflow)
   {

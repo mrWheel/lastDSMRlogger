@@ -2650,13 +2650,17 @@ function drawActualGraph()
     panelEnergy: panel1,
     panelGas: panel2,
     panelSplitY: (panel1.y + panel1.height + panel2.y) / 2,
+    zeroY: yOfEnergy(0),
     visible: visible,
   };
   updateActualGraphTooltip();
 }
 
-// Hover popup: one chip over the hovered slot listing the sample's time,
-// the per-phase watts of the visible series and the gas m³/h.
+// Hover popup: one chip over the hovered slot. The energy panel splits at
+// its zero line: hovering the red (delivered) half shows the delivered
+// watts only, the green (returned) half the returned watts only — always
+// for the phases the checkboxes keep visible — and hovering the gas panel
+// below shows the gas m³/h only.
 function updateActualGraphTooltip()
 {
   const canvas = el.actualGraphCanvas;
@@ -2692,33 +2696,39 @@ function updateActualGraphTooltip()
   const used = Array.isArray(record.used) ? record.used : [];
   const returned = Array.isArray(record.returned) ? record.returned : [];
   const lines = [record.time || "--:--:--"];
-  const usedParts = [];
-  const returnedParts = [];
+  const inGasPanel = (actualGraph.hoverY >= layout.panelSplitY);
 
-  for (let phase = 0; phase < 3; phase++)
+  if (inGasPanel)
   {
-    if (layout.visible.used[phase])
+    lines.push("gas  m³/h  " + (record.gas || 0).toFixed(3));
+  }
+  else
+  {
+    // One series per half of the energy panel: above the zero line the
+    // cursor reads the stacked delivered (red) bar, below it the stacked
+    // returned (green) one; the line still lists the visible phases only.
+    const aboveZero = (actualGraph.hoverY < layout.zeroY);
+    const series = aboveZero ? "used" : "returned";
+    const watts = aboveZero ? used : returned;
+    const parts = [];
+
+    for (let phase = 0; phase < 3; phase++)
     {
-      usedParts.push("L" + (phase + 1) + " " + ((used[phase] || 0) / 1000).toFixed(2));
+      if (layout.visible[series][phase])
+      {
+        parts.push("L" + (phase + 1) + " " + ((watts[phase] || 0) / 1000).toFixed(2));
+      }
     }
 
-    if (layout.visible.returned[phase])
+    if (parts.length === 0)
     {
-      returnedParts.push("L" + (phase + 1) + " " + ((returned[phase] || 0) / 1000).toFixed(2));
+      //-- That half's series are all switched off: nothing to read there.
+      tip.hidden = true;
+      return;
     }
-  }
 
-  if (usedParts.length > 0)
-  {
-    lines.push("used kW   " + usedParts.join("  "));
+    lines.push((aboveZero ? "Delivered kW  " : "Returned kW ") + parts.join("  "));
   }
-
-  if (returnedParts.length > 0)
-  {
-    lines.push("ret   kW  " + returnedParts.join("  "));
-  }
-
-  lines.push("gas  m³/h  " + (record.gas || 0).toFixed(3));
 
   tip.textContent = lines.join("\n");
   tip.hidden = false;
@@ -2726,7 +2736,7 @@ function updateActualGraphTooltip()
   const centre = layout.plotLeft + (layout.firstSlot + index + 0.5) * layout.slot;
   const half = tip.offsetWidth / 2;
   const left = Math.min(layout.cssWidth - half, Math.max(half, centre));
-  const panel = (actualGraph.hoverY >= layout.panelSplitY) ? layout.panelGas : layout.panelEnergy;
+  const panel = inGasPanel ? layout.panelGas : layout.panelEnergy;
   tip.style.left = (canvas.offsetLeft + left) + "px";
   tip.style.top = (canvas.offsetTop + panel.y + 2) + "px";
 }
