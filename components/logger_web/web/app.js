@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-22 · Build: 30
+// Date: 2026-11-22 · Build: 31
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -113,6 +113,7 @@ function bindElements()
                "displayRotationToggle", "rotNormalLabel", "rotUpsideDownLabel",
                "selCountry", "selProfile", "selMbus1", "selMbus2", "selMbus3", "selMbus4",
                "inpMqttBroker", "inpMqttPort", "inpMqttUser", "inpMqttPassword", "inpMqttTopic",
+               "inpMqttClientId", "inpMqttSubTopic",
                "inpMqttInterval", "inpHostname", "inpFixedIp",
                "inpRfsSync", "rfsWearEstimate", "inpDynamicTariffs",
                "inpTariff1", "inpTariff2", "inpTariffGas",
@@ -751,6 +752,11 @@ function renderSettings(message)
   el.inpMqttPassword.value = "";
   state.mqttPasswordChanged = false;
   el.inpMqttTopic.value = (settings && settings.mqttTopTopic) ? settings.mqttTopTopic : "";
+  // The tariff topic is <top topic>/<client id>/<sub topic>: an empty
+  // client id leaves the device segment out and an empty sub topic means
+  // newTariffs (see loggerTariffsEffectiveTopic on the device).
+  el.inpMqttClientId.value = (settings && settings.mqttClientId) ? settings.mqttClientId : "";
+  el.inpMqttSubTopic.value = (settings && settings.mqttSubTopic) ? settings.mqttSubTopic : "";
   el.inpMqttInterval.value =
       (settings && settings.mqttIntervalSeconds) ? String(settings.mqttIntervalSeconds) : "0";
   el.inpHostname.value = (settings && settings.hostname) ? settings.hostname : "";
@@ -917,6 +923,8 @@ function saveSettings(event)
                    ? "&mqttPassword=" + encodeURIComponent(el.inpMqttPassword.value || "")
                    : "") +
                "&mqttTopTopic=" + encodeURIComponent((el.inpMqttTopic.value || "").trim()) +
+               "&mqttClientId=" + encodeURIComponent((el.inpMqttClientId.value || "").trim()) +
+               "&mqttSubTopic=" + encodeURIComponent((el.inpMqttSubTopic.value || "").trim()) +
                "&mqttInterval=" + encodeURIComponent(mqttInterval) +
                "&hostname=" + encodeURIComponent(hostname) +
                "&fixedIp=" + encodeURIComponent(fixedIp) +

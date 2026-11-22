@@ -2,13 +2,15 @@
 """
 Haalt EPEX-stroomprijzen en TTF-gasprijzen (vandaag + morgen) op via het nieuwe
 publieke EnergyZero REST-endpoint en stuurt deze als JSON naar een MQTT-broker.
-Leest standaard 'configEnergy.cfg' uit dezelfde sub-map als dit script.
+Leest standaard 'configEnergy.cfg' uit dezelfde map als dit script.
 Volledig self-contained: gebruikt uitsluitend de Python Standard Library.
 """
 
+import argparse
 import configparser
 import json
-import os
+import math
+import secrets
 import socket
 import ssl
 import struct
@@ -52,9 +54,13 @@ class MinimalMQTTClient:
         raw_sock = socket.create_connection((host, port), timeout=timeout)
         if use_tls:
             context = ssl.create_default_context()
-            if ca_file:
-                context.load_verify_locations(cafile=ca_file)
-            self.sock = context.wrap_socket(raw_sock, server_hostname=host)
+            try:
+                if ca_file:
+                    context.load_verify_locations(cafile=ca_file)
+                self.sock = context.wrap_socket(raw_sock, server_hostname=host)
+            except Exception:
+                raw_sock.close()
+                raise
         else:
             self.sock = raw_sock
 
@@ -80,16 +86,21 @@ class MinimalMQTTClient:
 
         # Wacht op CONNACK (4 bytes: 0x20, 0x02, flags, return_code)
         connack = self._recv_exact(4)
-        if connack != 0x20 or connack != 0x00:
-            raise ConnectionError(f"MQTT verbinding geweigerd (code {connack})")
+        if connack[:3] != b"\x20\x02\x00":
+            raise ConnectionError("Ongeldig MQTT CONNACK ontvangen.")
+        if connack[3] != 0:
+            raise ConnectionError(f"MQTT verbinding geweigerd (code {connack[3]}).")
 
     def publish(self, topic: str, message: str, retain: bool = True):
         topic_bytes = self._encode_str(topic.encode("utf-8"))
         msg_bytes = message.encode("utf-8")
-        remaining = topic_bytes + msg_bytes
-        header_byte = 0x31 if retain else 0x30  # QoS 0, optioneel retain
+        packet_id = b"\x00\x01"
+        remaining = topic_bytes + packet_id + msg_bytes
+        header_byte = 0x33 if retain else 0x32  # QoS 1
         packet = bytes([header_byte]) + self._encode_remaining_length(len(remaining)) + remaining
         self.sock.sendall(packet)
+        if self._recv_exact(4) != b"\x40\x02" + packet_id:
+            raise ConnectionError("Ongeldig MQTT PUBACK ontvangen.")
 
     def disconnect(self):
         if self.sock:
@@ -114,42 +125,18 @@ class MinimalMQTTClient:
 # =====================================================================
 # Prijsdata ophalen & verwerken (nieuwe EnergyZero API)
 # =====================================================================
-def _create_ssl_context(verify: bool = True) -> ssl.SSLContext:
-    if not verify:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx
-
-    for ca_bundle in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
-        if os.path.exists(ca_bundle):
-            return ssl.create_default_context(cafile=ca_bundle)
-    return ssl.create_default_context()
-
-
 def _http_get_json(url: str) -> dict:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": "DSMRlogger-TariffFetcher/1.0",
-        },
-    )
-    try:
-        ctx = _create_ssl_context(verify=True)
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-            raw = resp.read().decode("utf-8").strip()
-    except urllib.error.URLError as err:
-        if isinstance(err.reason, ssl.SSLCertVerificationError):
-            ctx = _create_ssl_context(verify=False)
-            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-                raw = resp.read().decode("utf-8").strip()
-        else:
-            raise
-
-    if not raw:
-        raise ValueError(f"Leeg antwoord ontvangen van {url}")
-    return json.loads(raw)
+    ca_file = "/etc/ssl/cert.pem"
+    context = ssl.create_default_context(cafile=ca_file if Path(ca_file).is_file() else None)
+    request = urllib.request.Request(url, headers={
+        "Accept": "application/json",
+        "User-Agent": "DSMRlogger-TariffFetcher/1.0",
+    })
+    with urllib.request.urlopen(request, timeout=15, context=context) as response:
+        result = json.load(response)
+    if not isinstance(result, dict):
+        raise ValueError("EnergyZero gaf geen JSON-object terug.")
+    return result
 
 
 def fetch_energyzero_public_prices(date_nl: datetime, energy_type: str, interval: str) -> dict:
@@ -166,157 +153,171 @@ def fetch_energyzero_public_prices(date_nl: datetime, energy_type: str, interval
         "interval": interval,
     }
     url = f"{base_url}?{urllib.parse.urlencode(params)}"
-    try:
-        return _http_get_json(url)
-    except urllib.error.HTTPError as e:
-        # 404 betekent dat de prijzen voor morgen nog niet zijn gepubliceerd
-        if e.code == 404:
-            return {}
-        raise
+    return _http_get_json(url)
 
 
 def parse_zulu(ts: str) -> datetime:
-    return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+    value = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    if value.utcoffset() is None:
+        raise ValueError(f"Tijdzone ontbreekt in EnergyZero-tijdstempel: {ts}")
+    return value.astimezone(timezone.utc)
 
 
 def format_zulu(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def build_price_schedule(tariffs_cfg: dict) -> dict:
-    nl_tz = ZoneInfo("Europe/Amsterdam")
-    now_nl = datetime.now(nl_tz)
-    today_nl = now_nl.replace(hour=0, minute=0, second=0, microsecond=0)
-    tomorrow_nl = today_nl + timedelta(days=1)
-    day_after_nl = today_nl + timedelta(days=2)
+def price_slots(response, start, end, label):
+    entries = response.get("base_with_vat")
+    if not isinstance(entries, list):
+        raise ValueError(f"EnergyZero {label}: veld base_with_vat ontbreekt of is ongeldig.")
 
-    start_utc = today_nl.astimezone(timezone.utc)
-    end_utc = day_after_nl.astimezone(timezone.utc)
+    slots = {}
+    for entry in entries:
+        slot_start = parse_zulu(entry["start"])
+        slot_end = parse_zulu(entry["end"])
+        if slot_end <= slot_start:
+            raise ValueError(f"EnergyZero {label}: ongeldig prijsinterval.")
+        if slot_start >= end or slot_end <= start:
+            continue
+        price = float(entry["price"]["value"])
+        if not math.isfinite(price):
+            raise ValueError(f"EnergyZero {label}: ongeldige prijs.")
+        key = (slot_start, slot_end)
+        if key in slots and slots[key] != price:
+            raise ValueError(f"EnergyZero {label}: tegenstrijdige prijzen voor hetzelfde interval.")
+        slots[key] = price
 
-    # Haal vandaag en morgen op (de API geeft per aanroep ook de aangrenzende dag terug)
-    elec_today = fetch_energyzero_public_prices(today_nl, "ENERGY_TYPE_ELECTRICITY", "INTERVAL_QUARTER")
-    elec_tomorrow = fetch_energyzero_public_prices(tomorrow_nl, "ENERGY_TYPE_ELECTRICITY", "INTERVAL_QUARTER")
+    result = []
+    for (slot_start, slot_end), price in sorted(slots.items()):
+        if result and slot_start < result[-1][1]:
+            raise ValueError(f"EnergyZero {label}: overlappende prijsintervallen.")
+        result.append((slot_start, slot_end, price))
+    return result
 
-    gas_today = fetch_energyzero_public_prices(today_nl, "ENERGY_TYPE_GAS", "INTERVAL_DAY")
-    gas_tomorrow = fetch_energyzero_public_prices(tomorrow_nl, "ENERGY_TYPE_GAS", "INTERVAL_DAY")
 
-    # Gebruik 'baseWithVat' (kale beursprijs incl. 21% BTW) en tel daar de opslagen uit configEnergy.cfg bij op
-    raw_elec_entries = elec_today.get("baseWithVat", []) + elec_tomorrow.get("baseWithVat", [])
-    raw_gas_entries = gas_today.get("baseWithVat", []) + gas_tomorrow.get("baseWithVat", [])
+def build_price_schedule(tariffs_cfg, now=None):
+    now = datetime.now(timezone.utc) if now is None else now
+    local_now = now.astimezone(ZoneInfo("Europe/Amsterdam"))
+    today = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = today.astimezone(timezone.utc)
+    end = (today + timedelta(days=2)).astimezone(timezone.utc)
 
-    # Dedupliceer stroomintervallen op starttijd en filter op [vandaag 00:00, overmorgen 00:00)
-    elec_by_start: dict[datetime, float] = {}
-    for entry in raw_elec_entries:
-        dt_start = parse_zulu(entry["start"])
-        if start_utc <= dt_start < end_utc:
-            elec_by_start[dt_start] = float(entry["price"])
-
-    # Dedupliceer gasprijzen op starttijd en sorteer chronologisch
-    gas_by_start: dict[datetime, float] = {}
-    for entry in raw_gas_entries:
-        dt_start = parse_zulu(entry["start"])
-        gas_by_start[dt_start] = float(entry["price"])
-    parsed_gas = sorted(gas_by_start.items(), key=lambda x: x)
+    # Een aanvraag voor vandaag levert ook morgen, zodra gepubliceerd.
+    electricity = fetch_energyzero_public_prices(today, "ENERGY_TYPE_ELECTRICITY",
+                                                 "INTERVAL_QUARTER")
+    gas = fetch_energyzero_public_prices(today, "ENERGY_TYPE_GAS", "INTERVAL_DAY")
+    electric_slots = price_slots(electricity, start, end, "stroom")
+    gas_slots = price_slots(gas, start, end, "gas")
+    if not any(a <= now < b for a, b, _ in electric_slots):
+        raise ValueError("Geen actueel stroomtarief ontvangen van EnergyZero.")
+    if not any(a <= now < b for a, b, _ in gas_slots):
+        raise ValueError("Geen actueel gastarief ontvangen van EnergyZero.")
 
     imp_extra = tariffs_cfg["import_surcharge_kwh"] + tariffs_cfg["energy_tax_kwh"]
-    exp_extra = tariffs_cfg["export_surcharge_kwh"]
     gas_extra = tariffs_cfg["gas_surcharge_m3"] + tariffs_cfg["energy_tax_m3"]
-
-    def get_gas_price_at(dt: datetime) -> float | None:
-        active_price = None
-        for g_start, g_price in parsed_gas:
-            if g_start <= dt:
-                active_price = g_price
-            else:
-                break
-        if active_price is None:
-            return None
-        return round(active_price + gas_extra, 4)
-
+    export_extra = tariffs_cfg["export_surcharge_kwh"]
     intervals = []
-    for interval_start in sorted(elec_by_start.keys()):
-        interval_end = interval_start + timedelta(minutes=15)
-        base_price = elec_by_start[interval_start]
-
-        item = {
-            "start": format_zulu(interval_start),
-            "end": format_zulu(interval_end),
-            "importPricePerKwh": round(base_price + imp_extra, 4),
-            "exportPricePerKwh": round(base_price + exp_extra, 4),
-        }
-        gas_price = get_gas_price_at(interval_start)
-        if gas_price is not None:
-            item["gasPricePerM3"] = gas_price
-
-        intervals.append(item)
-
-    return {
-        "schemaVersion": 1,
-        "currency": "EUR",
-        "intervals": intervals,
-    }
+    for a, b, price in electric_slots:
+        # Een kwartier krijgt alleen een prijs als de gasdag het volledig dekt.
+        gas_price = next((value for start, end, value in gas_slots
+                          if start <= a and b <= end), None)
+        if gas_price is None:
+            continue
+        intervals.append({
+            "start": format_zulu(a),
+            "end": format_zulu(b),
+            "importPricePerKwh": round(price + imp_extra, 4),
+            "exportPricePerKwh": round(price + export_extra, 4),
+            "gasPricePerM3": round(gas_price + gas_extra, 4),
+        })
+    if not any(parse_zulu(item["start"]) <= now < parse_zulu(item["end"]) for item in intervals):
+        raise ValueError("Geen volledig actueel kwartier met stroom- en gastarief ontvangen.")
+    if len(intervals) < len(electric_slots):
+        print("Kwartieren zonder geldig gastarief zijn overgeslagen.", file=sys.stderr)
+    return {"schemaVersion": 1, "currency": "EUR", "intervals": intervals}
 
 
-# =====================================================================
-# Configuratie laden & uitvoeren
-def load_config(config_path: Path) -> configparser.ConfigParser:
-    if not config_path.exists():
-      raise FileNotFoundError(f"Configuratiebestand niet gevonden: {config_path}")
-    cfg = configparser.ConfigParser()
-    cfg.read(config_path, encoding="utf-8")
+def load_config(config_path):
+    cfg = configparser.ConfigParser(interpolation=None)
+    with config_path.open(encoding="utf-8") as source:
+        cfg.read_file(source)
     return cfg
 
-def resolve_topic(cfg: configparser.ConfigParser) -> str:
-    topic = cfg.get("logger", "topic", fallback="").strip()
-    if topic:
-        return topic
-    hostname = cfg.get("logger", "hostname", fallback="lastdsmrlogger").strip().lower()
+
+def resolve_topic(cfg):
+    hostname = cfg.get("logger", "hostname").strip().lower()
     if hostname.endswith(".local"):
         hostname = hostname[:-6]
-        return f"lastdsmrlogger/{hostname}/tariffs"
-    
-def resolve_ca_file(cfg: configparser.ConfigParser, config_dir: Path) -> str:
-    ca_raw = cfg.get("mqtt", "ca_file", fallback="").strip()
-    if not ca_raw:
-        return ""
-    ca_path = Path(ca_raw)
-    if not ca_path.is_absolute():
-        ca_path = (config_dir / ca_path).resolve()
-        return str(ca_path)
-    
+    suffix = cfg.get("logger", "topic").strip().strip("/")
+    topic = f"{hostname}/{suffix}"
+    if not hostname or "/" in hostname or not suffix or any(c in topic for c in "+#\x00"):
+        raise ValueError("Ongeldige hostname of topic in [logger].")
+    return topic
+
+
+def resolve_ca_file(cfg, config_dir):
+    raw = cfg.get("mqtt", "ca_file", fallback="").strip()
+    return str((config_dir / raw).resolve()) if raw else ""
+
+
 def main():
-    script_dir = Path(file).resolve().parent
-    default_config = script_dir / "configEnergy.cfg"
-    config_path = Path(sys.argv).resolve() if len(sys.argv) > 1 else default_config
-    cfg = load_config(config_path)
-    tariffs_cfg = {
-        "import_surcharge_kwh": cfg.getfloat("tariffs", "import_surcharge_kwh", fallback=0.0242),
-        "energy_tax_kwh": cfg.getfloat("tariffs", "energy_tax_kwh", fallback=0.1316),
-        "export_surcharge_kwh": cfg.getfloat("tariffs", "export_surcharge_kwh", fallback=0.0),
-        "gas_surcharge_m3": cfg.getfloat("tariffs", "gas_surcharge_m3", fallback=0.0749),
-        "energy_tax_m3": cfg.getfloat("tariffs", "energy_tax_m3", fallback=0.7054),
-    }
-    schedule = build_price_schedule(tariffs_cfg)
-    if not schedule["intervals"]:
-       raise RuntimeError("Geen prijsintervallen ontvangen van de EnergyZero API.")
-    payload_json = json.dumps(schedule, separators=(",", ":"))
-    mqtt_host = cfg.get("mqtt", "host").strip()
-    mqtt_port = cfg.getint("mqtt", "port", fallback=1883)
-    mqtt_user = cfg.get("mqtt", "username", fallback="").strip()
-    mqtt_pass = cfg.get("mqtt", "password", fallback="").strip()
-    mqtt_tls = cfg.getboolean("mqtt", "tls", fallback=False)
-    ca_file = resolve_ca_file(cfg, config_path.parent)
-    topic = resolve_topic(cfg)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("config", nargs="?", type=Path,
+                        default=Path(__file__).resolve().with_name("configEnergy.cfg"))
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Haal tarieven op en toon JSON, zonder MQTT-publicatie.")
+    args = parser.parse_args()
 
-    client_id = f"tariff-pub-{os.getpid()}"
-    mqtt = MinimalMQTTClient(client_id=client_id, username=mqtt_user, password=mqtt_pass)
+    try:
+        cfg = load_config(args.config)
+        topic = resolve_topic(cfg)
+        keys = ("import_surcharge_kwh", "energy_tax_kwh", "gas_surcharge_m3", "energy_tax_m3")
+        tariffs_cfg = {key: cfg.getfloat("tariffs", key) for key in keys}
+        export = cfg.get("tariffs", "export_surcharge_kwh", fallback="").strip()
+        if not export:
+            raise ValueError("Vul [tariffs] export_surcharge_kwh in. Gebruik 0 voor de beursprijs inclusief btw.")
+        tariffs_cfg["export_surcharge_kwh"] = float(export)
+        if not all(math.isfinite(price) for price in tariffs_cfg.values()):
+            raise ValueError("Ongeldig getal in [tariffs].")
 
-try:
-    mqtt.connect(host=mqtt_host, port=mqtt_port, use_tls=mqtt_tls, ca_file=ca_file)
-    mqtt.publish(topic=topic, message=payload_json, retain=True)
-    print(f"Succesvol {len(schedule['intervals'])} intervallen gepubliceerd naar '{topic}' op {mqtt_host}:{mqtt_port}")
-finally:
-    mqtt.disconnect()
-    
-    if name == "main":
-        main()
+        if not args.dry_run:
+            mqtt_host = cfg.get("mqtt", "host").strip()
+            mqtt_port = cfg.getint("mqtt", "port", fallback=1883)
+            mqtt_user = cfg.get("mqtt", "username", fallback="")
+            mqtt_client_id = cfg.get("mqtt", "client_id", fallback="").strip()
+            if not mqtt_client_id:
+                mqtt_client_id = "tariff-pub-" + secrets.token_hex(6)
+            if "\x00" in mqtt_client_id or len(mqtt_client_id.encode("utf-8")) > 65535:
+                raise ValueError("Ongeldige MQTT client_id in [mqtt].")
+            mqtt_password = cfg.get("mqtt", "password", fallback="")
+            mqtt_tls = cfg.getboolean("mqtt", "tls", fallback=False)
+            ca_file = resolve_ca_file(cfg, args.config.resolve().parent)
+            if not mqtt_host or mqtt_host == "YOUR_MQTT_BROKER" or not 1 <= mqtt_port <= 65535:
+                raise ValueError("Vul een geldig brokeradres en poort in bij [mqtt].")
+            if mqtt_password and not mqtt_user:
+                raise ValueError("Vul ook [mqtt] username in wanneer je een wachtwoord gebruikt.")
+
+        schedule = build_price_schedule(tariffs_cfg)
+        payload = json.dumps(schedule, separators=(",", ":"), allow_nan=False)
+        if args.dry_run:
+            print(json.dumps(schedule, indent=2))
+            return 0
+
+        mqtt = MinimalMQTTClient(mqtt_client_id, mqtt_user, mqtt_password)
+        try:
+            mqtt.connect(mqtt_host, mqtt_port, mqtt_tls, ca_file)
+            mqtt.publish(topic, payload, retain=True)
+        finally:
+            mqtt.disconnect()
+        print(f"{len(schedule['intervals'])} intervallen bevestigd door de broker op {topic}.")
+        return 0
+    except urllib.error.HTTPError as error:
+        print(f"EnergyZero HTTP {error.code}: {error.reason}", file=sys.stderr)
+    except (OSError, ValueError, TypeError, KeyError, configparser.Error) as error:
+        print(f"Fout: {error}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

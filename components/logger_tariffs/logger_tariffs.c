@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_tariffs.c - dynamic electricity tariff schedules
-//-- Date: 2026-11-22 · Build: 1
+//-- Date: 2026-11-22 · Build: 2
 //--
 //-- One sorted interval array in PSRAM is the live schedule; the same
 //-- content lands in a binary file on the meter store's LittleFS volume so
@@ -45,7 +45,6 @@
 #include "cJSON.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "logger_settings.h"
@@ -62,19 +61,26 @@ static const char* tag = "loggerTariffs";
 //-- the clock still sits at the 1970 epoch (same floor the meter store uses).
 #define TARIFF_CLOCK_FLOOR 1700000000LL
 
-//-- Binary file header and name on the meter store's volume.
+//-- Binary file header and name on the meter store's volume. Version 1
+//-- records carried import and export prices only; version 2 adds the gas
+//-- price and a three-bit presence byte (import, export, gas). Loading
+//-- accepts both versions: version 1 intervals are imported-price intervals.
 #define TARIFF_FILE_MAGIC "LDTF"
-#define TARIFF_FILE_VERSION 1u
+#define TARIFF_FILE_VERSION 2u
 #define TARIFF_FILE_NAME "tariffs.bin"
 #define TARIFF_FILE_TMP_NAME "tariffs.tmp"
 
-//-- Worst-case bytes of one serialised record: two 10-byte varints, two
+//-- Worst-case bytes of one serialised record: two 10-byte varints, three
 //-- floats and the presence byte, rounded up.
-#define TARIFF_RECORD_MAX_BYTES 32u
+#define TARIFF_RECORD_MAX_BYTES 40u
 
-#define TARIFF_DEVICE_ID_CHARS 12
-#define TARIFF_TOPIC_SUFFIX "/tariffs/electricity"
 #define TARIFF_TOPIC_DEFAULT "lastdsmrlogger"
+#define TARIFF_SUBTOPIC_DEFAULT "newTariffs"
+
+//-- Presence byte bits of one version 2 record.
+#define TARIFF_PRESENT_IMPORT 0x01u
+#define TARIFF_PRESENT_EXPORT 0x02u
+#define TARIFF_PRESENT_GAS 0x04u
 
 //-- The nesting bound the pre-parse scan enforces (the shared format nests
 //-- object > array > object: three levels; two levels of headroom).
@@ -435,17 +441,39 @@ static uint8_t* serializeSchedule(const loggerTariffInterval* intervals, size_t 
       return NULL;
     }
 
-    if (position + 9u > capacity)
+    if (position + 13u > capacity)
     {
       free(buffer);
       return NULL;
     }
 
+    //-- Three floats plus the presence byte: a missing price keeps its
+    //-- zeroed value and only the matching presence bit is stored.
     memcpy(buffer + position, &interval->importPricePerKwh, sizeof(float));
     position += sizeof(float);
     memcpy(buffer + position, &interval->exportPricePerKwh, sizeof(float));
     position += sizeof(float);
-    buffer[position++] = interval->hasExport ? 1u : 0u;
+    memcpy(buffer + position, &interval->gasPricePerM3, sizeof(float));
+    position += sizeof(float);
+
+    uint8_t presence = 0u;
+
+    if (interval->hasImport)
+    {
+      presence |= TARIFF_PRESENT_IMPORT;
+    }
+
+    if (interval->hasExport)
+    {
+      presence |= TARIFF_PRESENT_EXPORT;
+    }
+
+    if (interval->hasGas)
+    {
+      presence |= TARIFF_PRESENT_GAS;
+    }
+
+    buffer[position++] = presence;
     previousStart = interval->startEpochS;
   }
 
@@ -509,7 +537,7 @@ static bool persistSchedule(const loggerTariffInterval* intervals, size_t count)
     return false;
   }
 
-  ESP_LOGI(tag, "persisted %u tariff interval(s) to %s", (unsigned)count, finalPath);
+  ESP_LOGD(tag, "persisted %u tariff interval(s) to %s", (unsigned)count, finalPath);
   return true;
 }
 
@@ -572,16 +600,27 @@ static void ensureLoaded(void)
   fclose(file);
 
   size_t position = 0u;
+  bool headerOk = read && (fileSize >= 12) && (memcmp(payload, TARIFF_FILE_MAGIC, 4u) == 0);
+  uint16_t fileVersion = 0u;
 
-  if (!read || (fileSize < 12) || (memcmp(payload, TARIFF_FILE_MAGIC, 4u) != 0) ||
-      (payload[4] != (uint8_t)(TARIFF_FILE_VERSION & 0xFFu)) ||
-      (payload[5] != (uint8_t)((TARIFF_FILE_VERSION >> 8) & 0xFFu)))
+  if (headerOk)
+  {
+    fileVersion = (uint16_t)(payload[4] | ((uint16_t)payload[5] << 8));
+  }
+
+  //-- Both on-disk versions load: version 1 has no gas prices (its records
+  //-- are imported-price intervals) and a different presence byte shape.
+  if (!headerOk || ((fileVersion != 1u) && (fileVersion != (uint16_t)TARIFF_FILE_VERSION)))
   {
     ESP_LOGW(tag, "tariff schedule file is not readable, starting empty");
     free(payload);
     storeCount = 0u;
     return;
   }
+
+  //-- Fixed record tail: three floats and the presence byte for version 2,
+  //-- two floats and the export presence byte for version 1.
+  size_t recordTailBytes = (fileVersion == 1u) ? 9u : 13u;
 
   position = 6u;
   unsigned currencyLength = (unsigned)(payload[6] | (payload[7] << 8));
@@ -622,7 +661,7 @@ static void ensureLoaded(void)
 
     if (!readUvarint(payload, (size_t)fileSize, &position, &startDelta) ||
         !readUvarint(payload, (size_t)fileSize, &position, &duration) ||
-        (position + 9u > (size_t)fileSize))
+        (position + recordTailBytes > (size_t)fileSize))
     {
       valid = false;
       break;
@@ -631,14 +670,38 @@ static void ensureLoaded(void)
     loggerTariffInterval* interval = &spare[loadedCount];
     interval->startEpochS = previousStart + (int64_t)startDelta;
     interval->endEpochS = interval->startEpochS + (int64_t)duration;
+    interval->hasImport = false;
+    interval->hasExport = false;
+    interval->hasGas = false;
+    interval->importPricePerKwh = 0.0f;
+    interval->exportPricePerKwh = 0.0f;
+    interval->gasPricePerM3 = 0.0f;
+
     memcpy(&interval->importPricePerKwh, payload + position, sizeof(float));
     position += sizeof(float);
     memcpy(&interval->exportPricePerKwh, payload + position, sizeof(float));
     position += sizeof(float);
-    interval->hasExport = (payload[position++] != 0u);
+
+    if (fileVersion == 1u)
+    {
+      //-- Version 1 required an import price and only flagged the export.
+      interval->hasImport = true;
+      interval->hasExport = (payload[position++] != 0u);
+    }
+    else
+    {
+      memcpy(&interval->gasPricePerM3, payload + position, sizeof(float));
+      position += sizeof(float);
+
+      uint8_t presence = payload[position++];
+      interval->hasImport = (presence & TARIFF_PRESENT_IMPORT) != 0u;
+      interval->hasExport = (presence & TARIFF_PRESENT_EXPORT) != 0u;
+      interval->hasGas = (presence & TARIFF_PRESENT_GAS) != 0u;
+    }
 
     if ((duration == 0u) || (interval->endEpochS <= interval->startEpochS) ||
         (interval->startEpochS < TARIFF_EPOCH_MIN) || (interval->endEpochS > TARIFF_EPOCH_MAX) ||
+        (!interval->hasImport && !interval->hasExport && !interval->hasGas) ||
         ((loadedCount > 0u) && (interval->startEpochS <= previousStart)))
     {
       valid = false;
@@ -830,6 +893,7 @@ static loggerTariffIngestResult_t parseBatch(const char* json, size_t length, si
       cJSON* end = cJSON_GetObjectItemCaseSensitive(item, "end");
       cJSON* importPrice = cJSON_GetObjectItemCaseSensitive(item, "importPricePerKwh");
       cJSON* exportPrice = cJSON_GetObjectItemCaseSensitive(item, "exportPricePerKwh");
+      cJSON* gasPrice = cJSON_GetObjectItemCaseSensitive(item, "gasPricePerM3");
 
       if (!cJSON_IsObject(item))
       {
@@ -854,17 +918,27 @@ static loggerTariffIngestResult_t parseBatch(const char* json, size_t length, si
         break;
       }
 
-      if (!cJSON_IsNumber(importPrice) || !isfinite(importPrice->valuedouble))
-      {
-        snprintf(reason, reasonSize, "importPricePerKwh must be a finite number");
-        result = LOGGER_TARIFF_REJECTED;
-        break;
-      }
-
-      interval->importPricePerKwh = (float)importPrice->valuedouble;
-
+      //-- Each of the three prices is optional (absent or null means
+      //-- unknown); the interval must carry at least one of them.
+      interval->hasImport = false;
       interval->hasExport = false;
+      interval->hasGas = false;
+      interval->importPricePerKwh = 0.0f;
       interval->exportPricePerKwh = 0.0f;
+      interval->gasPricePerM3 = 0.0f;
+
+      if ((importPrice != NULL) && !cJSON_IsNull(importPrice))
+      {
+        if (!cJSON_IsNumber(importPrice) || !isfinite(importPrice->valuedouble))
+        {
+          snprintf(reason, reasonSize, "importPricePerKwh must be a finite number or null");
+          result = LOGGER_TARIFF_REJECTED;
+          break;
+        }
+
+        interval->importPricePerKwh = (float)importPrice->valuedouble;
+        interval->hasImport = true;
+      }
 
       if ((exportPrice != NULL) && !cJSON_IsNull(exportPrice))
       {
@@ -877,6 +951,26 @@ static loggerTariffIngestResult_t parseBatch(const char* json, size_t length, si
 
         interval->exportPricePerKwh = (float)exportPrice->valuedouble;
         interval->hasExport = true;
+      }
+
+      if ((gasPrice != NULL) && !cJSON_IsNull(gasPrice))
+      {
+        if (!cJSON_IsNumber(gasPrice) || !isfinite(gasPrice->valuedouble))
+        {
+          snprintf(reason, reasonSize, "gasPricePerM3 must be a finite number or null");
+          result = LOGGER_TARIFF_REJECTED;
+          break;
+        }
+
+        interval->gasPricePerM3 = (float)gasPrice->valuedouble;
+        interval->hasGas = true;
+      }
+
+      if (!interval->hasImport && !interval->hasExport && !interval->hasGas)
+      {
+        snprintf(reason, reasonSize, "every interval must carry at least one price");
+        result = LOGGER_TARIFF_REJECTED;
+        break;
       }
 
       count++;
@@ -966,7 +1060,8 @@ static bool previousMonthStartUtc(int64_t* out)
   return true;
 }
 
-loggerTariffIngestResult_t loggerTariffsIngestJson(const char* json, size_t length, char* reasonOut,
+loggerTariffIngestResult_t loggerTariffsIngestJson(const char* json, size_t length,
+                                                   const char* source, char* reasonOut,
                                                    size_t reasonSize)
 {
   char reason[160] = "";
@@ -1103,8 +1198,8 @@ loggerTariffIngestResult_t loggerTariffsIngestJson(const char* json, size_t leng
     storeCount = candidateCount;
     storeCurrency(newCurrency);
 
-    ESP_LOGI(tag, "accepted %u interval(s), %u stored, currency %s", (unsigned)count,
-             (unsigned)storeCount, currency);
+    ESP_LOGI(tag, "accepted %u interval(s) via %s, %u stored, currency %s", (unsigned)count,
+             (source != NULL ? source : "unknown"), (unsigned)storeCount, currency);
   }
 
   xSemaphoreGive(tariffsMutex);
@@ -1528,8 +1623,12 @@ esp_err_t loggerTariffsAggregate(time_t from, time_t to, loggerTariffResolution_
         }
 
         uint64_t coveredSeconds = (uint64_t)(coveredEnd - coveredStart);
-        importPriceSeconds += (double)store[interval].importPricePerKwh * (double)coveredSeconds;
-        importCoverage += coveredSeconds;
+
+        if (store[interval].hasImport)
+        {
+          importPriceSeconds += (double)store[interval].importPricePerKwh * (double)coveredSeconds;
+          importCoverage += coveredSeconds;
+        }
 
         if (store[interval].hasExport)
         {
@@ -1656,9 +1755,10 @@ void loggerTariffsMeterAmountCalculator(loggerMeterRing_t ring, uint64_t ringKey
   double priceGas = haveSettings ? (double)settings.tariffGasPricePerM3 : 0.0;
 
   //-- With dynamic tariffs on, the import price the table holds for this
-  //-- instant prices both energy tariffs; minutes the table does not cover
-  //-- keep the manual prices. Gas always carries the manual gas price: the
-  //-- electricity table has no gas price.
+  //-- instant prices both energy tariffs (one dynamic tariff always applies,
+  //-- there is no normal/off-peak distinction) and the gas price the table
+  //-- holds prices the gas; minutes the table does not cover — or prices it
+  //-- does not carry — keep the manual prices.
   if (haveSettings && settings.dynamicTariffsEnabled)
   {
     loggerTariffInterval active;
@@ -1667,8 +1767,16 @@ void loggerTariffsMeterAmountCalculator(loggerMeterRing_t ring, uint64_t ringKey
     //-- dynamic price, so the manual prices stand.
     if (loggerTariffsActiveInterval(time(NULL), &active))
     {
-      priceT1 = (double)active.importPricePerKwh;
-      priceT2 = (double)active.importPricePerKwh;
+      if (active.hasImport)
+      {
+        priceT1 = (double)active.importPricePerKwh;
+        priceT2 = (double)active.importPricePerKwh;
+      }
+
+      if (active.hasGas)
+      {
+        priceGas = (double)active.gasPricePerM3;
+      }
     }
   }
 
@@ -1719,11 +1827,15 @@ void loggerTariffsEffectiveTopic(char* out, size_t outSize)
   }
 
   char topTopic[LOGGER_MQTT_TOPIC_MAX] = "";
+  char clientId[LOGGER_MQTT_CLIENTID_MAX] = "";
+  char subTopic[LOGGER_MQTT_TOPIC_MAX] = "";
   loggerSettingsConfig config;
 
-  if ((loggerSettingsLoad(&config) == ESP_OK) && (config.mqttTopTopic[0] != '\0'))
+  if (loggerSettingsLoad(&config) == ESP_OK)
   {
     snprintf(topTopic, sizeof topTopic, "%s", config.mqttTopTopic);
+    snprintf(clientId, sizeof clientId, "%s", config.mqttClientId);
+    snprintf(subTopic, sizeof subTopic, "%s", config.mqttSubTopic);
   }
 
   if (topTopic[0] == '\0')
@@ -1731,19 +1843,21 @@ void loggerTariffsEffectiveTopic(char* out, size_t outSize)
     snprintf(topTopic, sizeof topTopic, "%s", TARIFF_TOPIC_DEFAULT);
   }
 
-  uint8_t mac[6] = {0u, 0u, 0u, 0u, 0u, 0u};
-  esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY);
-
-  char deviceId[TARIFF_DEVICE_ID_CHARS + 1u];
-
-  for (size_t index = 0u; index < sizeof mac; index++)
+  if (subTopic[0] == '\0')
   {
-    snprintf(&deviceId[index * 2u], 3u, "%02x", (unsigned)mac[index]);
+    snprintf(subTopic, sizeof subTopic, "%s", TARIFF_SUBTOPIC_DEFAULT);
   }
 
-  deviceId[TARIFF_DEVICE_ID_CHARS] = '\0';
-
-  snprintf(out, outSize, "%s/%s%s", topTopic, deviceId, TARIFF_TOPIC_SUFFIX);
+  //-- An empty client id leaves the device segment out: several loggers on
+  //-- one broker separate themselves by naming a client id in Settings.
+  if (clientId[0] != '\0')
+  {
+    snprintf(out, outSize, "%s/%s/%s", topTopic, clientId, subTopic);
+  }
+  else
+  {
+    snprintf(out, outSize, "%s/%s", topTopic, subTopic);
+  }
 }
 
 esp_err_t loggerTariffsInit(void)

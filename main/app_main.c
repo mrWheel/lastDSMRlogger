@@ -15,7 +15,7 @@
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
 extern const char* PROG_VERSION;
-const char* PROG_VERSION = "v0.5.8";
+const char* PROG_VERSION = "v0.5.9";
 
 #include <stdio.h>
 #include <string.h>
@@ -398,6 +398,14 @@ static void initialiseNvs(void)
 
 void app_main(void)
 {
+  //-- Serial quiet mode: the console shows warnings and errors only. The
+  //-- tariff store stays at info level so every tariff batch fetched through
+  //-- the HTTP API or MQTT remains visible, and the telnet console keeps its
+  //-- per-session connect and disconnect lines.
+  esp_log_level_set("*", ESP_LOG_WARN);
+  esp_log_level_set("loggerTariffs", ESP_LOG_INFO);
+  esp_log_level_set("loggerTelnet", ESP_LOG_INFO);
+
   ESP_LOGI(tag, "lastDSMRlogger %s starting", PROG_VERSION);
   ESP_LOGI(tag, "parserDSMR library version %s", dsmrParserVersion());
 

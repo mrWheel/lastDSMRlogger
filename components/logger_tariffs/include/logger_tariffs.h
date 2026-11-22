@@ -1,10 +1,11 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_tariffs.h - dynamic electricity tariff schedules
-//-- Date: 2026-11-22 · Build: 2
+//-- Date: 2026-11-22 · Build: 3
 //--
 //-- The shared tariff domain of the logger: prices per kWh for imported and
-//-- exported energy, submitted as one versioned JSON document either through
+//-- exported energy plus a price per m³ for gas, submitted as one versioned
+//-- JSON document either through
 //-- the MQTT tariff topic (the MQTT client feeds it in) or through the HTTP
 //-- API (the web component feeds it in). The same document format is
 //-- accepted on both paths, so a supplier feed can be published through Home
@@ -69,17 +70,23 @@
 //-- Model
 //-- --------------------------------------------------------------------------
 
-//-- One accepted tariff interval: the import price applies from start
-//-- (inclusive) to end (exclusive), all times are UTC seconds since the
-//-- epoch. The export price is only meaningful while hasExport is set; a
-//-- missing export price is unknown, never zero.
+//-- One accepted tariff interval: its prices apply from start (inclusive)
+//-- to end (exclusive), all times are UTC seconds since the epoch. An
+//-- interval carries at least one of the three prices; a missing price is
+//-- unknown, never zero, and its value is only meaningful while the
+//-- matching has* flag is set. Gas shares the electricity document because
+//-- suppliers report both from one feed; a gas day typically spans many
+//-- electricity quarter-hours.
 typedef struct
 {
   int64_t startEpochS;
   int64_t endEpochS;
   float importPricePerKwh;
   float exportPricePerKwh;
+  float gasPricePerM3;
+  bool hasImport;
   bool hasExport;
+  bool hasGas;
 } loggerTariffInterval;
 
 //-- Aggregation resolutions of the tariff query API.
@@ -112,8 +119,10 @@ typedef enum
 //-- the log) for every rejection. The json buffer carries exactly length
 //-- document bytes and must hold a terminating NUL at json[length]
 //-- (trailing garbage after the document is refused). The document is at
-//-- most LOGGER_TARIFF_JSON_MAX_BYTES long.
-loggerTariffIngestResult_t loggerTariffsIngestJson(const char* json, size_t length, char* reasonOut,
+//-- most LOGGER_TARIFF_JSON_MAX_BYTES long. The source names the entry
+//-- point ("HTTP API" or "MQTT") and only labels the log line.
+loggerTariffIngestResult_t loggerTariffsIngestJson(const char* json, size_t length,
+                                                   const char* source, char* reasonOut,
                                                    size_t reasonSize);
 
 //-- --------------------------------------------------------------------------
@@ -178,8 +187,10 @@ esp_err_t loggerTariffsAggregate(time_t from, time_t to, loggerTariffResolution_
 //-- energy consumed inside that ring's period: every minute of consumption
 //-- is priced with the import price the table holds for that instant while
 //-- the dynamic tariffs switch is on, and with the manual tariff prices
-//-- otherwise or where the table covers nothing. Gas always carries the
-//-- manual gas price: the electricity table has no gas price. The amounts
+//-- otherwise or where the table covers nothing (a dynamic tariff is one
+//-- price that always applies, there is no normal/off-peak distinction).
+//-- Gas is priced with the gas price the table holds for that instant when
+//-- it has one, and with the manual gas price otherwise. The amounts
 //-- accumulate inside the current period (they restart when a new period
 //-- opens or after a reboot, as the staged record is rewritten anyway).
 void loggerTariffsMeterAmountCalculator(loggerMeterRing_t ring, uint64_t ringKey,
@@ -189,9 +200,10 @@ void loggerTariffsMeterAmountCalculator(loggerMeterRing_t ring, uint64_t ringKey
 //-- MQTT topic and timestamp helpers
 //-- --------------------------------------------------------------------------
 
-//-- Builds the effective MQTT tariff topic
-//-- "<top topic or 'lastdsmrlogger'>/<deviceId>/tariffs/electricity" from
-//-- the stored MQTT configuration and the device's factory MAC address.
+//-- Builds the effective MQTT tariff topic from the stored MQTT
+//-- configuration: "<top topic or 'lastdsmrlogger'>/<client id>/<sub topic
+//-- or 'newTariffs'>". The client id segment is left out while the client
+//-- id setting is empty.
 void loggerTariffsEffectiveTopic(char* out, size_t outSize);
 
 //-- True when text is exactly "YYYY-MM-DDTHH:MM:SSZ" naming a valid UTC

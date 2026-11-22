@@ -25,6 +25,7 @@ Use the same versioned JSON format for MQTT and HTTP POST.
       "start": "2026-11-22T12:15:00Z",
       "end": "2026-11-22T12:30:00Z",
       "importPricePerKwh": 0.2216,
+      "exportPricePerKwh": 0.0812,
       "gasPricePerM3": 0.234
     }
   ]
@@ -38,17 +39,17 @@ Use the same versioned JSON format for MQTT and HTTP POST.
 
 ## MQTT input
 
-Reuse the existing MQTT client. Use <hostname>/tariffs/electricity as the default topic and adapt the prefix to existing configuration where applicable. Expose the effective topic and preserve compatibility with the existing telegram publication topic.
+Reuse the existing MQTT client. Use `<hostname>/newTariffs` as the default topic and adapt the prefix to existing configuration where applicable. Expose the effective topic and preserve compatibility with the existing telegram publication topic.
 
 Recommend one retained QoS 1 message containing the available schedule, typically today and tomorrow when available. Reassemble fragmented MQTT payloads. Accept at least two full local days of quarter-hour prices, including a 25-hour day. Log the reason for invalid messages and preserve the stored schedule.
 
 ## HTTP API
 
-Use the existing routing and authentication conventions. Implement these operations under /api/v3/tariffs/electricity or the equivalent project API prefix. Document the exact route.
+Use the existing routing and authentication conventions. Implement these operations under `/api/v3/newTariffs/` or the equivalent project API prefix. Document the exact route.
 
 |Request                                                    |Behavior                                                                                                                 |
 |-----------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------|
-|`POST /api/v3/tariffs`                            |Accept the shared JSON format and return success once stored. Return a clear client error for invalid input or conflicts.|
+|`POST /api/v3/newTariffs`                            |Accept the shared JSON format and return success once stored. Return a clear client error for invalid input or conflicts.|
 |`GET /api/v3/tariffs`                             |Return the currently active interval, or explicitly report that the tariff is unavailable.                               |
 |`GET /api/v3/tariffs?from=…&to=…&resolution=raw`  |Return original intervals overlapping the requested half-open range.                                                     |
 |`GET /api/v3/tariffs?from=…&to=…&resolution=hour` |Return average prices per local calendar hour.                                                                           |

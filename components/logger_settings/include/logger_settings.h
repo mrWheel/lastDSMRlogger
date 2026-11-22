@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.h - versioned settings service
-//-- Date: 2026-11-22 · Build: 7
+//-- Date: 2026-11-22 · Build: 8
 //--
 //-- The settings service stores the complete versioned configuration in
 //-- ESP-IDF NVS, validates it against the parserDSMR built-in profiles and
@@ -78,6 +78,10 @@ typedef enum
 //-- manual tariff prices were appended at the end of the struct. Blobs of
 //-- either earlier size migrate on load: the appended fields get their
 //-- defaults, so no save is required after updating.
+//-- Version 5 (extended again): the MQTT client id and the tariff topic
+//-- sub topic were appended at the end of the struct. Blobs of any earlier
+//-- size migrate on load: the appended fields get their defaults, so no
+//-- save is required after updating.
 #define LOGGER_SETTINGS_VERSION 5u
 #define LOGGER_SETTINGS_PROFILE_ID_MAX 32
 #define LOGGER_SETTINGS_COUNTRY_MAX 3
@@ -87,6 +91,7 @@ typedef enum
 #define LOGGER_MQTT_USER_MAX 64
 #define LOGGER_MQTT_PASSWORD_MAX 64
 #define LOGGER_MQTT_TOPIC_MAX 64
+#define LOGGER_MQTT_CLIENTID_MAX 64
 #define LOGGER_HOSTNAME_MAX 33
 #define LOGGER_SETTINGS_MQTT_PORT_DEFAULT 1883u
 #define LOGGER_SETTINGS_MQTT_INTERVAL_MAX_S 86400u
@@ -199,6 +204,21 @@ typedef struct
   //-- fall back to the manual prices above. False always uses the manual
   //-- prices.
   bool dynamicTariffsEnabled;
+
+  //-- ------------------------------------------------------------------------
+  //-- Tariff topic identity (appended with the third version 5 extension;
+  //-- older blobs leave these at their defaults)
+  //-- ------------------------------------------------------------------------
+
+  //-- MQTT client id: announced to the broker when the client connects and
+  //-- used as the optional middle segment of the tariff topic. Empty lets
+  //-- the client fall back to its generated id and leaves the segment out
+  //-- of the topic.
+  char mqttClientId[LOGGER_MQTT_CLIENTID_MAX];
+
+  //-- Last segment of the tariff topic (formerly the fixed "newTariffs").
+  //-- Empty selects the default "newTariffs".
+  char mqttSubTopic[LOGGER_MQTT_TOPIC_MAX];
 } loggerSettingsConfig;
 
 //-- Loads the stored configuration and validates it. Returns ESP_ERR_NOT_FOUND

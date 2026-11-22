@@ -1,3 +1,5 @@
+fileVersion: [1] - 22-11-2026 - 15:30
+
 # How to get dynamic energy tariffs for lastDSMRlogger
 
 Run a script, Node-RED flow, or Home Assistant automation that fetches your supplier's prices, converts them to the format below, and submits them to lastDSMRlogger. Keep supplier credentials and contract-specific calculations in that integration. Compare a few converted prices against your supplier's app or tariff sheet before publishing them.
@@ -50,11 +52,47 @@ Check whether the price field you select already includes tax and VAT. Apply any
 
 Source: [EnergyZero GetPrices API reference](https://docs.api.energyzero.nl/docs/api/swagger/public/energy-market-service-get-prices/).
 
+## Vattenfall
+
+Vattenfall publishes FlexPrijs tariffs on its customer-service page, in Mijn Vattenfall, and in the Energie app. No documented public FlexPrijs tariff API was identified. Use the displayed rates to check any estimate built from wholesale data and your contract terms. If you have TijdPrijs, build intervals from the fixed time blocks and rates in your contract. TijdPrijs has a separate pricing model.
+
+Sources: [Vattenfall dynamic tariffs](https://www.vattenfall.nl/klantenservice/alles-over-je-dynamische-contract/), [TijdPrijs](https://www.vattenfall.nl/energie/tijdprijs/).
+
+## Greenchoice
+
+The separate *Dynamisch verbruik Greenchoice* app, published by EnergyZero, shows electricity and gas prices. The public EnergyZero feed described above can supply market data. Compare the interval duration and all-in rates with the Greenchoice app and apply the Greenchoice contract charges where applicable. A Greenchoice-specific public contract-rate API was not verified.
+
+Source: [Dynamisch verbruik Greenchoice](https://play.google.com/store/apps/details?id=nl.energyzero.greenchoice).
+
+## Essent
+
+Home Assistant's Essent integration reads unauthenticated electricity and gas prices from Essent's public API. Use that integration or inspect the current client for request and response details. Read the available interval data, preserve its boundaries, and check the reported price against your Essent contract before forwarding it. Availability of the next day's prices can vary.
+
+Sources: [Home Assistant Essent integration](https://www.home-assistant.io/integrations/essent/), [Python client](https://pypi.org/project/essent-dynamic-pricing/).
+
+## Eneco and Oxxio
+
+Eneco publishes dynamic electricity and gas tariffs on its tariff page. Oxxio displays current electricity tariffs on its own dynamic contract page. No supported public contract-rate API was verified for either brand. When building a price from market data, use the billing period and fees for your own Eneco or Oxxio contract. Verify electricity, gas and export separately before publishing them.
+
+Sources: [Eneco dynamic tariff page](https://www.eneco.nl/duurzame-energie/dynamisch-energiecontract/dynamische-tarieven/), [Oxxio dynamic contract and rates](https://www.oxxio.nl/energiecontract-afsluiten/dynamisch-energiecontract/).
+
+## ENGIE Netherlands
+
+A community Python client exists for the private consumer app API. Check its current documentation for the data it exposes before relying on it for tariff schedules. No supported public residential tariff endpoint was verified. ENGIE also advertises business APIs. Those have a separate onboarding process. If you use market data to estimate residential prices, compare the results with your ENGIE contract or app.
+
+Sources: [Community ENGIE Netherlands client](https://github.com/AboveColin/engie-nl), [ENGIE business APIs](https://www.engie.nl/zakelijk/product-advies/api).
+
+## ANWB Energie
+
+ANWB publishes dynamic energy rates on its website. Home Assistant identifies ANWB Energie as an EnergyZero reseller, so the EnergyZero integration or public feed can provide the market-price input. Verify the billing intervals and ANWB-specific fees against the ANWB tariff display and your contract before publishing the final prices.
+
+Sources: [ANWB current energy tariffs](https://www.anwb.nl/energie/actuele-tarieven), [Home Assistant EnergyZero integration](https://www.home-assistant.io/integrations/energyzero/).
+
 ## Format the payload and send it
 
 - Use UTC timestamps ending in `Z`, with an inclusive start and exclusive end. Convert each boundary with its actual offset, including during daylight saving changes.
 - Send final variable prices as JSON numbers in EUR per kWh for electricity and EUR per m³ for gas. If a source reports EUR per MWh for electricity, divide by 1,000. Check which costs are included before adding tax, VAT, or supplier charges. Keep fixed monthly charges out of the payload.
-- Include at least one price per interval. Omit unknown prices. An actual zero or negative price is valid. Gas can have a separate daily interval that overlaps electricity intervals.
+- Include at least one price per interval. Omit unknown prices. An actual zero or negative price is valid. Carry the gas price on the intervals it covers; intervals inside one document may not overlap each other, so a gas day is priced inside the electricity intervals rather than as a separate overlapping interval.
 - If tomorrow's prices are unavailable, send the valid schedule you have and publish an updated schedule once the remaining prices arrive.
 
 Save the following example as `tariffs.json`. Replace the sample dates and prices with the intervals produced by your integration.
@@ -68,11 +106,14 @@ Save the following example as `tariffs.json`. Replace the sample dates and price
       "start": "2026-11-22T12:00:00Z",
       "end": "2026-11-22T12:15:00Z",
       "importPricePerKwh": 0.2474,
-      "exportPricePerKwh": 0.0812
+      "exportPricePerKwh": 0.0812,
+      "gasPricePerM3": 1.234
     },
     {
-      "start": "2026-11-22T05:00:00Z",
-      "end": "2026-11-23T05:00:00Z",
+      "start": "2026-11-22T12:15:00Z",
+      "end": "2026-11-22T12:30:00Z",
+      "importPricePerKwh": 0.2470,
+      "exportPricePerKwh": 0.0712,
       "gasPricePerM3": 1.234
     }
   ]
@@ -81,20 +122,132 @@ Save the following example as `tariffs.json`. Replace the sample dates and price
 
 ### MQTT
 
-Publish the complete available schedule as a retained QoS 1 message to the topic configured on your logger. With hostname `lastlogger` and topic suffix `tariffs`, use `lastlogger/tariffs`. Replace the broker address and apply its authentication or TLS options as required.
+Publish the complete available schedule as a retained QoS 1 message to the topic configured on your logger. The topic is `<top topic>/<client id>/<sub topic>` from the Settings **MQTT** group; with top topic `lastlogger`, no client id and the default sub topic it is `lastlogger/newTariffs`. The current-price endpoint `GET /api/v3/tariffs` reports the effective topic as `mqttTopic`, so it never has to be assembled by hand. Replace the broker address and apply its authentication or TLS options as required.
 
 ```sh
 mosquitto_pub -h mqtt.example.net -q 1 -r \
-  -t lastlogger/tariffs -f tariffs.json
+  -t lastlogger/newTariffs -f tariffs.json
 ```
 
 ### HTTP API
 
-Use the tariff POST endpoint documented for your firmware. The example assumes `/api/v3/tariffs` and the hostname `lastlogger.local`. Add the logger's authentication options if required.
+Send the JSON to `POST /api/v3/newTariffs`. Replace `lastlogger.local` with your logger's address and apply its authentication options if required.
 
 ```sh
 curl --fail-with-body -X POST \
   -H 'Content-Type: application/json' \
   --data-binary @tariffs.json \
-  http://lastlogger.local/api/v3/tariffs
+  http://lastlogger.local/api/v3/newTariffs
+```
+
+## Python and C++ examples
+
+These examples submit an already normalized `tariffs.json` to the logger. Use the supplier sections above to build the file. Run either example from the directory containing the file or pass its path as the second argument. The examples assume a logger on the local network with HTTP enabled.
+
+### Python
+
+Save as `post_tariffs.py`. It uses only the Python standard library.
+
+```python
+import argparse
+import json
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+parser = argparse.ArgumentParser()
+parser.add_argument("logger", help="Logger base URL, e.g. http://lastlogger.local")
+parser.add_argument("file", nargs="?", default="tariffs.json", type=Path)
+args = parser.parse_args()
+
+try:
+    data = args.file.read_bytes()
+    json.loads(data)
+    request = Request(
+        args.logger.rstrip("/") + "/api/v3/newTariffs",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=15) as response:
+        print(f"HTTP {response.status}")
+        print(response.read().decode("utf-8", errors="replace"))
+except HTTPError as error:
+    print(error.read().decode("utf-8", errors="replace"))
+    parser.exit(1, f"HTTP {error.code}\n")
+except (OSError, ValueError, URLError) as error:
+    parser.exit(1, f"{error}\n")
+```
+
+```sh
+python3 post_tariffs.py http://lastlogger.local tariffs.json
+```
+
+### C++ with libcurl
+
+Save as `post_tariffs.cpp`. This desktop example requires a C++ compiler and libcurl development headers.
+
+```cpp
+#include <curl/curl.h>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <string>
+
+int main(int argc, char** argv)
+{
+    if (argc < 2 || argc > 3)
+    {
+        std::cerr << "Usage: post_tariffs LOGGER_BASE_URL [tariffs.json]\n";
+        return 2;
+    }
+
+    std::ifstream file(argc == 3 ? argv[2] : "tariffs.json", std::ios::binary);
+    if (!file)
+    {
+        std::cerr << "Could not open the tariff file.\n";
+        return 1;
+    }
+    const std::string payload{std::istreambuf_iterator<char>(file), {}};
+    std::string url = argv[1];
+    while (!url.empty() && url.back() == '/')
+        url.pop_back();
+    url += "/api/v3/newTariffs";
+
+    CURL* curl = curl_easy_init();
+    if (curl == nullptr)
+        return 1;
+    curl_slist* headers = curl_slist_append(nullptr, "Content-Type: application/json");
+    if (headers == nullptr)
+    {
+        curl_easy_cleanup(curl);
+        return 1;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.data());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
+                     static_cast<curl_off_t>(payload.size()));
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+
+    const CURLcode result = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_cleanup(curl);
+    curl_slist_free_all(headers);
+
+    if (result != CURLE_OK)
+    {
+        std::cerr << curl_easy_strerror(result) << '\n';
+        return 1;
+    }
+    std::cerr << "\nHTTP " << status << '\n';
+    return status >= 200 && status < 300 ? 0 : 1;
+}
+```
+
+```sh
+c++ -std=c++17 post_tariffs.cpp -lcurl -o post_tariffs
+./post_tariffs http://lastlogger.local tariffs.json
 ```

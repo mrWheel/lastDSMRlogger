@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_mqtt.c - MQTT telegram publication and tariff ingestion
-//-- Date: 2026-11-22 · Build: 6
+//-- Date: 2026-11-22 · Build: 7
 //--
 //-- One background task owns the esp_mqtt client and the broadcast cadence.
 //-- It keeps a copy of the relevant settings behind a mutex; the settings
@@ -69,6 +69,7 @@ typedef struct
   char user[LOGGER_MQTT_USER_MAX];
   char password[LOGGER_MQTT_PASSWORD_MAX];
   char topTopic[LOGGER_MQTT_TOPIC_MAX];
+  char clientId[LOGGER_MQTT_CLIENTID_MAX];
   uint32_t intervalSeconds;
   bool publishNow;
 } MqttSettings;
@@ -350,6 +351,10 @@ static esp_err_t startClient(const MqttSettings* source)
   config.broker.address.uri = uri;
   config.credentials.username = (source->user[0] != '\0') ? source->user : NULL;
   config.credentials.authentication.password = (source->user[0] != '\0') ? source->password : NULL;
+
+  //-- The Settings client id identifies this logger on the broker; empty
+  //-- lets the client component generate one.
+  config.credentials.client_id = (source->clientId[0] != '\0') ? source->clientId : NULL;
 
   esp_mqtt_client_handle_t created = esp_mqtt_client_init(&config);
 
@@ -730,12 +735,14 @@ static void mqttTask(void* argument)
     {
       tariffPendingReady = false;
       char reason[160] = "";
-      loggerTariffIngestResult_t outcome =
-          loggerTariffsIngestJson(tariffPendingBuffer, tariffPendingLength, reason, sizeof reason);
+      loggerTariffIngestResult_t outcome = loggerTariffsIngestJson(
+          tariffPendingBuffer, tariffPendingLength, "MQTT", reason, sizeof reason);
 
       if (outcome == LOGGER_TARIFF_OK)
       {
-        ESP_LOGI(tag, "tariff schedule accepted via MQTT (%u bytes)",
+        //-- The tariff store logs the accepted batch with its source, this
+        //-- line only adds the payload size for MQTT debugging.
+        ESP_LOGD(tag, "tariff schedule accepted via MQTT (%u bytes)",
                  (unsigned)tariffPendingLength);
       }
       else
@@ -797,7 +804,8 @@ esp_err_t loggerMqttApplyConfig(const loggerSettingsConfig* config)
   bool reconnect = (strcmp(settings.broker, config->mqttBroker) != 0) ||
                    (settings.port != config->mqttPort) ||
                    (strcmp(settings.user, config->mqttUser) != 0) ||
-                   (strcmp(settings.password, config->mqttPassword) != 0);
+                   (strcmp(settings.password, config->mqttPassword) != 0) ||
+                   (strcmp(settings.clientId, config->mqttClientId) != 0);
 
   MqttSettings updated;
   memset(&updated, 0, sizeof updated);
@@ -806,6 +814,7 @@ esp_err_t loggerMqttApplyConfig(const loggerSettingsConfig* config)
   snprintf(updated.user, sizeof updated.user, "%s", config->mqttUser);
   snprintf(updated.password, sizeof updated.password, "%s", config->mqttPassword);
   snprintf(updated.topTopic, sizeof updated.topTopic, "%s", config->mqttTopTopic);
+  snprintf(updated.clientId, sizeof updated.clientId, "%s", config->mqttClientId);
   updated.intervalSeconds = config->mqttIntervalSeconds;
   updated.publishNow = settings.publishNow;
   settings = updated;

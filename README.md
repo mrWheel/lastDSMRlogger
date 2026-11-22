@@ -1,7 +1,6 @@
 # lastDSMRlogger
 
-Buildnumber: 43
-Last update-date: 2026-11-22
+fileVersion: [44] - 22-11-2026 - 15:30
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -178,8 +177,11 @@ the device.
   version reported by the meter), and M-Bus channels 1–4 with Auto, Disabled
   or an explicit device type. All dropdowns are filled from the valid
   choices the device reports. An **MQTT** group enters the broker IP/URL,
-  broker port, user, password, top topic and broadcast interval (the stored
-  password is never shown by the device: the password field starts empty
+  broker port, user, password, top topic, **Client ID** (the device segment
+  of the tariff topic and the id the broker sees; empty leaves the segment
+  out) and **Sub topic** of the tariff topic (empty selects `newTariffs`)
+  and the broadcast interval (the stored password is never shown by the
+  device: the password field starts empty
   and a save only sends it when the operator typed a new one)
   (0 = no broadcast); a **Network** group enters the hostname and the fixed
   IP (only the last part — empty or 0 means plain DHCP); a **Meter store**
@@ -406,9 +408,9 @@ every save path.
 ### UART0 TX forwarding
 
 Every accepted telegram is also forwarded out on the UART0 TX pin (GPIO43)
-as the exact accepted frame bytes. Every burst sends the frame **twice**
-back to back at 115200 baud and runs in a dedicated low-priority receiver
-task, so the blocking writes never stall reception. Both copies go out
+as the exact accepted frame bytes. Every burst sends the frame
+back at 115200 baud and runs in a dedicated low-priority receiver
+task, so the blocking writes never stall reception. The copie go out
 straight from the retained history slot of the accepted telegram (sized for
 `DSMR_MAX_TELEGRAM_BYTES`, 12 KB — the parser's frame cap): reception is
 suspended for the whole burst, so the slot cannot be evicted while its
@@ -429,7 +431,7 @@ detection skips the overlapping frame whole and the next complete telegram
 is processed normally. Test mode opens no receive UART at all; frames the
 generator produces during a burst are discarded the same way.
 
-Polarity follows the two SPA toggles. During a burst both copies leave the
+Polarity follows the two SPA toggles. During a burst the copy leave the
 pin at the selected *P1 Tx polarity*, and the RXD inversion of the current
 *P1 RX polarity* setting is kept in the mask while it is active. Once TX is
 idle again the TX line returns to the polarity of the current P1 Rx
@@ -439,9 +441,9 @@ confirmed on the wire with `uart_wait_tx_done()` (5 s timeout; a
 maximum-sized copy takes ≈1.5 s); a partial write or timeout skips the
 remaining copies and reception is still restored safely. A settings change
 that arrives mid-burst waits for the burst to finish and applies to the
-next operation, so both copies of one telegram always share one polarity.
+next operation, so the copy of one telegram always share one polarity.
 The console runs on USB-Serial-JTAG and never touches UART0. The console
-reports every burst with `forwarded <n> bytes x 2 on UART0 TX, tx polarity
+reports every burst with `forwarded <n> bytes on UART0 TX, tx polarity
 ..., sent in <ms> ms, free heap <n>`.
 
 At most one forwarding burst happens per five seconds — or per interval when
@@ -586,23 +588,27 @@ path carried its document.
 ```json
 {"schemaVersion":1,"currency":"EUR","intervals":[
   {"start":"2026-12-01T00:00:00Z","end":"2026-12-01T00:15:00Z",
-   "importPricePerKwh":0.235,"exportPricePerKwh":0.08},
+   "importPricePerKwh":0.235,"exportPricePerKwh":0.08,"gasPricePerM3":1.09},
   {"start":"2026-12-01T00:15:00Z","end":"2026-12-01T00:30:00Z",
-   "importPricePerKwh":-0.042}
+   "importPricePerKwh":-0.042,"gasPricePerM3":1.09}
 ]}
 ```
 
 - `schemaVersion` must be `1`; `currency` is a three-letter code.
 - Timestamps are exactly `YYYY-MM-DDTHH:MM:SSZ` in **UTC**. `start` is
   inclusive, `end` exclusive; any positive duration is allowed (quarter
-  hours, hours, a whole day — whatever the feed delivers).
-- `importPricePerKwh` is required and finite; **zero and negative prices
-  are valid** (negative spot prices happen). `exportPricePerKwh` is
-  optional and a missing or `null` export price means **unknown, never
-  zero**.
-- Prices are per kWh in the document currency, taken as submitted:
-  whether VAT and taxes are included is the feed's choice and should be
-  documented by the publisher (the logger only echoes the currency).
+  hours, hours, a whole day — whatever the feed delivers; a gas day may
+  span many electricity quarter-hours).
+- Each interval carries at least one of `importPricePerKwh`,
+  `exportPricePerKwh` and `gasPricePerM3`; every submitted price is a
+  finite number and **zero and negative prices are valid** (negative spot
+  prices happen). A missing or `null` price means **unknown, never zero**.
+  A dynamic tariff is one price that always applies — there is no
+  normal/off-peak distinction.
+- Electricity prices are per kWh and the gas price per m³, in the document
+  currency, taken as submitted: whether VAT and taxes are included is the
+  feed's choice and should be documented by the publisher (the logger only
+  echoes the currency).
 
 **Validation is all-or-nothing.** A batch failing any check is refused
 whole, the reply and the log carry the reason, and the stored schedule
@@ -614,11 +620,13 @@ outside the submitted batch keep standing, so history survives partial
 updates.
 
 **MQTT input.** The device subscribes (QoS 1) to
-`<top topic>/<deviceId>/tariffs/electricity` whenever a broker is
-configured and the station has joined; the top topic is the Settings value
-(empty selects `lastdsmrlogger`) and `<deviceId>` is the factory MAC in
-lowercase hex. The effective topic is reported by the current-price
-endpoint, so it never has to be assembled by hand. Large documents are
+`<top topic>/<client id>/<sub topic>` whenever a broker is configured and
+the station has joined; all three segments come from the Settings **MQTT**
+group — the top topic (empty selects `lastdsmrlogger`), the **Client ID**
+(the device segment; while empty the segment is left out, and the same id
+is what the broker sees when the client connects) and the **Sub topic**
+(empty selects `newTariffs`). The effective topic is reported by the
+current-price endpoint, so it never has to be assembled by hand. Large documents are
 reassembled from MQTT fragments before validation; oversized or malformed
 payloads are dropped with a log line naming the reason. **Publish
 retained** (`-r`) and the device recovers the last schedule on every boot
@@ -628,15 +636,15 @@ or overlapping redelivery of the same document is a no-op.
 
 ```
 mosquitto_pub -h <broker> -p 1883 -q 1 -r \
-  -t 'lastdsmrlogger/1cdbd4a27714/tariffs/electricity' \
+  -t 'lastdsmrlogger/newTariffs' \
   -s < batch.json
 ```
 
-**HTTP API** (same document on the `POST`, route `/api/v3/tariffs`):
+**HTTP API** (same document on the `POST`, route `/api/v3/newTariffs`):
 
 ```
 curl -s -X POST -H 'Content-Type: application/json' \
-  --data-binary @batch.json http://<device>/api/v3/tariffs
+  --data-binary @batch.json http://<device>/api/v3/newTariffs
 # -> {"ok":true,"storedIntervals":192,"currency":"EUR"}
 #    400 (or 500 for store problems) with {"ok":false,"reason":"…"} on refusal
 
@@ -667,11 +675,13 @@ covered seconds — unknown stays unknown.
 **Stored tariff amounts.** With the **Dynamic Tariffs** switch on (Settings
 view, **Tariffs** group) the meter store values every ring record from the
 table instead of the fictional demo amounts: each minute of energy
-consumed in tariff 1 or tariff 2 is priced with the import price the table
-holds for that instant, and periods the table does not cover fall back to
-the manual **Tariff 1 (kWh)** and **Tariff 2 (kWh)** prices. Gas always
-carries the manual **Tariff Gas (m3)** price — the electricity table has no
-gas price. With the switch off all three amounts use the manual prices. The
+consumed in tariff 1 or tariff 2 is priced with the single import price the
+table holds for that instant (a dynamic tariff has no normal/off-peak
+distinction), and periods the table does not cover fall back to the manual
+**Tariff 1 (kWh)** and **Tariff 2 (kWh)** prices. Gas is priced with the
+**gasPricePerM3** the table holds for that instant when it carries one, and
+with the manual **Tariff Gas (m3)** price otherwise. With the switch off
+all three amounts use the manual prices. The
 amounts accumulate inside the current period and restart when a new period
 opens (or after a reboot, when the staged record is rewritten anyway);
 counter jumps (a meter replacement, or a meter that never published a

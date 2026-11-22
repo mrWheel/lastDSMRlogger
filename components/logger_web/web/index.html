@@ -90,8 +90,8 @@
         </fieldset>
 
         <!-- MQTT and Network groups: iOS Settings style list rows (one row
-             per field, label left, borderless right aligned value, hairline
-             separators; see the .iosGroup rules in style.css). -->
+             per field, label left, gray filled input, hairline separators;
+             see the .iosGroup rules in style.css). -->
         <fieldset class="iosGroup">
           <legend>MQTT</legend>
           <div class="iosRow">
@@ -119,6 +119,22 @@
             <label for="inpMqttTopic">Top topic</label>
             <input id="inpMqttTopic" type="text" maxlength="63" autocomplete="off"
                    placeholder="lastdsmrlogger">
+          </div>
+
+          <!-- The tariff topic is <top topic>/<client id>/<sub topic>: the
+               client id segment is left out while the field is empty, and a
+               blank sub topic means newTariffs. The client id is also what
+               the broker sees for this device. -->
+          <div class="iosRow">
+            <label for="inpMqttClientId">Client ID</label>
+            <input id="inpMqttClientId" type="text" maxlength="63" autocomplete="off"
+                   placeholder="empty = no device segment">
+          </div>
+
+          <div class="iosRow">
+            <label for="inpMqttSubTopic">Sub topic</label>
+            <input id="inpMqttSubTopic" type="text" maxlength="63" autocomplete="off"
+                   placeholder="newTariffs">
           </div>
 
           <div class="iosRow">
@@ -154,9 +170,10 @@
         </fieldset>
 
         <!-- Tariffs group: with Dynamic Tariffs on the stored tariff
-             amounts come from the dynamic tariff table; periods the table
-             does not price fall back to the manual prices below (gas always
-             uses its manual price: the electricity table has no gas price). -->
+             amounts come from the dynamic tariff table (one price that
+             always applies, gas included when the table carries one);
+             periods or prices the table does not carry fall back to the
+             manual prices below. -->
         <fieldset class="iosGroup">
           <legend>Tariffs</legend>
           <div class="iosRow">

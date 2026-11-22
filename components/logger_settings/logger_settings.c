@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.c - versioned settings service
-//-- Date: 2026-11-22 · Build: 7
+//-- Date: 2026-11-22 · Build: 8
 //--
 //-- The complete configuration is stored as one versioned blob so a save is
 //-- atomic. A stored blob that fails validation is treated as absent: the
@@ -68,6 +68,37 @@ typedef struct
   char hostname[LOGGER_HOSTNAME_MAX];
   uint8_t fixedIpLastOctet;
 } loggerSettingsConfigPreTariff;
+
+//-- Layout of the stored blob before the MQTT client id and the tariff
+//-- topic sub topic were appended. A stored blob of exactly this size
+//-- migrates like the two above: its fields land in the identical prefix
+//-- of the current struct and the appended fields get their defaults.
+typedef struct
+{
+  uint32_t structVersion;
+  int rxGpio;
+  bool rxInverted;
+  bool txInverted;
+  uint32_t intervalSeconds;
+  char countryCode[LOGGER_SETTINGS_COUNTRY_MAX];
+  char profileId[LOGGER_SETTINGS_PROFILE_ID_MAX];
+  loggerMbusMode mbusMode[DSMR_MBUS_CHANNEL_MAX + 1];
+  dsmrMbusDeviceType mbusType[DSMR_MBUS_CHANNEL_MAX + 1];
+  bool displayFlipped;
+  char mqttBroker[LOGGER_MQTT_BROKER_MAX];
+  uint16_t mqttPort;
+  char mqttUser[LOGGER_MQTT_USER_MAX];
+  char mqttPassword[LOGGER_MQTT_PASSWORD_MAX];
+  char mqttTopTopic[LOGGER_MQTT_TOPIC_MAX];
+  uint32_t mqttIntervalSeconds;
+  char hostname[LOGGER_HOSTNAME_MAX];
+  uint8_t fixedIpLastOctet;
+  uint16_t rfsSyncIntervalMinutes;
+  float tariff1PricePerKwh;
+  float tariff2PricePerKwh;
+  float tariffGasPricePerM3;
+  bool dynamicTariffsEnabled;
+} loggerSettingsConfigPreTopic;
 
 //-- Human readable protocol version labels for the built-in profiles. The
 //-- stable profile identifier is what gets persisted.
@@ -298,6 +329,20 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
     return false;
   }
 
+  //-- The client id is broker-facing printable ASCII; the tariff sub topic
+  //-- is a topic segment and shares the top topic's wildcard exclusion.
+  if (!plainTextOk(config->mqttClientId))
+  {
+    ESP_LOGW(tag, "rejecting MQTT client id text");
+    return false;
+  }
+
+  if (!plainTextOk(config->mqttSubTopic) || (strpbrk(config->mqttSubTopic, "+#$") != NULL))
+  {
+    ESP_LOGW(tag, "rejecting tariff sub topic text");
+    return false;
+  }
+
   if (config->mqttIntervalSeconds > LOGGER_SETTINGS_MQTT_INTERVAL_MAX_S)
   {
     ESP_LOGW(tag, "rejecting MQTT interval %u s: above %u s", (unsigned)config->mqttIntervalSeconds,
@@ -374,14 +419,15 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
   size_t blobSize = 0u;
   result = nvs_get_blob(handle, NVS_KEY_CONFIG, NULL, &blobSize);
 
-  //-- A blob of the current size is read as-is; a blob of either earlier
+  //-- A blob of the current size is read as-is; a blob of any earlier
   //-- size migrates (the appended fields get their defaults below). Anything
   //-- else cannot be trusted.
   bool migrated = (blobSize == sizeof(loggerSettingsConfigV5));
   bool migratedTariff = (blobSize == sizeof(loggerSettingsConfigPreTariff));
+  bool migratedTopic = (blobSize == sizeof(loggerSettingsConfigPreTopic));
 
-  if ((result != ESP_OK) ||
-      ((blobSize != sizeof(loggerSettingsConfig)) && !migrated && !migratedTariff))
+  if ((result != ESP_OK) || ((blobSize != sizeof(loggerSettingsConfig)) && !migrated &&
+                             !migratedTariff && !migratedTopic))
   {
     nvs_close(handle);
 
@@ -415,6 +461,10 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
     {
       ESP_LOGI(tag, "stored settings migrated: store and tariff fields take their defaults");
     }
+  }
+  else if (migratedTopic && (result == ESP_OK))
+  {
+    ESP_LOGI(tag, "stored settings migrated: the tariff topic fields take their defaults");
   }
 
   if (result != ESP_OK)

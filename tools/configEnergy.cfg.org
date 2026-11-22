@@ -1,9 +1,13 @@
+#
+# Rename this file to configEnergy.cfg
+#
 [mqtt]
 # Address of the MQTT broker that lastDSMRlogger subscribes to.
 host = YOUR_MQTT_BROKER
 port = 1883
 username =
 password =
+clientId =
 tls = false
 # Optional PEM CA file, relative to this config file or an absolute path.
 ca_file =
@@ -15,6 +19,11 @@ hostname = lastdsmrlogger
 # Set the complete topic here if the logger uses a different prefix or device ID.
 topic = subTopic
 
-
+[tariffs]
+import_surcharge_kwh = 0
+energy_tax_kwh = 0
+gas_surcharge_m3 = 0
+energy_tax_m3 = 0
+export_surcharge_kwh = 0
 
 

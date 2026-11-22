@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-22 · Build: 23
+//-- Date: 2026-11-22 · Build: 24
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -663,6 +663,10 @@ static void appendSettingsJson(stringBuilder* sb, const loggerSettingsConfig* co
   //-- applySettingsFromForm).
   sbAppend(sb, ",\"mqttTopTopic\":");
   sbAppendJsonString(sb, config->mqttTopTopic);
+  sbAppend(sb, ",\"mqttClientId\":");
+  sbAppendJsonString(sb, config->mqttClientId);
+  sbAppend(sb, ",\"mqttSubTopic\":");
+  sbAppendJsonString(sb, config->mqttSubTopic);
   sbAppendFmt(sb, ",\"mqttIntervalSeconds\":%" PRIu32, config->mqttIntervalSeconds);
   sbAppend(sb, ",\"hostname\":");
   sbAppendJsonString(sb, config->hostname);
@@ -1014,6 +1018,18 @@ static const char* applySettingsFromForm(const char* body)
   if (formGet(body, "mqttTopTopic", text, sizeof text))
   {
     copyTrimmed(candidate.mqttTopTopic, sizeof candidate.mqttTopTopic, text);
+  }
+
+  //-- The MQTT client id (broker identity and optional tariff topic
+  //-- segment) and the tariff sub topic (default newTariffs when blank).
+  if (formGet(body, "mqttClientId", text, sizeof text))
+  {
+    copyTrimmed(candidate.mqttClientId, sizeof candidate.mqttClientId, text);
+  }
+
+  if (formGet(body, "mqttSubTopic", text, sizeof text))
+  {
+    copyTrimmed(candidate.mqttSubTopic, sizeof candidate.mqttSubTopic, text);
   }
 
   //-- The broker port is clamped like the read interval: an unusable value
@@ -2085,11 +2101,12 @@ static esp_err_t handleViewReport(httpd_req_t* req)
 //-- v3 API: dynamic electricity tariffs
 //-- ------------------------------------------------------------------------
 
-//-- Room for the largest aggregated answer: the bucket bound at the widest
-//-- bucket framing. The document is far too big for the internal heap, so
-//-- the query buffer is asked of PSRAM (it lives in the same PSRAM as the
-//-- tariff store itself).
-#define WEB_TARIFF_QUERY_JSON_BYTES (256u * 1024u)
+//-- Room for the largest answer: the raw bound at the widest record
+//-- framing (three optional prices plus timestamps) and the bucket bound at
+//-- the widest bucket framing. The document is far too big for the internal
+//-- heap, so the query buffer is asked of PSRAM (it lives in the same PSRAM
+//-- as the tariff store itself).
+#define WEB_TARIFF_QUERY_JSON_BYTES (384u * 1024u)
 
 //-- A raw answer never lists more stored intervals than this: a caller
 //-- wanting more must narrow the range.
@@ -2126,12 +2143,33 @@ static bool tariffRawVisitor(const loggerTariffInterval* interval, void* userDat
   sbAppendJsonString(emit->sb, start);
   sbAppend(emit->sb, ",\"end\":");
   sbAppendJsonString(emit->sb, end);
-  sbAppendFmt(emit->sb, ",\"importPricePerKwh\":%.6f", (double)interval->importPricePerKwh);
+  sbAppend(emit->sb, ",\"importPricePerKwh\":");
+
+  if (interval->hasImport)
+  {
+    sbAppendFmt(emit->sb, "%.6f", (double)interval->importPricePerKwh);
+  }
+  else
+  {
+    sbAppend(emit->sb, "null");
+  }
+
   sbAppend(emit->sb, ",\"exportPricePerKwh\":");
 
   if (interval->hasExport)
   {
     sbAppendFmt(emit->sb, "%.6f", (double)interval->exportPricePerKwh);
+  }
+  else
+  {
+    sbAppend(emit->sb, "null");
+  }
+
+  sbAppend(emit->sb, ",\"gasPricePerM3\":");
+
+  if (interval->hasGas)
+  {
+    sbAppendFmt(emit->sb, "%.6f", (double)interval->gasPricePerM3);
   }
   else
   {
@@ -2235,12 +2273,33 @@ static esp_err_t handleTariffsCurrentGet(httpd_req_t* req)
     sbAppendJsonString(&sb, start);
     sbAppend(&sb, ",\"end\":");
     sbAppendJsonString(&sb, end);
-    sbAppendFmt(&sb, ",\"importPricePerKwh\":%.6f", (double)active.importPricePerKwh);
+    sbAppend(&sb, ",\"importPricePerKwh\":");
+
+    if (active.hasImport)
+    {
+      sbAppendFmt(&sb, "%.6f", (double)active.importPricePerKwh);
+    }
+    else
+    {
+      sbAppend(&sb, "null");
+    }
+
     sbAppend(&sb, ",\"exportPricePerKwh\":");
 
     if (active.hasExport)
     {
       sbAppendFmt(&sb, "%.6f", (double)active.exportPricePerKwh);
+    }
+    else
+    {
+      sbAppend(&sb, "null");
+    }
+
+    sbAppend(&sb, ",\"gasPricePerM3\":");
+
+    if (active.hasGas)
+    {
+      sbAppendFmt(&sb, "%.6f", (double)active.gasPricePerM3);
     }
     else
     {
@@ -2421,7 +2480,7 @@ static esp_err_t handleTariffsElectricityPost(httpd_req_t* req)
 
   char reason[120] = "";
   loggerTariffIngestResult_t result =
-      loggerTariffsIngestJson(body, (size_t)contentLength, reason, sizeof reason);
+      loggerTariffsIngestJson(body, (size_t)contentLength, "HTTP API", reason, sizeof reason);
   free(body);
 
   if (result == LOGGER_TARIFF_OK)
@@ -2499,8 +2558,8 @@ static const ApiV3Entry apiV3Entries[] = {
      "the active electricity tariff interval (or an explicit unavailable report)"},
     {"GET", "/api/v3/tariffs?from=<utc>&to=<utc>&resolution=<raw|hour|day|month>",
      "stored intervals or time-weighted price averages for the UTC range"},
-    {"POST", "/api/v3/tariffs",
-     "accept the shared tariff schedule JSON document (same format as the MQTT topic)"},
+    {"POST", "/api/v3/newTariffs",
+     "accept the shared newTariff schedule JSON document (same format as the MQTT topic)"},
 };
 
 static esp_err_t handleApiV3IndexGet(httpd_req_t* req)
@@ -3556,7 +3615,7 @@ esp_err_t loggerWebStart(void)
   //-- aggregated walk of the stored ones (README: Dynamic electricity
   //-- tariffs).
   registerUri(server, "/api/v3/tariffs", HTTP_GET, false, handleTariffsElectricityGet);
-  registerUri(server, "/api/v3/tariffs", HTTP_POST, false, handleTariffsElectricityPost);
+  registerUri(server, "/api/v3/newTariffs", HTTP_POST, false, handleTariffsElectricityPost);
 
   registerUri(server, "/ws", HTTP_GET, true, handleWebSocket);
 

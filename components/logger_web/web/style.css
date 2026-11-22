@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-22 · Build: 25 */
+   Date: 2026-11-22 · Build: 26 */
 
 :root
 {
@@ -474,6 +474,9 @@ fieldset.iosGroup legend
   color: var(--fg);
 }
 
+/* Every settings field shares one look: gray filled, rounded, bordered —
+   the same treatment as the Interval field and the dropdowns (the iOS list
+   rows used to render borderless right aligned values; one style won). */
 .iosRow > input
 {
   flex: 1 1 auto;
@@ -482,11 +485,18 @@ fieldset.iosGroup legend
   font-size: 0.92rem;
   font-variant-numeric: tabular-nums;
   color: var(--fg);
-  background: transparent;
-  border: none;
-  padding: 2px 0;
-  text-align: right;
+  background-color: var(--controlFill);
+  border: 1px solid var(--separator);
+  border-radius: 9px;
+  padding: 9px 12px;
+  text-align: left;
   caret-color: var(--accent);
+  transition: border-color 0.15s ease;
+}
+
+.iosRow > input:hover
+{
+  border-color: var(--hairline);
 }
 
 .iosRow > input::placeholder
@@ -513,6 +523,9 @@ fieldset.iosGroup legend
   width: 22px;
   height: 22px;
   margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
   accent-color: var(--accent);
 }
 
