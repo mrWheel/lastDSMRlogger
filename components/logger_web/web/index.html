@@ -358,11 +358,16 @@
       </div>
       <!-- The table presentation of the same frame: one row per retained
            period, newest first, with the per-period used/returned kWh and
-           gas m³ the bars are drawn from. Rows are built by app.js. -->
+           gas m³ the bars are drawn from, plus the row's own money
+           columns: Used (€), Returned (€) and Gas (€) (the quantities
+           against the tariffs the ring stores) and Total (€) (used minus
+           the returned export credit plus gas plus the prorated network
+           amount) — every figure stands on its own row, the table never
+           carries a summed total row. Rows are built by app.js. -->
       <div class="tableWrap" id="hoursGraphTableWrap" hidden>
         <table id="hoursGraphTable">
           <thead>
-            <tr><th>Period</th><th class="valueNumeric">Used (kWh)</th><th class="valueNumeric">Returned (kWh)</th><th class="valueNumeric">Gas (m³)</th></tr>
+            <tr><th>Period</th><th class="valueNumeric">Used (kWh)</th><th class="valueNumeric">Returned (kWh)</th><th class="valueNumeric">Gas (m³)</th><th class="valueNumeric">Used (€)</th><th class="valueNumeric">Returned (€)</th><th class="valueNumeric">Gas (€)</th><th class="valueNumeric">Total (€)</th></tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -392,11 +397,16 @@
       </div>
       <!-- The table presentation of the same frame: one row per retained
            period, newest first, with the per-period used/returned kWh and
-           gas m³ the bars are drawn from. Rows are built by app.js. -->
+           gas m³ the bars are drawn from, plus the row's own money
+           columns: Used (€), Returned (€) and Gas (€) (the quantities
+           against the tariffs the ring stores) and Total (€) (used minus
+           the returned export credit plus gas plus the prorated network
+           amount) — every figure stands on its own row, the table never
+           carries a summed total row. Rows are built by app.js. -->
       <div class="tableWrap" id="daysGraphTableWrap" hidden>
         <table id="daysGraphTable">
           <thead>
-            <tr><th>Period</th><th class="valueNumeric">Used (kWh)</th><th class="valueNumeric">Returned (kWh)</th><th class="valueNumeric">Gas (m³)</th></tr>
+            <tr><th>Period</th><th class="valueNumeric">Used (kWh)</th><th class="valueNumeric">Returned (kWh)</th><th class="valueNumeric">Gas (m³)</th><th class="valueNumeric">Used (€)</th><th class="valueNumeric">Returned (€)</th><th class="valueNumeric">Gas (€)</th><th class="valueNumeric">Total (€)</th></tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -462,7 +472,8 @@
            the ring stores — the electricity amount (the used kWh times the
            import tariff, what the used energy costs), the export amount
            (the returned kWh times the export tariff, the credit the
-           delivered-back energy earns, subtracted in the total), the gas
+           delivered-back energy earns, subtracted in the total by the
+           shared periodCostsOf), the gas
            amount (the gas m³ times the gas tariff) and the
            network and transport amount the ring stores with the record —
            the Settings month amount as saved when the record was written

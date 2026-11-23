@@ -1766,7 +1766,9 @@ function renderRingFileList(message)
 // is interpreted. The toolbar radio group picks the presentation (see
 // showPeriodGraphView): Graph draws the canvas above, Table lists the very
 // same per-period amounts as a newest-first table (period, used kWh,
-// returned kWh and gas m³), built by renderPeriodGraphTable from the
+// returned kWh and gas m³, plus the row's own Used (€), Returned (€),
+// Gas (€) and Total (€) money columns — per row, never a summed row),
+// built by renderPeriodGraphTable from the
 // cached frame — like the old DSMRlogger32 history tables. The months
 // view's Table is the two-year comparison of the old history page
 // (assets/oldMonthsTabel.png): the drawn twelve months, newest on top,
@@ -1775,7 +1777,8 @@ function renderRingFileList(message)
 // month's money amounts in the same paired layout (assets/
 // oldMonthsCosts.png): Electra (the used kWh times the import tariff the
 // ring stores), Export (the returned kWh times the export tariff, a credit
-// subtracted in the total), Gas (the gas m³ times the gas tariff), Netw.
+// the shared periodCostsOf subtracts in the total), Gas (the gas m³ times
+// the gas tariff), Netw.
 // (the network amount the ring stores with the record) and the Total, with an
 // Advance row of each half's total sum over twelve (the old page's
 // Voorschot Bedrag).
@@ -1994,9 +1997,15 @@ function periodGraphTableLabel(ring, key)
 // The table presentation of the Hours and Days views: one row per
 // retained period, newest first (the frame arrives oldest first, so the
 // cached array is walked reversed), carrying the same per-period amounts
-// the bars are drawn from. The months view's table is the two-year
-// comparison built by renderMonthsCompareTable. Rows are built with
-// textContent only.
+// the bars are drawn from plus the row's own four money columns: Used
+// (€) (the used kWh against the import tariff), Returned (€) (the
+// returned kWh against the export tariff, a positive compensation),
+// Gas (€) (the gas m³ against the gas tariff) and Total (€) (used minus
+// the returned credit plus gas plus the prorated network amount the ring
+// stores with the record). Every figure stands
+// on its own row; no row sums the table. The months view's table is the
+// two-year comparison built by renderMonthsCompareTable. Rows are built
+// with textContent only.
 function renderPeriodGraphTable(viewId)
 {
   if (viewId === "monthsGraph")
@@ -2011,11 +2020,24 @@ function renderPeriodGraphTable(viewId)
 
   periodGraphs[viewId].records.slice().reverse().forEach((record) =>
   {
+    //-- The row's money amounts from the shared periodCostsOf — the very
+    // same formula the months Costs table prints (the used kWh against
+    // the import tariff, the returned kWh against the export tariff as a
+    // positive credit the total nets, the gas m³ against the gas tariff
+    // and the period's prorated network share; total used minus returned
+    // plus gas plus network). A dash prints only when the record carries
+    // none of the four figures.
+    const costs = periodCostsOf(record);
+
     const cells = [
       periodGraphTableLabel(config.ring, record.key),
       (typeof record.used === "number") ? record.used.toFixed(3) : "-",
       (typeof record.returned === "number") ? record.returned.toFixed(3) : "-",
       (typeof record.gas === "number") ? record.gas.toFixed(3) : "-",
+      graphCellNumber(costs.electra, 2),
+      graphCellNumber(costs.exported, 2),
+      graphCellNumber(costs.gas, 2),
+      graphCellNumber(costs.total, 2),
     ];
 
     appendGraphTableRow(tbody, cells);
@@ -2474,9 +2496,10 @@ function monthsElectraEuro(record)
 
 // The month's export credit in EUR: the returned kWh times the export
 // tariff the ring stores under the te rubric (what the delivered-back
-// energy earns), or null when the record carries neither figure. The Costs
-// presentation prints it as its own column and subtracts it in the month's
-// total.
+// energy earns — the net compensation per delivered-back kWh, a positive
+// figure), or null when the record carries neither figure. The Costs
+// presentations print it as its own column and periodCostsOf nets it as
+// a credit in the total.
 function monthsExportEuro(record)
 {
   return monthsProductEuro(record.returned, record.te);
@@ -2491,6 +2514,37 @@ function monthsNetworkCostsEuro(record)
   return ((typeof record.nc === "number") && Number.isFinite(record.nc)) ? record.nc : null;
 }
 
+// The single money formula every period view shares (the months Costs
+// table and the Hours and Days tables' four amount columns alike): the
+// used kWh against the import tariff (electra), the returned kWh against
+// the export tariff (exported — the net compensation per delivered-back
+// kWh, a positive figure), the gas m³ against the gas tariff (gas) and
+// the period's prorated network share the ring stores with the record
+// (netw). The total nets the export credit from the costs, exactly the
+// rule dynamicPricing.md documents for the Costs presentations: used
+// minus returned plus gas plus network. All five fields are null when
+// the record carries none of the figures.
+function periodCostsOf(record)
+{
+  const electra = monthsElectraEuro(record);
+  const exported = monthsExportEuro(record);
+  const gas = monthsProductEuro(record.gas, record.tG);
+  const netw = monthsNetworkCostsEuro(record);
+
+  if ((electra === null) && (exported === null) && (gas === null) && (netw === null))
+  {
+    return {electra: null, exported: null, gas: null, netw: null, total: null};
+  }
+
+  return {
+    electra: electra,
+    exported: exported,
+    gas: gas,
+    netw: netw,
+    total: (electra || 0) - (exported || 0) + (gas || 0) + (netw || 0)
+  };
+}
+
 // The months view's Costs presentation (the old DSMRlogger32 history
 // page, assets/oldMonthsCosts.png): per drawn month the money amounts,
 // each the period's quantity times the tariff the ring stores — Electra
@@ -2499,7 +2553,9 @@ function monthsNetworkCostsEuro(record)
 // delivered-back energy earns), Gas (the gas m³ times the gas tariff),
 // Netw. (the network and transport amount the ring stores with the record,
 // the Settings month amount as it was when the record was written) and
-// their Total (Electra minus Export plus Gas plus Netw.) —
+// their Total (Electra minus Export plus Gas plus Netw. from the shared
+// periodCostsOf — the export amount is a positive compensation the total
+// nets as a credit) —
 // each month paired with the same month one year back, the ring partner
 // supplying the right half. A month the ring does not retain
 // shows dashes. The Advance row prints each half's advance payment: that
@@ -2512,27 +2568,6 @@ function renderMonthsCostsTable()
 
   const records = periodGraphs.monthsGraph.records;
   const drawn = periodGraphWindow("monthsGraph", records).slice().reverse();
-
-  const costsOf = (record) =>
-  {
-    const electra = monthsElectraEuro(record);
-    const exported = monthsExportEuro(record);
-    const gas = monthsProductEuro(record.gas, record.tG);
-    const netw = monthsNetworkCostsEuro(record);
-
-    if ((electra === null) && (exported === null) && (gas === null) && (netw === null))
-    {
-      return {electra: null, exported: null, gas: null, netw: null, total: null};
-    }
-
-    return {
-      electra: electra,
-      exported: exported,
-      gas: gas,
-      netw: netw,
-      total: (electra || 0) - (exported || 0) + (gas || 0) + (netw || 0)
-    };
-  };
 
   let columnTotal = 0;
   let columnTotalYearAgo = 0;
@@ -2548,9 +2583,9 @@ function renderMonthsCostsTable()
     }
 
     const previous = periodYearAgoRecordByKey(records, record.key);
-    const costs = costsOf(record);
+    const costs = periodCostsOf(record);
     const yearAgo = previous
-        ? costsOf(previous)
+        ? periodCostsOf(previous)
         : {electra: null, exported: null, gas: null, netw: null, total: null};
 
     columnTotal += costs.total || 0;
