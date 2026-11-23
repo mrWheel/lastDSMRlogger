@@ -1772,9 +1772,10 @@ function renderRingFileList(message)
 // each row pairing every amount with the same month one year back and
 // closing with Total and Balance rows. Its third option Costs lists the
 // month's money amounts in the same paired layout (assets/
-// oldMonthsCosts.png): Electra (the ring's import amount), Export (the
-// ring's export amount, a credit subtracted in the total), Gas, the fixed
-// monthly Netw. fee from Settings and the Total, with an
+// oldMonthsCosts.png): Electra (the used kWh times the import tariff the
+// ring stores), Export (the returned kWh times the export tariff, a credit
+// subtracted in the total), Gas (the gas m³ times the gas tariff), the
+// fixed monthly Netw. fee from Settings and the Total, with an
 // Advance row of each half's total sum over twelve (the old page's
 // Voorschot Bedrag).
 
@@ -2450,21 +2451,34 @@ function renderMonthsCompareTable()
   ], true);
 }
 
-// The month's Electra amount in EUR: the import amount the ring stores for
-// the used energy (what the grid delivered to the home), or null when the
-// record carries none.
-function monthsElectraEuro(record)
+// One Costs money column: the period's quantity times the tariff the ring
+// stores for that direction (kWh against the EUR/kWh tariff, gas m³ against
+// the EUR/m³ tariff) — the amount the month's energy costs or earns. Null
+// when either figure is missing, so the row prints dashes instead of
+// inventing a figure.
+function monthsProductEuro(quantity, tariff)
 {
-  return ((typeof record.ti === "number") && Number.isFinite(record.ti)) ? record.ti : null;
+  const isFigure = (value) => ((typeof value === "number") && Number.isFinite(value));
+
+  return (isFigure(quantity) && isFigure(tariff)) ? quantity * tariff : null;
 }
 
-// The month's export credit in EUR: the export amount the ring stores for
-// the energy delivered back to the grid, or null when the record carries
-// none. The Costs presentation prints it as its own column and subtracts
-// it in the month's total.
+// The month's Electra amount in EUR: the used kWh times the import tariff
+// the ring stores under the ti rubric (what the grid delivered to the home
+// costs), or null when the record carries neither figure.
+function monthsElectraEuro(record)
+{
+  return monthsProductEuro(record.used, record.ti);
+}
+
+// The month's export credit in EUR: the returned kWh times the export
+// tariff the ring stores under the te rubric (what the delivered-back
+// energy earns), or null when the record carries neither figure. The Costs
+// presentation prints it as its own column and subtracts it in the month's
+// total.
 function monthsExportEuro(record)
 {
-  return ((typeof record.te === "number") && Number.isFinite(record.te)) ? record.te : null;
+  return monthsProductEuro(record.returned, record.te);
 }
 
 // The fixed monthly network and transport amount stored in Settings (the
@@ -2478,10 +2492,12 @@ function monthsNetworkCostsEuro()
 }
 
 // The months view's Costs presentation (the old DSMRlogger32 history
-// page, assets/oldMonthsCosts.png): per drawn month the money amounts —
-// Electra (the ring's import amount, what the used energy costs), Export
-// (the ring's export amount, the credit the delivered-back energy earns),
-// Gas (the gas tariff amount), Netw. (the fixed monthly network fee from
+// page, assets/oldMonthsCosts.png): per drawn month the money amounts,
+// each the period's quantity times the tariff the ring stores — Electra
+// (the used kWh times the import tariff, what the used energy costs),
+// Export (the returned kWh times the export tariff, the credit the
+// delivered-back energy earns), Gas (the gas m³ times the gas tariff),
+// Netw. (the fixed monthly network fee from
 // Settings) and their Total (Electra minus Export plus Gas plus Netw.) —
 // each month paired with the same month one year back, the ring partner
 // supplying the right half. A month the ring does not retain
@@ -2501,7 +2517,7 @@ function renderMonthsCostsTable()
   {
     const electra = monthsElectraEuro(record);
     const exported = monthsExportEuro(record);
-    const gas = ((typeof record.tG === "number") && Number.isFinite(record.tG)) ? record.tG : null;
+    const gas = monthsProductEuro(record.gas, record.tG);
 
     if ((electra === null) && (exported === null) && (gas === null))
     {

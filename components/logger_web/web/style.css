@@ -1131,6 +1131,47 @@ footer
   border-top: 1px solid var(--hairline);
 }
 
+/* The months comparison and Costs tables are never scrolled: every column
+   stays visible inside the card. The tables spread over the full card
+   width with a fixed layout (the twelve value columns and the month
+   column share it equally), the digits ride a reduced size and padding
+   that follows the viewport width, the headers and the Advance labels
+   wrap over two lines instead of widening the table, and what a very
+   narrow screen still cannot show clips inside its own cell. */
+#monthsGraphTable,
+#monthsGraphCostsTable
+{
+  table-layout: fixed;
+}
+
+#monthsGraphTable th,
+#monthsGraphTable td,
+#monthsGraphCostsTable th,
+#monthsGraphCostsTable td
+{
+  padding: 6px 3px;
+  font-size: clamp(0.62rem, 1.1vw, 0.78rem);
+  overflow: hidden;
+}
+
+#monthsGraphTable thead th,
+#monthsGraphCostsTable thead th,
+#monthsGraphTable tr.tableFooterRow td,
+#monthsGraphCostsTable tr.tableFooterRow td
+{
+  white-space: normal;
+}
+
+/* The fixed layout spreads the first header row's cells equally, so the
+   month column claims a quarter of the comparison table next to the
+   three group headers. Its tenth is enough for the longest month name;
+   the three groups then share the rest and their two-year value columns
+   keep the room the digits need. */
+#monthsGraphTable thead th:first-child
+{
+  width: 10%;
+}
+
 /* --------------------------------------------------------------------------
    Tariffs view: the table of the stored dynamic tariff schedule (only the
    intervals in use now or coming up; see refreshTariffs in app.js). The
