@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.c - hour, day and month smart meter ring file store
-//-- Date: 2026-11-23 · Build: 13
+//-- Date: 2026-11-23 · Build: 14
 //--
 //-- The store task owns all ring_file_store work: it mounts the LittleFS
 //-- storage partition, removes the ring file of the retired minute store,
@@ -963,9 +963,34 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
         break;
       }
 
+      uint8_t mappedColumns = 0u;
+
       for (uint8_t index = 1u; index < columnCount; index++)
       {
         fieldOfColumn[index] = importFieldForColumn(fields[index]);
+
+        if (fieldOfColumn[index] != IMPORT_FIELD_NONE)
+        {
+          mappedColumns++;
+        }
+      }
+
+      //-- A header that names no known value column is almost always a
+      //-- hand-written file using its own rubrics (EDT1, GDT, ...): the
+      //-- import still lands every period, but all of them as 0.0. Warn
+      //-- loudly instead of letting a ring silently fill with zeros.
+      if (mappedColumns == 0u)
+      {
+        ESP_LOGW(tag,
+                 "populate %s ring from %s: no value column of the header is known, every counter "
+                 "and amount imports as 0.0",
+                 rings[ring].name, path);
+
+        if (result->firstError[0] == '\0')
+        {
+          snprintf(result->firstError, sizeof result->firstError,
+                   "header names no known value column (expected OBIS codes and ti/te/tg)");
+        }
       }
 
       continue;

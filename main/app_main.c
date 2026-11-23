@@ -15,7 +15,7 @@
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
 extern const char* PROG_VERSION;
-const char* PROG_VERSION = "v0.5.13";
+const char* PROG_VERSION = "v0.5.14";
 
 #include <stdio.h>
 #include <string.h>
@@ -254,8 +254,11 @@ static void onSntpSynced(struct timeval* tv)
 
 //-- The SMB share exposes the meter store's mounted LittleFS volume to the
 //-- local network through mrwheel's smb_server component. The share is
-//-- read-only and guest-accessible: a visitor can inspect or copy the ring
-//-- file but can never delete or corrupt the logger's own records.
+//-- read/write and guest-accessible: a visitor can inspect, copy, replace,
+//-- upload and delete files. The ring files the store keeps open stay
+//-- protected by their own lock: esp_littlefs refuses to unlink a path whose
+//-- file descriptor the firmware still holds, so the live records cannot be
+//-- corrupted while the logger runs.
 static void startSmbShare(void)
 {
   if (smb_server_is_running())
@@ -276,7 +279,7 @@ static void startSmbShare(void)
   smb_server_config_t config = SMB_SERVER_DEFAULT_CONFIG();
   config.share_name = "DSMRLOGGER";
   config.mount_point = mountPoint;
-  config.read_only = true;
+  config.read_only = false;
 
   esp_err_t result = smb_server_start(&config);
 
@@ -286,7 +289,7 @@ static void startSmbShare(void)
     return;
   }
 
-  ESP_LOGI(tag, "SMB share '%s' open on port %u (read-only, guest access)", config.share_name,
+  ESP_LOGI(tag, "SMB share '%s' open on port %u (read/write, guest access)", config.share_name,
            (unsigned)config.port);
 }
 
