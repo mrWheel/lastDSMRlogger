@@ -1,7 +1,7 @@
 # Dynamic pricing with lastDSMRlogger
 
-fileVersion: [3] - 23-11-2026 - 20:05
-Buildnumber: 3 - Last update-date: 23-11-2026
+fileVersion: [4] - 23-11-2026 - 22:35
+Buildnumber: 4 - Last update-date: 23-11-2026
 
 Who is this for: users who want the logger to show real energy costs (and the
 current kWh price) instead of fixed manual prices, and who are comfortable
@@ -54,19 +54,31 @@ flash volume and uses it to price the energy your meter reports.
   is **one price that always
   applies per direction** — there is no normal/off-peak distinction.
 - The amounts become visible in the **Show RingFile** view
-  (columns **Import €**, **Export €**, **Gas €**, **Netw. €**) and in the
+  (columns **Import €**, **Export €**, **Gas €**, **Netw. €**), in the
+  **Hours** and **Days** views under **Presentation: Table** (the row's
+  own **Used (€)**, **Returned (€)**, **Gas (€)** and **Total (€)**
+  columns beside the quantities — every figure per row, these tables
+  carry no summed rows) and in the
   **Months** view under **Presentation: Costs** (Electra, Export, Gas,
   Netw., Total
-  and the advance amount; the Total subtracts the Export credit, and the
-  Netw. column prints the network amount stored with the record — the fixed
+  and the advance amount). Every money column shares one formula:
+  total = used kWh × import price − returned kWh × export price + gas
+  m³ × gas price + the record's prorated network amount (the Total
+  subtracts the Export credit, and the Netw. column prints the network
+  amount stored with the record — the fixed
   monthly **Network & transport costs** setting as it was when the record
-  was written). A `populate` import whose file carries no `ti`, `te`, `tg`
+  was written). All prices — the manual Settings fields and the published
+  feed prices alike — are positive amounts (per kWh, gas per m³); the
+  export price is the net compensation received per delivered-back kWh,
+  which the tables net as a credit. A `populate` import whose file carries no `ti`, `te`, `tg`
   or `nc` column (or leaves those values blank) stores them anyway: the
   tariff amounts as the average tariffs of the manual **Tariff 1** prices
   and the network costs prorated from the Settings month amount.
 
-There is **no dedicated tariff screen** in the SPA: the current price is read
-from `GET /api/v3/tariffs` (the **API** view can open it, or use `curl`).
+The **Tariffs** view lists the stored schedule (it reads
+`GET /api/v3/tariffs?from=&to=&resolution=raw`); the interval that is
+active right now is answered by plain `GET /api/v3/tariffs` (the **API**
+view can open it too, or use `curl`).
 
 ## 2. Five-minute test with synthetic prices
 

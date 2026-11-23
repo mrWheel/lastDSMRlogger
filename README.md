@@ -1,6 +1,6 @@
 # lastDSMRlogger
 <!--
-fileVersion: [53] - 23-11-2026 - 20:05
+fileVersion: [54] - 23-11-2026 - 22:35
 -->
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -209,7 +209,9 @@ Phase Load view is the default screen at every start and reload of the page.
   amount prorated to its period (the days ring a thirtieth of the month,
   the hours ring a thirtieth of a day) and the *Netw.* column of the
   Months Graph *Costs* presentation prints the figure stored with the
-  month (a more advanced treatment of the network costs may follow later). The
+  month — the Hours and Days tables' *Total (€)* column adds the same
+  stored figure (a more advanced treatment of the network costs may
+  follow later). The
   manual prices follow the direction of the energy: *Delivered* is what the
   grid delivers to the home (the used energy, a cost), *Received* is what
   the home delivers back to the grid (returned energy, a credit). The
@@ -302,7 +304,10 @@ Phase Load view is the default screen at every start and reload of the page.
   same cached frame between presentations without asking the device again:
   **Graph** draws the panels described above, **Table** lists the same
   per-period amounts newest first. The Hours and Days tables show one row
-  per retained period (period, used kWh, returned kWh, gas m³). The months
+  per retained period (period, used kWh, returned kWh, gas m³) plus the
+  row's own money columns *Used (€)*, *Returned (€)*, *Gas (€)* and
+  *Total (€)* — every figure stands on its own row, these tables never
+  carry a summed row. The months
   Table is the two-year comparison of the old DSMRlogger32 history page
   (`assets/oldMonthsTabel.png`): the drawn twelve months, newest on top,
   each row showing used, returned and gas twice — this month and the same
@@ -312,12 +317,13 @@ Phase Load view is the default screen at every start and reload of the page.
   months view has a third option **Costs** (`assets/oldMonthsCosts.png`):
   per drawn month the *Electra* amount (the used kWh times the import
   tariff the ring stores, what the used energy costs), the *Export* amount
-  (the returned kWh times the export tariff, the credit the
+  (the returned kWh times the export tariff, the positive compensation the
   delivered-back energy earns), the *Gas* amount (the gas m³ times the
   gas tariff), *Netw.* (the network and transport amount stored with the
   record: the Settings month amount as saved when the record was written)
   and their
-  *Total* (Electra minus Export plus Gas plus Netw.), each month paired
+  *Total* (Electra minus Export plus Gas plus Netw. — the very rule the
+  Hours and Days *Total (€)* columns share), each month paired
   with the same month one year back, and an
   **Advance** row printing each half's advance payment: that column's
   total sum divided by twelve (the old page's *Voorschot Bedrag*).

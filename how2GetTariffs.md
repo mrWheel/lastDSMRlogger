@@ -1,8 +1,8 @@
-fileVersion: [2] - 22-11-2026 - 19:55
+fileVersion: [3] - 23-11-2026 - 22:35
 
 # How to get dynamic energy tariffs for lastDSMRlogger
 
-Run a script, Node-RED flow, or Home Assistant automation that fetches your supplier's prices, converts them to the format below, and submits them to lastDSMRlogger. Keep supplier credentials and contract-specific calculations in that integration. Compare a few converted prices against your supplier's app or tariff sheet before publishing them.
+Run a script, Node-RED flow, or Home Assistant automation that fetches your supplier's prices, converts them to the format below, and submits them to lastDSMRlogger. Keep supplier credentials and contract-specific calculations in that integration. Compare a few converted prices against your supplier's app or tariff sheet before publishing them. Every price is a positive amount (per kWh, gas per m³): the import price is what the used energy costs, the export price the compensation received for delivered-back energy — the SPA's cost tables net the export amount as a credit in the total.
 
 ## Vandebron Dynamisch
 
