@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.c - hour, day and month smart meter ring file store
-//-- Date: 2026-11-23 · Build: 14
+//-- Date: 2026-11-23 · Build: 15
 //--
 //-- The store task owns all ring_file_store work: it mounts the LittleFS
 //-- storage partition, removes the ring file of the retired minute store,
@@ -11,7 +11,10 @@
 //-- Every minute the task reads the five meter counters of the most
 //-- recently accepted telegram (a reading no telegram published stays 0.0)
 //-- and upserts the snapshot into the current hour, day and month record.
-//-- The three tariff amounts of each ring record are filled by the
+//-- Each record also stores the Settings network and transport month
+//-- amount prorated to the ring's period (the months ring the full
+//-- amount, the days ring a thirtieth, the hours ring a thirtieth of a
+//-- day). The three tariff amounts of each ring record are filled by the
 //-- registered tariff calculator (the tariff component's calculator values
 //-- the energy consumed inside the ring's period with the dynamic tariff
 //-- table and the manual prices); without a calculator the task adds the
@@ -24,8 +27,11 @@
 //-- loggerStorePopulateRing(): a semicolon separated csv file from the
 //-- volume root (the import csv files are shipped there by the storage
 //-- partition image built from the project's storageImage/ folder), keyed
-//-- by period and columned by OBIS code, is edited into one ring with
-//-- missing values becoming 0.0. A mode picks what happens to the records
+//-- by period and columned by OBIS code, is edited into one ring: missing
+//-- counter values become 0.0, while a missing or blank ti, te, tg or nc
+//-- value is computed from the stored settings (the three average tariffs
+//-- from the manual tariff 1 prices and the prorated network and transport
+//-- month amount). A mode picks what happens to the records
 //-- the ring already holds: merge (default) backfills, overwrite clears the
 //-- ring before importing and update only revises stored periods. The
 //-- console's ring2csv command writes one ring back to the volume root as
@@ -74,13 +80,14 @@ static const char* tag = "meterStore";
 //-- payload as raw bytes, so a firmware that changed the *meaning* of a
 //-- field cannot tell its records from the old ones by size alone (the
 //-- tariff amounts moved from one per tariff to one per direction of the
-//-- energy, which kept the struct's eight floats). The store task compares
+//-- energy, which kept the struct's floats; adding the network costs field
+//-- made it nine). The store task compares
 //-- this marker after mounting: a volume that does not carry the marker of
 //-- the current layout gets its three ring files rebuilt empty (the
 //-- retained periods return through the console's populate command). Bump
 //-- the version with every payload change, name change included.
 #define STORE_LAYOUT_MARKER_PATH STORE_MOUNT_POINT "/ringlayout.ver"
-#define STORE_RECORD_LAYOUT_VERSION 2u
+#define STORE_RECORD_LAYOUT_VERSION 3u
 
 //-- Buffered persistence with a one-record staging buffer: the newest
 //-- record of every ring lives in RAM until the staging buffer flushes
@@ -351,6 +358,27 @@ static bool meterRingKey(const MeterRing* ring, uint64_t timeStamp, uint64_t* ou
 
   *outKey = usedKey % ring->centuryModulus;
   return true;
+}
+
+//-- --------------------------------------------------------------------------
+//-- Network and transport costs
+//-- --------------------------------------------------------------------------
+
+//-- The Settings network and transport amount stored with one record of one
+//-- ring: the configured month amount prorated to the ring's period (the
+//-- days ring stores a thirtieth of the month, the hours ring a thirtieth
+//-- of a day, the months ring the full month amount).
+static float networkCostsForRing(loggerMeterRing_t ring, float monthlyEuro)
+{
+  switch (ring)
+  {
+  case LOGGER_RING_DAYS:
+    return monthlyEuro / 30.0f;
+  case LOGGER_RING_HOURS:
+    return monthlyEuro / (24.0f * 30.0f);
+  default:
+    return monthlyEuro;
+  }
 }
 
 //-- --------------------------------------------------------------------------
@@ -672,7 +700,8 @@ typedef enum
   IMPORT_FIELD_GAS,
   IMPORT_FIELD_AMOUNT_IMPORT,
   IMPORT_FIELD_AMOUNT_EXPORT,
-  IMPORT_FIELD_AMOUNT_GAS
+  IMPORT_FIELD_AMOUNT_GAS,
+  IMPORT_FIELD_AMOUNT_NETWORK
 } ImportField;
 
 //-- Header column name to payload field. The counters are named by their
@@ -680,7 +709,11 @@ typedef enum
 //-- catalogue code 0-1:24.1.0 and under the Dutch and Belgian publishing
 //-- codes alike. The three tariff amounts have no OBIS code of their own and
 //-- carry the same rubrics the ring print uses, named for the direction of
-//-- the energy they value: ti (import), te (export) and tg (gas).
+//-- the energy they value: ti (import), te (export) and tg (gas); the
+//-- network and transport month amount carries the rubric nc. A line that
+//-- leaves one of these four values blank (or a file whose header omits the
+//-- column) gets it computed from the stored settings instead of imported
+//-- as 0.0 (see importRingFile).
 static const struct
 {
   const char* obis;
@@ -691,6 +724,7 @@ static const struct
     {"0-1:24.1.0", IMPORT_FIELD_GAS},        {"0-1:24.2.1", IMPORT_FIELD_GAS},
     {"0-1:24.2.3", IMPORT_FIELD_GAS},        {"ti", IMPORT_FIELD_AMOUNT_IMPORT},
     {"te", IMPORT_FIELD_AMOUNT_EXPORT},      {"tg", IMPORT_FIELD_AMOUNT_GAS},
+    {"nc", IMPORT_FIELD_AMOUNT_NETWORK},
 };
 
 //-- Period key column spellings the header line may start with; the data
@@ -912,6 +946,19 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
   //-- 0xFF fills every enum-sized entry with -1 (IMPORT_FIELD_NONE).
   memset(fieldOfColumn, 0xFF, sizeof fieldOfColumn);
 
+  //-- The stored settings name the tariffs and the network amount that
+  //-- value every line whose ti, te, tg or nc value is blank or missing:
+  //-- the manual tariff 1 prices (the way a meter that names no active
+  //-- tariff prices) and the network and transport month amount prorated
+  //-- to the ring's period. Read once for the whole import.
+  loggerSettingsConfig settings;
+  bool haveSettings = (loggerSettingsLoad(&settings) == ESP_OK);
+
+  if (!haveSettings)
+  {
+    memset(&settings, 0, sizeof settings);
+  }
+
   bool headerRead = false;
   bool ringCleared = false;
   esp_err_t outcome = ESP_OK;
@@ -977,19 +1024,20 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
 
       //-- A header that names no known value column is almost always a
       //-- hand-written file using its own rubrics (EDT1, GDT, ...): the
-      //-- import still lands every period, but all of them as 0.0. Warn
-      //-- loudly instead of letting a ring silently fill with zeros.
+      //-- import still lands every period, but every counter as 0.0 (the
+      //-- four amounts are still computed from the settings). Warn loudly
+      //-- instead of letting a ring silently fill with zeros.
       if (mappedColumns == 0u)
       {
         ESP_LOGW(tag,
-                 "populate %s ring from %s: no value column of the header is known, every counter "
-                 "and amount imports as 0.0",
+                 "populate %s ring from %s: no value column of the header is known, every "
+                 "counter imports as 0.0 (ti, te, tg and nc are computed from the settings)",
                  rings[ring].name, path);
 
         if (result->firstError[0] == '\0')
         {
           snprintf(result->firstError, sizeof result->firstError,
-                   "header names no known value column (expected OBIS codes and ti/te/tg)");
+                   "header names no known value column (expected OBIS codes and ti/te/tg/nc)");
         }
       }
 
@@ -1016,8 +1064,18 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
     loggerMeterRecord record;
     memset(&record, 0, sizeof record);
 
+    //-- The four amount columns the line may leave blank: a blank (or a
+    //-- header without the column) is not a value and gets computed from
+    //-- the settings below instead of staying 0.0.
+    bool hasImportAmount = false;
+    bool hasExportAmount = false;
+    bool hasGasAmount = false;
+    bool hasNetworkAmount = false;
+
     for (uint8_t index = 1u; index < columnCount; index++)
     {
+      bool fieldGiven = (fields[index][0] != '\0');
+
       switch (fieldOfColumn[index])
       {
       case IMPORT_FIELD_DELIVERED_1:
@@ -1037,16 +1095,48 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
         break;
       case IMPORT_FIELD_AMOUNT_IMPORT:
         record.tariffAmountImportEuro = (float)atof(fields[index]);
+        hasImportAmount = fieldGiven;
         break;
       case IMPORT_FIELD_AMOUNT_EXPORT:
         record.tariffAmountExportEuro = (float)atof(fields[index]);
+        hasExportAmount = fieldGiven;
         break;
       case IMPORT_FIELD_AMOUNT_GAS:
         record.tariffAmountGasEuro = (float)atof(fields[index]);
+        hasGasAmount = fieldGiven;
+        break;
+      case IMPORT_FIELD_AMOUNT_NETWORK:
+        record.networkCostsEuro = (float)atof(fields[index]);
+        hasNetworkAmount = fieldGiven;
         break;
       default:
         break;
       }
+    }
+
+    //-- The values the file did not carry are stored anyway (the Costs
+    //-- presentation needs them for imported history): the tariff amounts
+    //-- as the average tariffs of the manual tariff 1 prices (an imported
+    //-- line names no tariff indicator, so it prices like tariff 1) and
+    //-- the network amount as the month amount prorated to this ring.
+    if (!hasImportAmount)
+    {
+      record.tariffAmountImportEuro = settings.tariff1ImportPricePerKwh;
+    }
+
+    if (!hasExportAmount)
+    {
+      record.tariffAmountExportEuro = settings.tariff1ExportPricePerKwh;
+    }
+
+    if (!hasGasAmount)
+    {
+      record.tariffAmountGasEuro = settings.tariffGasPricePerM3;
+    }
+
+    if (!hasNetworkAmount)
+    {
+      record.networkCostsEuro = networkCostsForRing(ring, settings.networkCostsPerMonthEuro);
     }
 
     esp_err_t edited;
@@ -1232,16 +1322,18 @@ esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePa
 
 //-- Header of an exported file: the period key column, the five counter
 //-- columns in the spelling the populate import maps back (the 0-1:24.1.0
-//-- gas code is accepted for all published gas codes alike) and the three
+//-- gas code is accepted for all published gas codes alike), the three
 //-- tariff amounts under the rubrics the ring print uses, named for the
-//-- direction of the energy they value (ti, te and tg).
+//-- direction of the energy they value (ti, te and tg), and the network
+//-- and transport amount under the rubric nc.
 #define STORE_EXPORT_HEADER                                                                        \
-  "YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255;ti;te;tg\r\n"
+  "YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255;ti;te;tg;"      \
+  "nc\r\n"
 
 //-- Walks the ring newest first into a buffer (deduplicating a cursor that
 //-- is invalidated by a concurrent snapshot), then writes the file oldest
 //-- first: key as eight YYMMDDHH digits, the five counters at three decimals
-//-- and the three tariff amounts at two. An empty ring still produces the
+//-- and the three tariff amounts and the network costs at two. An empty ring still produces the
 //-- header line. The caller may hand an already open stream (the in-memory
 //-- csv text of the API); with file NULL the RING<name>.csv volume file is
 //-- opened and closed here like the console's ring2csv always did.
@@ -1338,11 +1430,12 @@ static esp_err_t exportRingFile(loggerMeterRing_t ring, FILE* file, uint32_t* ou
     //-- digits and the century from the full timestamp.
     uint64_t key = (record->keys.timeStamp / 10000ULL) % 100000000ULL;
 
-    fprintf(file, "%08" PRIu64 ";%.3f;%.3f;%.3f;%.3f;%.3f;%.2f;%.2f;%.2f\r\n", key,
+    fprintf(file, "%08" PRIu64 ";%.3f;%.3f;%.3f;%.3f;%.3f;%.2f;%.2f;%.2f;%.2f\r\n", key,
             record->meter.energyDeliveredTariff1Kwh, record->meter.energyDeliveredTariff2Kwh,
             record->meter.energyReturnedTariff1Kwh, record->meter.energyReturnedTariff2Kwh,
             record->meter.gasDeliveredM3, record->meter.tariffAmountImportEuro,
-            record->meter.tariffAmountExportEuro, record->meter.tariffAmountGasEuro);
+            record->meter.tariffAmountExportEuro, record->meter.tariffAmountGasEuro,
+            record->meter.networkCostsEuro);
   }
 
   if (ownFile)
@@ -1501,6 +1594,16 @@ static bool storeSnapshot(uint64_t* outTimeStamp)
   uint8_t tariffIndicator = 0u;
   bool telegramSeen = readLatestMeterCounters(&record, &tariffIndicator);
 
+  //-- The network and transport month amount stored with every record of
+  //-- this snapshot, prorated to each ring's period below. An unreadable
+  //-- settings block stores 0.0.
+  loggerSettingsConfig snapshotSettings;
+
+  if (loggerSettingsLoad(&snapshotSettings) != ESP_OK)
+  {
+    memset(&snapshotSettings, 0, sizeof snapshotSettings);
+  }
+
   uint64_t hourKey = 0u;
   (void)meterRingKey(&rings[LOGGER_RING_HOURS], timeStamp, &hourKey);
 
@@ -1515,6 +1618,11 @@ static bool storeSnapshot(uint64_t* outTimeStamp)
     loggerMeterRecord ringRecord = record;
     uint64_t ringKey = 0u;
     (void)meterRingKey(&rings[ring], timeStamp, &ringKey);
+
+    //-- The network amount belongs to the ring's own period: every ring
+    //-- stores the month amount prorated to its granularity.
+    ringRecord.networkCostsEuro =
+        networkCostsForRing(ring, snapshotSettings.networkCostsPerMonthEuro);
 
     if (tariffCalculator != NULL)
     {
@@ -1547,15 +1655,17 @@ static bool storeSnapshot(uint64_t* outTimeStamp)
 
   //-- One summary line per snapshot: the hour key leads, the counters keep
   //-- the units of the telegram (kWh and m³), the tariff amounts are in EUR
-  //-- (import, export and gas) and the tariff is the indicator the meter
+  //-- (import, export and gas), nc is the hour ring's share of the network
+  //-- and transport month amount and the tariff is the indicator the meter
   //-- published (0 when it named none).
   ESP_LOGI(tag,
            "stored h=%08" PRIu64 " edT1=%8.3f edT2=%8.3f erT1=%8.3f erT2=%8.3f "
-           "gas=%8.3f ti=%5.2f te=%5.2f tg=%5.2f tariff=%u%s",
+           "gas=%8.3f ti=%5.2f te=%5.2f tg=%5.2f nc=%6.3f tariff=%u%s",
            hourKey, record.energyDeliveredTariff1Kwh, record.energyDeliveredTariff2Kwh,
            record.energyReturnedTariff1Kwh, record.energyReturnedTariff2Kwh, record.gasDeliveredM3,
            logged.tariffAmountImportEuro, logged.tariffAmountExportEuro, logged.tariffAmountGasEuro,
-           (unsigned)tariffIndicator, telegramSeen ? "" : " (no telegram yet)");
+           logged.networkCostsEuro, (unsigned)tariffIndicator,
+           telegramSeen ? "" : " (no telegram yet)");
 
   *outTimeStamp = timeStamp;
   return true;

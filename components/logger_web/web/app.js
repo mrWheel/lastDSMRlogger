@@ -1712,6 +1712,7 @@ function renderRingFileList(message)
       (typeof record.ti === "number") ? record.ti.toFixed(2) : "-",
       (typeof record.te === "number") ? record.te.toFixed(2) : "-",
       (typeof record.tG === "number") ? record.tG.toFixed(2) : "-",
+      (typeof record.nc === "number") ? record.nc.toFixed(2) : "-",
     ];
 
     cells.forEach((text, index) =>
@@ -1774,8 +1775,8 @@ function renderRingFileList(message)
 // month's money amounts in the same paired layout (assets/
 // oldMonthsCosts.png): Electra (the used kWh times the import tariff the
 // ring stores), Export (the returned kWh times the export tariff, a credit
-// subtracted in the total), Gas (the gas m³ times the gas tariff), the
-// fixed monthly Netw. fee from Settings and the Total, with an
+// subtracted in the total), Gas (the gas m³ times the gas tariff), Netw.
+// (the network amount the ring stores with the record) and the Total, with an
 // Advance row of each half's total sum over twelve (the old page's
 // Voorschot Bedrag).
 
@@ -2481,14 +2482,13 @@ function monthsExportEuro(record)
   return monthsProductEuro(record.returned, record.te);
 }
 
-// The fixed monthly network and transport amount stored in Settings (the
-// Netw. column): 0 while it has never been saved.
-function monthsNetworkCostsEuro()
+// The month's network and transport amount in EUR (the Netw. column): the
+// figure the ring stores with the record (the Settings "Network & transport
+// costs (month)" amount as it was when the record was written), or null
+// when the record carries none.
+function monthsNetworkCostsEuro(record)
 {
-  const settings = (state.config && state.config.settings) || null;
-  const value = settings ? settings.networkCostsPerMonthEuro : 0;
-
-  return Number.isFinite(value) ? value : 0;
+  return ((typeof record.nc === "number") && Number.isFinite(record.nc)) ? record.nc : null;
 }
 
 // The months view's Costs presentation (the old DSMRlogger32 history
@@ -2497,8 +2497,9 @@ function monthsNetworkCostsEuro()
 // (the used kWh times the import tariff, what the used energy costs),
 // Export (the returned kWh times the export tariff, the credit the
 // delivered-back energy earns), Gas (the gas m³ times the gas tariff),
-// Netw. (the fixed monthly network fee from
-// Settings) and their Total (Electra minus Export plus Gas plus Netw.) —
+// Netw. (the network and transport amount the ring stores with the record,
+// the Settings month amount as it was when the record was written) and
+// their Total (Electra minus Export plus Gas plus Netw.) —
 // each month paired with the same month one year back, the ring partner
 // supplying the right half. A month the ring does not retain
 // shows dashes. The Advance row prints each half's advance payment: that
@@ -2511,24 +2512,25 @@ function renderMonthsCostsTable()
 
   const records = periodGraphs.monthsGraph.records;
   const drawn = periodGraphWindow("monthsGraph", records).slice().reverse();
-  const netw = monthsNetworkCostsEuro();
 
   const costsOf = (record) =>
   {
     const electra = monthsElectraEuro(record);
     const exported = monthsExportEuro(record);
     const gas = monthsProductEuro(record.gas, record.tG);
+    const netw = monthsNetworkCostsEuro(record);
 
-    if ((electra === null) && (exported === null) && (gas === null))
+    if ((electra === null) && (exported === null) && (gas === null) && (netw === null))
     {
-      return {electra: null, exported: null, gas: null, total: null};
+      return {electra: null, exported: null, gas: null, netw: null, total: null};
     }
 
     return {
       electra: electra,
       exported: exported,
       gas: gas,
-      total: (electra || 0) - (exported || 0) + (gas || 0) + netw
+      netw: netw,
+      total: (electra || 0) - (exported || 0) + (gas || 0) + (netw || 0)
     };
   };
 
@@ -2549,7 +2551,7 @@ function renderMonthsCostsTable()
     const costs = costsOf(record);
     const yearAgo = previous
         ? costsOf(previous)
-        : {electra: null, exported: null, gas: null, total: null};
+        : {electra: null, exported: null, gas: null, netw: null, total: null};
 
     columnTotal += costs.total || 0;
     columnTotalYearAgo += yearAgo.total || 0;
@@ -2560,11 +2562,11 @@ function renderMonthsCostsTable()
       parts.yearLabel,
       graphCellNumber(costs.electra, 2), graphCellNumber(costs.exported, 2),
       graphCellNumber(costs.gas, 2),
-      graphCellNumber(netw, 2), graphCellNumber(costs.total, 2),
+      graphCellNumber(costs.netw, 2), graphCellNumber(costs.total, 2),
       parts.yearAgoLabel,
       graphCellNumber(yearAgo.electra, 2), graphCellNumber(yearAgo.exported, 2),
       graphCellNumber(yearAgo.gas, 2),
-      previous ? graphCellNumber(netw, 2) : "-", graphCellNumber(yearAgo.total, 2),
+      previous ? graphCellNumber(yearAgo.netw, 2) : "-", graphCellNumber(yearAgo.total, 2),
     ]);
   });
 

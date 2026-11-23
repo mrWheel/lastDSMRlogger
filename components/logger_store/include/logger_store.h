@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.h - hour, day and month smart meter ring file store
-//-- Date: 2026-11-23 · Build: 12
+//-- Date: 2026-11-23 · Build: 13
 //--
 //-- Three fixed-capacity ring files land on the LittleFS storage partition,
 //-- written through mrwheel's ring_file_store component: the hours ring
@@ -19,7 +19,9 @@
 //-- semicolon separated csv file on the volume (the import files are
 //-- shipped to the volume root by the storage partition image built from
 //-- the project's storageImage/ folder) into one ring through
-//-- ringFileEdit(), missing values becoming 0.0.
+//-- ringFileEdit(): missing counter values become 0.0, missing ti, te, tg
+//-- and nc values are computed from the stored settings (average tariffs
+//-- and the prorated network and transport month amount).
 //-- ==========================================================================
 
 #ifndef LOGGER_STORE_H
@@ -83,6 +85,15 @@ typedef struct
   float tariffAmountImportEuro;
   float tariffAmountExportEuro;
   float tariffAmountGasEuro;
+
+  //-- Fixed monthly network and transport amount (Settings, "Network &
+  //-- transport costs (month)") as it was configured when this record was
+  //-- written, prorated to the ring's period: the months ring stores the
+  //-- full month amount, the days ring a thirtieth of it and the hours ring
+  //-- a thirtieth of a day. The Months view's Costs table prints this
+  //-- stored figure as its Netw. column; populate fills it from the stored
+  //-- settings when the import file carries no nc column (or a blank value).
+  float networkCostsEuro;
 } loggerMeterRecord;
 
 //-- --------------------------------------------------------------------------
@@ -178,11 +189,17 @@ typedef struct
 //-- (kWh) and the gas counter 0-1:24.1.0 (also accepted as 0-1:24.2.1 or
 //-- 0-1:24.2.3), all case-insensitive and with an optional "*255" method
 //-- suffix. The three tariff amounts carry the rubrics of the ring print:
-//-- ti (import), te (export) and tg (gas). Unknown columns - including the
+//-- ti (import), te (export) and tg (gas), and the monthly network and
+//-- transport amount the rubric nc. Unknown columns - including the
 //-- "#" and empty trailing
 //-- columns of handwritten files - are skipped. Every data line starts with
 //-- the period key and carries its values in header order; a blank or
-//-- missing value becomes 0.0. The mode picks how the ring's current records are
+//-- missing counter value becomes 0.0. A missing or blank ti, te, tg or nc
+//-- is not imported as 0.0: the three tariff amounts are filled with the
+//-- average tariffs of the stored manual prices (the tariff 1 prices, the
+//-- way a meter that names no active tariff prices) and nc with the stored
+//-- network and transport month amount prorated to the ring's period. The mode picks how the ring's
+//current records are
 //-- treated: MERGE backfills the retained window through ringFileEdit()
 //-- (periods older than the ring capacity are refused and counted),
 //-- OVERWRITE clears the ring just before the first valid data line so the
@@ -207,9 +224,9 @@ esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePa
 //-- separated csv file (the console's ring2csv command): the file lands at
 //-- the volume root as "RING<hours|days|months>.csv", carries the header
 //-- "YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;
-//-- 0-1:24.1.0*255;ti;te;tg" and one line per retained record, oldest
+//-- 0-1:24.1.0*255;ti;te;tg;nc" and one line per retained record, oldest
 //-- period first, with the key as eight digits, the five counters at three
-//-- decimals and the three tariff amounts at two.
+//-- decimals, the three tariff amounts and the network costs at two.
 //-- The result re-imports through loggerStorePopulateRing() unchanged.
 //-- outRecords (optional) receives the number of records written. Returns
 //-- ESP_ERR_INVALID_ARG for an invalid ring, ESP_ERR_INVALID_STATE while the

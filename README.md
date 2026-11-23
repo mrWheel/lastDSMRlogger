@@ -1,6 +1,6 @@
 # lastDSMRlogger
 <!--
-fileVersion: [52] - 23-11-2026 - 14:29
+fileVersion: [53] - 23-11-2026 - 20:05
 -->
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -205,9 +205,11 @@ Phase Load view is the default screen at every start and reload of the page.
   **Tariff 1 Received (kWh)**, **Tariff 2 Received (kWh)** and **Tariff Gas
   Delivered (m3)** in EUR (see *Dynamic electricity tariffs*) and a fixed
   monthly **Network &
-  transport costs (month)** amount in EUR — the *Netw.* column of the
-  Months Graph *Costs* presentation (a flat fee added to every month; a
-  more advanced treatment of the network costs may follow later). The
+  transport costs (month)** amount in EUR — every ring record stores this
+  amount prorated to its period (the days ring a thirtieth of the month,
+  the hours ring a thirtieth of a day) and the *Netw.* column of the
+  Months Graph *Costs* presentation prints the figure stored with the
+  month (a more advanced treatment of the network costs may follow later). The
   manual prices follow the direction of the energy: *Delivered* is what the
   grid delivers to the home (the used energy, a cost), *Received* is what
   the home delivers back to the grid (returned energy, a credit). The
@@ -308,11 +310,13 @@ Phase Load view is the default screen at every start and reload of the page.
   closing with a **Total** row that sums the drawn rows column by column
   and a **Balance** row that nets used against returned per year. The
   months view has a third option **Costs** (`assets/oldMonthsCosts.png`):
-  per drawn month the *Electra* amount (the ring's import amount, what the
-  used energy costs), the *Export* amount (the ring's export amount, the
-  credit the delivered-back energy earns), the *Gas* amount (the gas tariff
-  amount), *Netw.* (the fixed
-  monthly network and transport fee from the Settings view) and their
+  per drawn month the *Electra* amount (the used kWh times the import
+  tariff the ring stores, what the used energy costs), the *Export* amount
+  (the returned kWh times the export tariff, the credit the
+  delivered-back energy earns), the *Gas* amount (the gas m³ times the
+  gas tariff), *Netw.* (the network and transport amount stored with the
+  record: the Settings month amount as saved when the record was written)
+  and their
   *Total* (Electra minus Export plus Gas plus Netw.), each month paired
   with the same month one year back, and an
   **Advance** row printing each half's advance payment: that column's
@@ -438,7 +442,7 @@ and a save that omits the `mqttPassword` field keeps the stored password
 |GET    |`/api/v3/raw/<seq>`                     |Exact accepted frame bytes as `text/plain`                    |
 |GET    |`/api/v3/power`                         |Realtime power frame of the newest accepted telegram (phases and total watts/amps/volts, meter time, scale ladder step, history of the newest 100 accepted total watts) |
 |GET    |`/api/v3/ringfile?ring=hours\|days\|months` |Records of one meter ring (hours by default), newest first |
-|GET    |`/api/v3/graph?ring=hours\|days\|months`|Per-period used/returned kWh and gas m³ of one ring (hours by default; differences of consecutive counters), oldest first |
+|GET    |`/api/v3/graph?ring=hours\|days\|months`|Per-period used/returned kWh and gas m³ of one ring (hours by default; differences of consecutive counters), plus the tariff amounts (`ti`/`te`/`tG`) and network costs (`nc`) stored with the period, oldest first |
 |GET    |`/api/v3/actualgraph`                   |Rolling table of the newest ~100 accepted telegrams: delivered and returned watts per phase, held gas m³/h and sample time, oldest first |
 |GET    |`/api/v3/store`                         |Console `store` command as JSON: every LittleFS volume file with its size, plus capacity, used and free bytes |
 |GET    |`/api/v3/csv?ring=hours\|days\|months`  |Console `ring2csv` content as a `text/csv` download: the exact `RING<name>.csv` a ring2csv would write (re-importable through populate), without touching the volume |
@@ -802,7 +806,8 @@ line cancels.
 The ring files carry a record layout marker on the volume (the tariff
 amounts moved from one per tariff — `t1`, `t2` — to one per direction of the
 energy — `ti`, `te`, `tg` — so the old amounts would read back under the
-wrong heading). A volume whose marker names another layout rebuilds its
+wrong heading, and every record later grew the prorated `nc` network costs
+field). A volume whose marker names another layout rebuilds its
 three rings empty once, on the model of a ring whose configured capacity
 changed, and the log asks for a repopulate; a retained file whose header
 disagrees with the current record size rebuilds the same way. The tariff
@@ -813,8 +818,9 @@ retained periods matter.
 The file starts with a header line. Its first column names the period key
 (`YYMMDDHH`, `YYMMDD` or `YYMM`); the value columns are named by OBIS code
 (with or without the `*255` method suffix) or, for the three tariff amounts
-that have no code of their own, by the rubrics of the ring print (`ti`, `te`
-and `tg`, named for the direction of the energy they value):
+and the network costs that have no code of their own, by the rubrics of the
+ring print (`ti`, `te`
+and `tg`, named for the direction of the energy they value, and `nc`):
 
 |Column                             |Ring field                |Unit|
 |-----------------------------------|--------------------------|----|
@@ -826,11 +832,18 @@ and `tg`, named for the direction of the energy they value):
 |`ti`                               |import amount (used)      |€   |
 |`te`                               |export amount (returned)  |€   |
 |`tg`                               |gas amount                |€   |
+|`nc`                               |network costs             |€   |
 
 Unknown columns — including the `#` and the empty trailing columns
 handwritten files may carry — are skipped. Every data line starts with the
 period key (8, 6 or 4 digits) and carries its values in header order; **a
-blank or missing value becomes 0**. Several lines of one period update the
+blank or missing counter value becomes 0**. A blank or missing `ti`, `te`,
+`tg` or `nc` is stored anyway: the tariff amounts are filled with the
+average tariffs of the manual **Tariff 1** prices (an imported line names no
+tariff indicator, so it prices like tariff 1) and `nc` with the Settings
+**Network & transport costs (month)** amount prorated to the ring's period
+(days a thirtieth of the month, hours a thirtieth of a day). Several lines
+of one period update the
 same record: the last line wins.
 
 The optional mode argument picks what happens to the records the ring
@@ -859,10 +872,11 @@ logger> showring hours
 The console command `ring2csv {hours|days|months}` writes one meter ring
 back to the LittleFS volume as a semicolon separated csv file named
 `RING<ring>.csv` at the volume root: the header
-`YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255;ti;te;tg`
+`YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255;ti;te;tg;nc`
 followed by one line per retained record, oldest period first, the key as
 eight `YYMMDDHH` digits, the five counters at three decimals and the three
-tariff amounts at two. Every field the ring file holds is exported, so the
+tariff amounts and the network costs at two. Every field the ring file holds
+is exported, so the
 file is re-importable through `populate` unchanged, and the read-only
 `DSMRLOGGER` SMB share exposes it for inspection or editing on any machine.
 

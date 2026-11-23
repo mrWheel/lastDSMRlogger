@@ -17,7 +17,11 @@ COUNTER_COLUMNS = (
     ("ERT2", "1-0:2.8.2"),
     ("GDT", "0-1:24.1.0", "0-1:24.2.1", "0-1:24.2.3"),
 )
-TARIFF_COLUMNS = ("ti", "te", "tg")
+# Value columns the new ring file always carries: the three tariff amounts
+# (named for the direction of the energy they value) and the network and
+# transport amount of the month (the Settings "Network & transport costs
+# (month)" figure, prorated to the ring's period on import).
+VALUE_COLUMNS = ("ti", "te", "tg", "nc")
 KEY_NAMES = ("YYMM", "YYMMDD", "YYMMDDHH")
 DECIMAL_PATTERN = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)")
 
@@ -56,13 +60,13 @@ def readRing(path):
                 raise ValueError(f"expected exactly one column for {aliases[0]}")
             counterIndexes.append(matches[0])
 
-        tariffIndexes = []
-        for name in TARIFF_COLUMNS:
+        valueIndexes = []
+        for name in VALUE_COLUMNS:
             if names.count(name) > 1:
                 raise ValueError(f"duplicate header column {name!r}")
-            tariffIndexes.append(names.index(name) if name in names else None)
+            valueIndexes.append(names.index(name) if name in names else None)
 
-        knownIndexes = {0, *counterIndexes, *tariffIndexes}
+        knownIndexes = {0, *counterIndexes, *valueIndexes}
         records = []
         seen = set()
         for row in reader:
@@ -81,13 +85,13 @@ def readRing(path):
                     raise ValueError("negative cumulative meter reading")
                 if any(value and i not in knownIndexes for i, value in enumerate(row)):
                     raise ValueError("unexpected data in an unnamed or unsupported column")
-                tariffs = [row[i] if i is not None and i < len(row) else "" for i in tariffIndexes]
-                for value in filter(None, tariffs):
+                amounts = [row[i] if i is not None and i < len(row) else "" for i in valueIndexes]
+                for value in filter(None, amounts):
                     parseNumber(value)
             except ValueError as error:
                 raise ValueError(f"line {reader.line_num}: {error}") from error
             seen.add(timestamp)
-            records.append((timestamp, row[0], fields, readings, tariffs))
+            records.append((timestamp, row[0], fields, readings, amounts))
 
     if not records:
         raise ValueError("no data records found")
@@ -177,19 +181,21 @@ def main():
         print("Cancelled. No output file was created.")
         return 1
 
-    labels = ("electricity import", "electricity export", "gas")
+    labels = ("electricity import", "electricity export", "gas", "network costs per month")
     if any(not value for record in records for value in record[4]):
-        print("Enter values for missing fields. The logger stores these fields as euro amounts.")
+        print("Enter values for missing fields. The logger stores these fields as euro amounts "
+              "(ti, te and tg as the period's tariff amounts, nc as the monthly network and "
+              "transport amount).")
     defaults = [
         askValue(name, label) if any(not record[4][i] for record in records) else ""
-        for i, (name, label) in enumerate(zip(TARIFF_COLUMNS, labels))
+        for i, (name, label) in enumerate(zip(VALUE_COLUMNS, labels))
     ]
 
     with destination.open("x", encoding="utf-8", newline="") as output:
         writer = csv.writer(output, delimiter=";")
-        writer.writerow([keyName, *(aliases[1] for aliases in COUNTER_COLUMNS), *TARIFF_COLUMNS])
-        for _, key, fields, _, tariffs in records:
-            writer.writerow([key, *fields, *(value or default for value, default in zip(tariffs, defaults))])
+        writer.writerow([keyName, *(aliases[1] for aliases in COUNTER_COLUMNS), *VALUE_COLUMNS])
+        for _, key, fields, _, amounts in records:
+            writer.writerow([key, *fields, *(value or default for value, default in zip(amounts, defaults))])
     print(f"Wrote {len(records)} records to {destination}.")
     return 0
 

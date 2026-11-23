@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-23 · Build: 26
+//-- Date: 2026-11-23 · Build: 27
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -1442,7 +1442,8 @@ static void appendPowerJson(stringBuilder* sb)
 //-- first, exactly as the ring walk returns them. The counters keep the
 //-- units of the telegram (kWh and m³), the tariff amounts are in EUR under
 //-- the direction rubrics ti (import), te (export) and tG (gas) — the
-//-- fictional billing cents while no calculator is registered. ring echoes
+//-- fictional billing cents while no calculator is registered — and the
+//-- stored network and transport amount under the rubric nc. ring echoes
 //-- the walked selector and
 //-- available reports whether the store walk completed: while the store
 //-- task never opened its rings the records array simply stays empty.
@@ -1461,12 +1462,12 @@ static bool appendRingFileRecord(uint64_t key, const loggerMeterRecord* record, 
 
   sbAppendFmt(sb,
               "%s{\"key\":%" PRIu64 ",\"edT1\":%.3f,\"edT2\":%.3f,\"erT1\":%.3f,\"erT2\":%.3f,"
-              "\"gas\":%.3f,\"ti\":%.2f,\"te\":%.2f,\"tG\":%.2f}",
+              "\"gas\":%.3f,\"ti\":%.2f,\"te\":%.2f,\"tG\":%.2f,\"nc\":%.2f}",
               (emit->emitted > 0u) ? "," : "", key, record->energyDeliveredTariff1Kwh,
               record->energyDeliveredTariff2Kwh, record->energyReturnedTariff1Kwh,
               record->energyReturnedTariff2Kwh, record->gasDeliveredM3,
               record->tariffAmountImportEuro, record->tariffAmountExportEuro,
-              record->tariffAmountGasEuro);
+              record->tariffAmountGasEuro, record->networkCostsEuro);
   emit->emitted++;
 
   //-- Stop the walk the moment the buffer is full: the client receives the
@@ -1680,7 +1681,8 @@ static uint64_t nextPeriodKey(loggerMeterRing_t ring, uint64_t key)
 //-- used/returned kWh and gas m³ plus that period's three tariff amounts
 //-- in EUR under the direction rubrics ti (import), te (export) and tG
 //-- (gas) (the fictional billing figures while no calculator is registered,
-//-- as the RingFile table prints them), oldest first, plus the ring's
+//-- as the RingFile table prints them) and its stored network and transport
+//-- amount under the rubric nc, oldest first, plus the ring's
 //-- selector name as the walk echoed it.
 static void appendPeriodGraphFrame(stringBuilder* sb, loggerMeterRing_t ring, const char* typeName)
 {
@@ -1727,10 +1729,10 @@ static void appendPeriodGraphFrame(stringBuilder* sb, loggerMeterRing_t ring, co
 
     sbAppendFmt(sb,
                 "%s{\"key\":%" PRIu64 ",\"used\":%.3f,\"returned\":%.3f,\"gas\":%.3f"
-                ",\"ti\":%.2f,\"te\":%.2f,\"tG\":%.2f}",
+                ",\"ti\":%.2f,\"te\":%.2f,\"tG\":%.2f,\"nc\":%.2f}",
                 (emitted > 0u) ? "," : "", collect->keys[index - 1u], usedKwh, returnedKwh, gasM3,
                 newer->tariffAmountImportEuro, newer->tariffAmountExportEuro,
-                newer->tariffAmountGasEuro);
+                newer->tariffAmountGasEuro, newer->networkCostsEuro);
     emitted++;
   }
 

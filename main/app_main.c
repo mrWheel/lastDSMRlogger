@@ -14,7 +14,7 @@
 
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
-const char* PROG_VERSION = "v0.5.16";
+const char* PROG_VERSION = "v0.5.17";
 
 #include <stdio.h>
 #include <string.h>

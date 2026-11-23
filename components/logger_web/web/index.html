@@ -224,9 +224,11 @@
                    inputmode="decimal" placeholder="EUR per m3">
           </div>
 
-          <!-- Fixed monthly network and transport fee: the Costs
-               presentation of the Months view adds this amount to every
-               month (its Netw. column). A more advanced treatment of the
+          <!-- Fixed monthly network and transport fee: every ring record
+               stores this amount (prorated to its period: days a
+               thirtieth, hours a thirtieth of a day) and the Costs
+               presentation of the Months view prints the stored figure in
+               its Netw. column. A more advanced treatment of the
                network costs may follow later. -->
           <div class="iosRow">
             <label for="inpNetworkCosts">Network &amp; transport costs (month)</label>
@@ -306,17 +308,19 @@
       </div>
       <!-- The records of the selected on-device ring file, newest period
            first (the device walks its ring from the newest slot): one row
-           per stored period with the five meter counters (kWh and m³) and
-           the three tariff amounts (EUR) per direction of the energy: the
+           per stored period with the five meter counters (kWh and m³), the
+           three tariff amounts (EUR) per direction of the energy: the
            import amount (what the used energy costs), the export amount
            (what the delivered-back energy earns) and the gas amount;
-           fictional billing cents while no calculator runs. The first
+           fictional billing cents while no calculator runs — and the
+           network costs (EUR) stored with the record (the Settings month
+           amount prorated to the ring's period). The first
            column header follows the ring (Hour / Day / Month). Rows are
            built by app.js. -->
       <div class="tableWrap">
         <table id="ringFileTable">
           <thead>
-            <tr><th id="ringFileKeyHeader">Hour</th><th class="valueNumeric">Ed T1 kWh</th><th class="valueNumeric">Ed T2 kWh</th><th class="valueNumeric">Er T1 kWh</th><th class="valueNumeric">Er T2 kWh</th><th class="valueNumeric">Gas m³</th><th class="valueNumeric">Import €</th><th class="valueNumeric">Export €</th><th class="valueNumeric">Gas €</th></tr>
+            <tr><th id="ringFileKeyHeader">Hour</th><th class="valueNumeric">Ed T1 kWh</th><th class="valueNumeric">Ed T2 kWh</th><th class="valueNumeric">Er T1 kWh</th><th class="valueNumeric">Er T2 kWh</th><th class="valueNumeric">Gas m³</th><th class="valueNumeric">Import €</th><th class="valueNumeric">Export €</th><th class="valueNumeric">Gas €</th><th class="valueNumeric">Netw. €</th></tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -460,7 +464,9 @@
            (the returned kWh times the export tariff, the credit the
            delivered-back energy earns, subtracted in the total), the gas
            amount (the gas m³ times the gas tariff) and the
-           fixed monthly network fee from Settings (its Netw. column), with
+           network and transport amount the ring stores with the record —
+           the Settings month amount as saved when the record was written
+           (its Netw. column), with
            the total, each month paired with the same month of the year
            before. The Advance row prints each half's advance payment: the
            sum of that column's totals over twelve (the old page's Voorschot

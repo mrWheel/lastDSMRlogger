@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_telnet.c - telnet console server on port 23
-//-- Date: 2026-11-23 · Build: 16
+//-- Date: 2026-11-23 · Build: 17
 //--
 //-- A plain BSD-socket console task: it listens on port 23, serves exactly
 //-- one session at a time and answers a command set from the receiver,
@@ -879,12 +879,13 @@ static void printPower(int fd)
 static const char* const ringKeyNames[LOGGER_RING_COUNT] = {"YYMMDDHH", "YYMMDD", "YYMM"};
 
 //-- Value column labels of the ring print: the OBIS codes of the five
-//-- counters (gas under its catalogue code) and the three tariff amounts.
-//-- The tariff amounts are fictional billing figures without a code of
-//-- their own, so they keep their rubrics, named for the direction of the
-//-- energy they value: ti (import), te (export) and tg (gas).
-static const char* const ringValueLabels[] = {"1-0:1.8.1",  "1-0:1.8.2", "1-0:2.8.1", "1-0:2.8.2",
-                                              "0-1:24.1.0", "ti",        "te",        "tg"};
+//-- counters (gas under its catalogue code), the three tariff amounts and
+//-- the network costs. The tariff amounts are fictional billing figures
+//-- without a code of their own, so they keep their rubrics, named for the
+//-- direction of the energy they value: ti (import), te (export) and
+//-- tg (gas); the network costs carry the rubric nc.
+static const char* const ringValueLabels[] = {
+    "1-0:1.8.1", "1-0:1.8.2", "1-0:2.8.1", "1-0:2.8.2", "0-1:24.1.0", "ti", "te", "tg", "nc"};
 
 //-- Visitor of the ring walk: builds the answer in memory instead of writing
 //-- to the socket while the store handle is held by the walk. One record is
@@ -901,11 +902,13 @@ static bool appendRingFileRecord(uint64_t key, const loggerMeterRecord* record, 
 {
   RingPrint* print = (RingPrint*)userData;
 
-  outAppendFmt(
-      print->out, "%0*" PRIu64 ";%10.3f;%10.3f;%10.3f;%10.3f;%10.3f;%10.2f;%10.2f;%10.2f\r\n",
-      print->keyWidth, key, record->energyDeliveredTariff1Kwh, record->energyDeliveredTariff2Kwh,
-      record->energyReturnedTariff1Kwh, record->energyReturnedTariff2Kwh, record->gasDeliveredM3,
-      record->tariffAmountImportEuro, record->tariffAmountExportEuro, record->tariffAmountGasEuro);
+  outAppendFmt(print->out,
+               "%0*" PRIu64 ";%10.3f;%10.3f;%10.3f;%10.3f;%10.3f;%10.2f;%10.2f;%10.2f;%10.2f\r\n",
+               print->keyWidth, key, record->energyDeliveredTariff1Kwh,
+               record->energyDeliveredTariff2Kwh, record->energyReturnedTariff1Kwh,
+               record->energyReturnedTariff2Kwh, record->gasDeliveredM3,
+               record->tariffAmountImportEuro, record->tariffAmountExportEuro,
+               record->tariffAmountGasEuro, record->networkCostsEuro);
   return !print->out->overflow;
 }
 
@@ -941,10 +944,10 @@ static void printRingFile(int fd, const char* periodText)
   outAppendFmt(&out, "\r\n%s ring records (newest first):\r\n", loggerStoreRingName(ring));
 
   //-- The column rubrics once, right aligned above the columns they name.
-  outAppendFmt(&out, "%*s;%10s;%10s;%10s;%10s;%10s;%10s;%10s;%10s\r\n", print.keyWidth,
+  outAppendFmt(&out, "%*s;%10s;%10s;%10s;%10s;%10s;%10s;%10s;%10s;%10s\r\n", print.keyWidth,
                ringKeyNames[ring], ringValueLabels[0], ringValueLabels[1], ringValueLabels[2],
                ringValueLabels[3], ringValueLabels[4], ringValueLabels[5], ringValueLabels[6],
-               ringValueLabels[7]);
+               ringValueLabels[7], ringValueLabels[8]);
   esp_err_t walked = loggerStoreListRecords(ring, appendRingFileRecord, &print);
 
   if (walked != ESP_OK)
