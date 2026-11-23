@@ -192,6 +192,7 @@ Both the MQTT message and the HTTP body carry the same single JSON document:
       "start":"2026-12-01T00:15:00Z",
       "end":"2026-12-01T00:30:00Z",
       "importPricePerKwh":-0.042,
+      "exportPricePerKwh":0.096,
       "gasPricePerM3":1.09
     }
   ]

@@ -1,12 +1,17 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-22 · Build: 33
+// Date: 2026-11-23 · Build: 35
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
 // needs one registry entry plus a matching section in index.html and a
 // command on the device (the API view needs no device command: it fetches
 // the published endpoint index over plain HTTP instead — see its refresh
-// hook). The Telegrams view opens first.
+// hook). Every registry entry also carries a bar group: the logger bar shows
+// the feature views and ends with [System], the system bar shows the
+// settings views (Settings, Show RingFile, Tariffs, API) and ends with
+// [Back], which returns to the logger screen last shown. Every bar is named
+// by a macOS-style leading caption ("Logger:" / "System:"). The realtime
+// Phase Load view opens first (at every start and reload of the page).
 // All dynamic data travels over one WebSocket at /ws: the
 // device pushes status, the telegram list and the realtime power frame, the
 // browser sends form-urlencoded commands (cmd=config, cmd=save,
@@ -29,7 +34,14 @@
 
 const state =
 {
-  screen: "telegrams",
+  // The realtime Phase Load view opens first (at every start and reload).
+  screen: "power",
+  // Which tab bar the header shows: "logger" (feature views + System) or
+  // "system" (settings views + Back).
+  bar: "logger",
+  // The logger-group view shown before the system bar opened: the Back
+  // button restores this screen.
+  lastLoggerView: "power",
   config: null,
   selectedSeq: null,
   latestSeq: null,
@@ -67,32 +79,37 @@ const WS_RAPID_CLOSE_LIMIT = 3;
 // One entry per feature view: the tab bar and the view switching are driven
 // by this registry. To add a feature: add an entry here, add a matching
 // <section class="card" hidden id="viewXxx"> to index.html and answer the
-// view's command on the device.
+// view's command on the device. The group property assigns the view to one
+// of the two bars: the logger bar ("logger", ended by the [System] button)
+// and the system bar ("system", ended by the [Back] button).
 const VIEWS =
 [
-  {id: "settings", label: "Settings", section: "viewSettings", command: "cmd=config"},
-  {id: "telegrams", label: "Telegrams", section: "viewTelegrams", command: "cmd=telegrams"},
-  {id: "power", label: "Phase Load", section: "viewPower", command: "cmd=power"},
+  {id: "settings", label: "Settings", section: "viewSettings", command: "cmd=config",
+   group: "system"},
+  {id: "telegrams", label: "Telegrams", section: "viewTelegrams", command: "cmd=telegrams",
+   group: "logger"},
+  {id: "power", label: "Phase Load", section: "viewPower", command: "cmd=power",
+   group: "logger"},
   {id: "ringfile", label: "Show RingFile", section: "viewRingFile",
-   command: () => "cmd=ringfile&ring=" + selectedRing()},
+   command: () => "cmd=ringfile&ring=" + selectedRing(), group: "system"},
   {id: "hoursGraph", label: "Hours", section: "viewHoursGraph",
-   command: "cmd=graph&ring=hours"},
+   command: "cmd=graph&ring=hours", group: "logger"},
   {id: "daysGraph", label: "Days", section: "viewDaysGraph",
-   command: "cmd=graph&ring=days"},
+   command: "cmd=graph&ring=days", group: "logger"},
   {id: "monthsGraph", label: "Months", section: "viewMonthsGraph",
-   command: "cmd=graph&ring=months"},
+   command: "cmd=graph&ring=months", group: "logger"},
   {id: "actualGraph", label: "Actual", section: "viewActualGraph",
-   command: "cmd=actualgraph"},
+   command: "cmd=actualgraph", group: "logger"},
   // The Tariffs view reads the stored schedule over plain HTTP (see
   // refreshTariffs), so it carries a refresh hook like the API view
   // instead of a WebSocket command.
   {id: "tariffs", label: "Tariffs", section: "viewTariffs", command: null,
-   refresh: refreshTariffs},
+   refresh: refreshTariffs, group: "system"},
   // The API view needs no WebSocket command: it fetches the device's own
   // endpoint index from GET /api/v3 (see refreshApiList), so it carries a
   // refresh hook instead of a command.
   {id: "api", label: "API", section: "viewApi", command: null,
-   refresh: refreshApiList},
+   refresh: refreshApiList, group: "system"},
 ];
 
 // Resolves a view's command: either a fixed string or a function evaluated
@@ -105,12 +122,13 @@ function viewCommand(view)
 
 const el = {};
 
-// Built once by buildTabBar(); maps a view id to its tab button.
+// Filled by buildTabBar() for the active bar; maps a view id to its tab
+// button (only the buttons of the shown bar are in the map).
 const tabButtons = {};
 
 function bindElements()
 {
-  const ids = ["tabBar", "statusStrip", "settingsMessage", "settingsForm",
+  const ids = ["tabBar", "tabBarCaption", "statusStrip", "settingsMessage", "settingsForm",
                "headerVersion", "headerClock",
                "srcToggle", "srcLiveLabel", "srcTestLabel",
                "rxPolarityToggle", "polNormalLabel", "polInvertedLabel",
@@ -3723,13 +3741,26 @@ function renderTariffTable(data)
 //-- View switching and boot
 //-- --------------------------------------------------------------------------
 
-// Builds the segmented control from the VIEWS registry: every future
-// feature button gets the same pill styling and click wiring for free.
+// Builds the segmented control from the VIEWS registry for the active bar:
+// the logger bar shows the logger views and ends with [System], the system
+// bar shows the system views (Settings, Show RingFile, Tariffs, API) and
+// ends with [Back]. Every button carries the same .tab pill styling, so the
+// look and feel of the bar stays as it was and every future feature button
+// gets the styling and click wiring for free.
 function buildTabBar()
 {
-  el.tabBar.textContent = "";
+  // The macOS-style bar caption names the active bar left of the pills:
+  // "Logger:" before the feature buttons and "System:" before the settings
+  // buttons (the span in the .tabRow of index.html).
+  el.tabBarCaption.textContent = (state.bar === "logger") ? "Logger:" : "System:";
 
-  VIEWS.forEach((view) =>
+  el.tabBar.textContent = "";
+  Object.keys(tabButtons).forEach((id) =>
+  {
+    delete tabButtons[id];
+  });
+
+  VIEWS.filter((view) => view.group === state.bar).forEach((view) =>
   {
     const button = document.createElement("button");
     button.type = "button";
@@ -3740,6 +3771,49 @@ function buildTabBar()
     el.tabBar.appendChild(button);
     tabButtons[view.id] = button;
   });
+
+  // The bar switch sits at the right end of every bar: [System] opens the
+  // system bar, [Back] returns to the logger screen last shown.
+  const switchButton = document.createElement("button");
+  switchButton.type = "button";
+  switchButton.className = "tab";
+  switchButton.textContent = (state.bar === "logger") ? "System" : "Back";
+  switchButton.setAttribute("role", "tab");
+  switchButton.addEventListener("click", () => switchBar());
+  el.tabBar.appendChild(switchButton);
+
+  markActiveTab();
+}
+
+// Marks the button of the shown view as the active tab; only the buttons of
+// the active bar live in the bar, so the map is walked.
+function markActiveTab()
+{
+  Object.keys(tabButtons).forEach((id) =>
+  {
+    tabButtons[id].classList.toggle("active", id === state.screen);
+    tabButtons[id].setAttribute("aria-selected", String(id === state.screen));
+  });
+}
+
+// Swaps the two bars: [System] switches to the system bar and opens its
+// first view, [Back] switches back to the logger bar and restores the
+// logger screen last shown before the system bar opened.
+function switchBar()
+{
+  if (state.bar === "logger")
+  {
+    const firstSystemView = VIEWS.find((view) => view.group === "system");
+
+    state.bar = "system";
+    buildTabBar();
+    showScreen(firstSystemView.id);
+    return;
+  }
+
+  state.bar = "logger";
+  buildTabBar();
+  showScreen(state.lastLoggerView);
 }
 
 function showScreen(name)
@@ -3753,12 +3827,18 @@ function showScreen(name)
 
   state.screen = view.id;
 
+  // The Back button restores this screen once the system bar opened.
+  if (view.group === "logger")
+  {
+    state.lastLoggerView = view.id;
+  }
+
   VIEWS.forEach((entry) =>
   {
     el[entry.section].hidden = (entry.id !== view.id);
-    tabButtons[entry.id].classList.toggle("active", entry.id === view.id);
-    tabButtons[entry.id].setAttribute("aria-selected", String(entry.id === view.id));
   });
+
+  markActiveTab();
 
   if (view.command !== null)
   {
@@ -3963,7 +4043,9 @@ function boot()
   });
 
   wsConnect();
-  showScreen("telegrams");
+  // The realtime Phase Load view is the default screen at every start and
+  // reload of the page (reset and startup).
+  showScreen("power");
 }
 
 document.addEventListener("DOMContentLoaded", boot);

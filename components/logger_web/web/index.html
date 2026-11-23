@@ -11,8 +11,14 @@
     <div class="headerInner">
       <h1>lastDSMRlogger</h1>
       <!-- The tab bar is built by app.js from the VIEWS registry so new
-           feature buttons only need one registry entry and one section. -->
-      <nav id="tabBar" class="segmented" role="tablist" aria-label="Views"></nav>
+           feature buttons only need one registry entry and one section. The
+           caption names the active bar the way macOS labels a control:
+           "Logger:" before the feature buttons, "System:" before the
+           settings buttons (see buildTabBar in app.js). -->
+      <div class="tabRow">
+        <span id="tabBarCaption" class="barCaption" aria-hidden="true"></span>
+        <nav id="tabBar" class="segmented" role="tablist" aria-label="Views"></nav>
+      </div>
       <!-- Program version and device wall clock, filled by the status push. -->
       <div class="headerInfo">
         <span id="headerVersion"></span>

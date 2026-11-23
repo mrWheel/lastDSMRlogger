@@ -1,7 +1,7 @@
 # lastDSMRlogger
-
-fileVersion: [49] - 23-11-2026 - 07:02
-
+<!--
+fileVersion: [51] - 23-11-2026 - 10:21
+-->
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
 shows recent telegrams in a single-page web application with nine views:
@@ -157,9 +157,18 @@ overflows, which previously killed the server and blanked the detail panes.
 The interface uses an iOS/macOS look and feel (system fonts, translucent
 header, grouped cards, an iOS blue accent, automatic light/dark mode). The
 tab bar is an iOS-style segmented control built by `app.js` from the `VIEWS`
-registry: adding a feature button takes one registry entry in `app.js`, a
-matching `<section>` in `index.html`, and an answer to the view's command on
-the device.
+registry: adding a feature button takes one registry entry in `app.js`
+(including its `group`), a matching `<section>` in `index.html`, and an
+answer to the view's command on the device. The registry's `group` property
+assigns every view to one of the two bars: the **logger bar** shows the
+feature views (Telegrams, Phase Load, Hours, Days, Months, Actual) and ends
+with a **System** button, the **system bar** shows the settings views
+(Settings, Show RingFile, Tariffs, API) and ends with a **Back** button.
+Pressing System swaps to the system bar and opens its first view; pressing
+Back swaps to the logger bar and restores the logger screen last shown. Each
+bar is named by a macOS-style leading caption left of the pills: **Logger:**
+before the feature buttons and **System:** before the settings buttons. The
+Phase Load view is the default screen at every start and reload of the page.
 
 - **Settings**: prefilled with the configuration currently stored in NVS and
   refilled after every save, so the form always shows the settings in force.
@@ -853,7 +862,7 @@ a maintainer-side fix would make full-ring listings fast again.
 |Item                                    |Size                                                            |
 |----------------------------------------|----------------------------------------------------------------|
 |Parser workspace (telegram + raw copy)  |`DSMR_DEFAULT_WORKSPACE_BYTES` ≈ 40 KB (2 × 12 KB + tables)     |
-|Telegram history                        |4 records × (12 KB raw + up to 96 field snapshots) ≈ 100 KB     |
+|Telegram history                        |2 records × (12 KB raw + up to 96 field snapshots) ≈ 50 KB     |
 |Per-burst UART0 TX driver               |TX ring = frame length + 512 B, internal heap, only during a burst |
 |Requirement                             |accommodates at least two maximum-sized telegram records        |
 
