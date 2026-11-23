@@ -862,7 +862,7 @@ a maintainer-side fix would make full-ring listings fast again.
 |Item                                    |Size                                                            |
 |----------------------------------------|----------------------------------------------------------------|
 |Parser workspace (telegram + raw copy)  |`DSMR_DEFAULT_WORKSPACE_BYTES` ≈ 40 KB (2 × 12 KB + tables)     |
-|Telegram history                        |2 records × (12 KB raw + up to 96 field snapshots) ≈ 50 KB     |
+|Telegram history                        |1 record × (12 KB raw + up to 96 field snapshots) ≈ 50 KB     |
 |Per-burst UART0 TX driver               |TX ring = frame length + 512 B, internal heap, only during a burst |
 |Requirement                             |accommodates at least two maximum-sized telegram records        |
 

@@ -1460,12 +1460,15 @@ function drawPowerSpark(scale)
   ctx.lineTo(cssWidth, mid);
   ctx.stroke();
 
+  // Ladder labels follow the bar sides: consumption (the signed-negative
+  // watts) grows up so its scale reads at the top, feed-in hangs down with
+  // its scale at the bottom, like the used/returned panels of the graphs.
   ctx.font = "10px " + cssVar("--mono", "monospace");
   ctx.fillStyle = secondaryColor;
   ctx.textBaseline = "top";
-  ctx.fillText("+" + scale + " W", 4, padY - 8 < 0 ? 0 : padY - 8);
+  ctx.fillText("-" + scale + " W", 4, padY - 8 < 0 ? 0 : padY - 8);
   ctx.textBaseline = "bottom";
-  ctx.fillText("-" + scale + " W", 4, cssHeight);
+  ctx.fillText("+" + scale + " W", 4, cssHeight);
 
   const samples = state.powerHistory;
 
@@ -1481,10 +1484,13 @@ function drawPowerSpark(scale)
   const slot = cssWidth / samples.length;
   const barWidth = Math.max(1, Math.min(10, Math.floor(slot * 0.65)));
 
+  // Mirrored ladder like the used/returned graph panels: the signed-negative
+  // consumption watts map above the zero line and the positive feed-in ones
+  // below it, so red consumption grows up and green feed-in hangs down.
   function yOf(total)
   {
     const clamped = Math.max(-scale, Math.min(scale, total));
-    return mid - (clamped / scale) * halfSpan;
+    return mid + (clamped / scale) * halfSpan;
   }
 
   function centreOf(index)
@@ -1492,9 +1498,10 @@ function drawPowerSpark(scale)
     return (samples.length === 1) ? (cssWidth / 2) : ((index + 0.5) * slot);
   }
 
-  // Centre-zero bars: consumption hangs red below the zero line, feed-in
-  // grows green above it, with a brighter cap at the value end so even the
-  // thinnest bars stay readable.
+  // Centre-zero bars: consumption grows red above the zero line, feed-in
+  // hangs green below it (the same sides the used/returned graph panels
+  // use), with a brighter cap at the value end so even the thinnest bars
+  // stay readable.
   samples.forEach((sample, index) =>
   {
     const produce = sample.total >= 0;
@@ -1502,10 +1509,10 @@ function drawPowerSpark(scale)
     const x = centreOf(index) - barWidth / 2;
 
     ctx.fillStyle = produce ? "rgba(52, 199, 89, 0.7)" : "rgba(255, 59, 48, 0.7)";
-    ctx.fillRect(x, produce ? (mid - barHeight) : mid, barWidth, barHeight);
+    ctx.fillRect(x, produce ? mid : (mid - barHeight), barWidth, barHeight);
 
     ctx.fillStyle = produce ? produceColor : consumeColor;
-    ctx.fillRect(x, produce ? (mid - barHeight) : (mid + barHeight - 1), barWidth, 1);
+    ctx.fillRect(x, produce ? (mid + barHeight - 1) : (mid - barHeight), barWidth, 1);
   });
 
   // The latest reading as a glowing dot above the newest bar.
