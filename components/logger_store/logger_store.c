@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.c - hour, day and month smart meter ring file store
-//-- Date: 2026-11-22 · Build: 12
+//-- Date: 2026-11-23 · Build: 13
 //--
 //-- The store task owns all ring_file_store work: it mounts the LittleFS
 //-- storage partition, removes the ring file of the retired minute store,
@@ -69,6 +69,18 @@ static const char* tag = "meterStore";
 //-- The ring file of the retired per-minute store; it has no reader
 //-- anymore and is removed from the volume when it is still present.
 #define STORE_LEGACY_RING_PATH STORE_MOUNT_POINT "/meter.rfs"
+
+//-- Record layout version marker on the volume. The ring files store the
+//-- payload as raw bytes, so a firmware that changed the *meaning* of a
+//-- field cannot tell its records from the old ones by size alone (the
+//-- tariff amounts moved from one per tariff to one per direction of the
+//-- energy, which kept the struct's eight floats). The store task compares
+//-- this marker after mounting: a volume that does not carry the marker of
+//-- the current layout gets its three ring files rebuilt empty (the
+//-- retained periods return through the console's populate command). Bump
+//-- the version with every payload change, name change included.
+#define STORE_LAYOUT_MARKER_PATH STORE_MOUNT_POINT "/ringlayout.ver"
+#define STORE_RECORD_LAYOUT_VERSION 2u
 
 //-- Buffered persistence with a one-record staging buffer: the newest
 //-- record of every ring lives in RAM until the staging buffer flushes
@@ -182,11 +194,14 @@ bool loggerStoreRingFromName(const char* name, loggerMeterRing_t* outRing)
 
 //-- OBIS codes of the wanted measurements. Gas lives on 0-1:24.2.1 in the
 //-- Dutch DSMR profiles and on 0-1:24.2.3 in the Belgian eMUCs profile, so
-//-- both are collected and the first one published wins.
-#define STORE_WANTED_COUNT 6
+//-- both are collected and the first one published wins. The last entry is
+//-- the meter's tariff indicator (001/002): it is not a counter and never
+//-- lands in the record, it only names the tariff whose prices value the
+//-- snapshot's amounts.
+#define STORE_WANTED_COUNT 7
 
-static const char* const wantedObis[STORE_WANTED_COUNT] = {"1-0:1.8.1", "1-0:1.8.2",  "1-0:2.8.1",
-                                                           "1-0:2.8.2", "0-1:24.2.1", "0-1:24.2.3"};
+static const char* const wantedObis[STORE_WANTED_COUNT] = {
+    "1-0:1.8.1", "1-0:1.8.2", "1-0:2.8.1", "1-0:2.8.2", "0-1:24.2.1", "0-1:24.2.3", "0-0:96.14.0"};
 
 typedef struct
 {
@@ -222,12 +237,15 @@ static bool collectMeterFields(const loggerTelegramRecord* record, void* userDat
   return true;
 }
 
-//-- Fills the payload counters from the newest retained telegram. Counters
-//-- the telegram did not publish (and the case of no telegram at all) stay
-//-- 0.0; the return value only reports whether a telegram was inspected.
-static bool readLatestMeterCounters(loggerMeterRecord* record)
+//-- Fills the payload counters from the newest retained telegram and reports
+//-- the tariff indicator that telegram published (1 or 2; 0 when the meter
+//-- names no active tariff, and also 0 when no telegram was inspected).
+//-- Counters the telegram did not publish stay 0.0; the return value only
+//-- reports whether a telegram was inspected.
+static bool readLatestMeterCounters(loggerMeterRecord* record, uint8_t* outTariffIndicator)
 {
   memset(record, 0, sizeof *record);
+  *outTariffIndicator = 0u;
 
   loggerTelegramMeta meta;
 
@@ -251,6 +269,18 @@ static bool readLatestMeterCounters(loggerMeterRecord* record)
 
   //-- Gas: Dutch code first, Belgian eMUCs code as fallback.
   record->gasDeliveredM3 = scan.found[4] ? scan.values[4] : scan.values[5];
+
+  //-- Tariff indicator: the meter publishes it as 001 or 002 (some also as
+  //-- 000). Anything but one or two counts as "no active tariff named".
+  if (scan.found[6])
+  {
+    const int indicator = (int)(scan.values[6] + 0.5f);
+
+    if ((indicator == 1) || (indicator == 2))
+    {
+      *outTariffIndicator = (uint8_t)indicator;
+    }
+  }
 
   return true;
 }
@@ -363,6 +393,24 @@ static bool openMeterRing(MeterRing* ring)
     result = ringFileOpen(ring->path, &openConfig, &handle);
   }
 
+  //-- A retained file written by a firmware whose loggerMeterRecord had a
+  //-- different layout cannot be read back (the schema id and the record
+  //-- size both live in the file header). Rebuild such a file empty once,
+  //-- like a ring whose capacity changed: the console's populate command
+  //-- fills it again.
+  if (result == RING_FILE_STORE_ERR_SCHEMA_MISMATCH)
+  {
+    ESP_LOGW(tag,
+             "ring file %s was written with another record layout: rebuilding it empty "
+             "(re-run populate to fill it)",
+             ring->path);
+    (void)unlink(ring->path);
+    (void)ringFileBreakStaleLock(ring->path);
+    handle = NULL;
+
+    result = ringFileCreate(ring->path, &config, &handle);
+  }
+
   if (result != ESP_OK)
   {
     ESP_LOGE(tag, "could not open ring file %s: %s", ring->path, esp_err_to_name(result));
@@ -413,6 +461,56 @@ static bool openMeterRing(MeterRing* ring)
   return true;
 }
 
+//-- Rebuilds the three ring files once when the volume still carries the
+//-- records of another payload layout (see STORE_RECORD_LAYOUT_VERSION).
+//-- Everything else on the volume — the tariff schedule and the import csv
+//-- files — stays untouched.
+static void ensureRingRecordLayout(void)
+{
+  uint32_t storedVersion = 0u;
+  FILE* marker = fopen(STORE_LAYOUT_MARKER_PATH, "rb");
+
+  if (marker != NULL)
+  {
+    size_t readCount = fread(&storedVersion, sizeof storedVersion, 1u, marker);
+    fclose(marker);
+
+    if (readCount != 1u)
+    {
+      storedVersion = 0u;
+    }
+  }
+
+  if (storedVersion == STORE_RECORD_LAYOUT_VERSION)
+  {
+    return;
+  }
+
+  ESP_LOGW(tag,
+           "ring files carry record layout %u, this firmware stores layout %u: rebuilding the "
+           "rings empty (re-run populate to fill them)",
+           (unsigned)storedVersion, (unsigned)STORE_RECORD_LAYOUT_VERSION);
+
+  for (loggerMeterRing_t ring = LOGGER_RING_HOURS; ring < LOGGER_RING_COUNT; ring++)
+  {
+    (void)ringFileBreakStaleLock(rings[ring].path);
+    (void)unlink(rings[ring].path);
+  }
+
+  FILE* fresh = fopen(STORE_LAYOUT_MARKER_PATH, "wb");
+
+  if (fresh != NULL)
+  {
+    uint32_t version = STORE_RECORD_LAYOUT_VERSION;
+    (void)fwrite(&version, sizeof version, 1u, fresh);
+    fclose(fresh);
+  }
+  else
+  {
+    ESP_LOGW(tag, "could not write the ring layout marker: the rings rebuild again next boot");
+  }
+}
+
 //-- Mounts LittleFS, clears the retired minute ring file and opens the
 //-- three meter rings. False when the volume or any ring could not be
 //-- opened; already opened rings are closed again so a retry starts clean.
@@ -443,6 +541,8 @@ static bool openMeterRings(void)
   {
     ESP_LOGI(tag, "removed the retired minute ring file %s", STORE_LEGACY_RING_PATH);
   }
+
+  ensureRingRecordLayout();
 
   for (loggerMeterRing_t ring = LOGGER_RING_HOURS; ring < LOGGER_RING_COUNT; ring++)
   {
@@ -570,16 +670,17 @@ typedef enum
   IMPORT_FIELD_RETURNED_1,
   IMPORT_FIELD_RETURNED_2,
   IMPORT_FIELD_GAS,
-  IMPORT_FIELD_TARIFF_1,
-  IMPORT_FIELD_TARIFF_2,
-  IMPORT_FIELD_TARIFF_GAS
+  IMPORT_FIELD_AMOUNT_IMPORT,
+  IMPORT_FIELD_AMOUNT_EXPORT,
+  IMPORT_FIELD_AMOUNT_GAS
 } ImportField;
 
 //-- Header column name to payload field. The counters are named by their
 //-- OBIS code (without method suffix); the gas counter is accepted under the
 //-- catalogue code 0-1:24.1.0 and under the Dutch and Belgian publishing
 //-- codes alike. The three tariff amounts have no OBIS code of their own and
-//-- carry the same rubrics the ring print uses: t1, t2 and tg.
+//-- carry the same rubrics the ring print uses, named for the direction of
+//-- the energy they value: ti (import), te (export) and tg (gas).
 static const struct
 {
   const char* obis;
@@ -588,8 +689,8 @@ static const struct
     {"1-0:1.8.1", IMPORT_FIELD_DELIVERED_1}, {"1-0:1.8.2", IMPORT_FIELD_DELIVERED_2},
     {"1-0:2.8.1", IMPORT_FIELD_RETURNED_1},  {"1-0:2.8.2", IMPORT_FIELD_RETURNED_2},
     {"0-1:24.1.0", IMPORT_FIELD_GAS},        {"0-1:24.2.1", IMPORT_FIELD_GAS},
-    {"0-1:24.2.3", IMPORT_FIELD_GAS},        {"t1", IMPORT_FIELD_TARIFF_1},
-    {"t2", IMPORT_FIELD_TARIFF_2},           {"tg", IMPORT_FIELD_TARIFF_GAS},
+    {"0-1:24.2.3", IMPORT_FIELD_GAS},        {"ti", IMPORT_FIELD_AMOUNT_IMPORT},
+    {"te", IMPORT_FIELD_AMOUNT_EXPORT},      {"tg", IMPORT_FIELD_AMOUNT_GAS},
 };
 
 //-- Period key column spellings the header line may start with; the data
@@ -909,13 +1010,13 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
       case IMPORT_FIELD_GAS:
         record.gasDeliveredM3 = (float)atof(fields[index]);
         break;
-      case IMPORT_FIELD_TARIFF_1:
-        record.tariffAmount1Euro = (float)atof(fields[index]);
+      case IMPORT_FIELD_AMOUNT_IMPORT:
+        record.tariffAmountImportEuro = (float)atof(fields[index]);
         break;
-      case IMPORT_FIELD_TARIFF_2:
-        record.tariffAmount2Euro = (float)atof(fields[index]);
+      case IMPORT_FIELD_AMOUNT_EXPORT:
+        record.tariffAmountExportEuro = (float)atof(fields[index]);
         break;
-      case IMPORT_FIELD_TARIFF_GAS:
+      case IMPORT_FIELD_AMOUNT_GAS:
         record.tariffAmountGasEuro = (float)atof(fields[index]);
         break;
       default:
@@ -1107,9 +1208,10 @@ esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePa
 //-- Header of an exported file: the period key column, the five counter
 //-- columns in the spelling the populate import maps back (the 0-1:24.1.0
 //-- gas code is accepted for all published gas codes alike) and the three
-//-- tariff amounts under the rubrics the ring print uses (t1, t2 and tg).
+//-- tariff amounts under the rubrics the ring print uses, named for the
+//-- direction of the energy they value (ti, te and tg).
 #define STORE_EXPORT_HEADER                                                                        \
-  "YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255;t1;t2;tg\r\n"
+  "YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255;ti;te;tg\r\n"
 
 //-- Walks the ring newest first into a buffer (deduplicating a cursor that
 //-- is invalidated by a concurrent snapshot), then writes the file oldest
@@ -1214,8 +1316,8 @@ static esp_err_t exportRingFile(loggerMeterRing_t ring, FILE* file, uint32_t* ou
     fprintf(file, "%08" PRIu64 ";%.3f;%.3f;%.3f;%.3f;%.3f;%.2f;%.2f;%.2f\r\n", key,
             record->meter.energyDeliveredTariff1Kwh, record->meter.energyDeliveredTariff2Kwh,
             record->meter.energyReturnedTariff1Kwh, record->meter.energyReturnedTariff2Kwh,
-            record->meter.gasDeliveredM3, record->meter.tariffAmount1Euro,
-            record->meter.tariffAmount2Euro, record->meter.tariffAmountGasEuro);
+            record->meter.gasDeliveredM3, record->meter.tariffAmountImportEuro,
+            record->meter.tariffAmountExportEuro, record->meter.tariffAmountGasEuro);
   }
 
   if (ownFile)
@@ -1371,7 +1473,8 @@ static bool storeSnapshot(uint64_t* outTimeStamp)
   }
 
   loggerMeterRecord record;
-  bool telegramSeen = readLatestMeterCounters(&record);
+  uint8_t tariffIndicator = 0u;
+  bool telegramSeen = readLatestMeterCounters(&record, &tariffIndicator);
 
   uint64_t hourKey = 0u;
   (void)meterRingKey(&rings[LOGGER_RING_HOURS], timeStamp, &hourKey);
@@ -1390,14 +1493,14 @@ static bool storeSnapshot(uint64_t* outTimeStamp)
 
     if (tariffCalculator != NULL)
     {
-      tariffCalculator(ring, ringKey, &ringRecord);
+      tariffCalculator(ring, ringKey, tariffIndicator, &ringRecord);
     }
     else
     {
-      //-- The fictional tariff amounts: a random few cents per tariff.
-      ringRecord.tariffAmount1Euro =
+      //-- The fictional tariff amounts: a random few cents per amount.
+      ringRecord.tariffAmountImportEuro =
           (float)(STORE_TARIFF_CENT_MIN + (esp_random() % STORE_TARIFF_CENT_SPAN)) / 100.0f;
-      ringRecord.tariffAmount2Euro =
+      ringRecord.tariffAmountExportEuro =
           (float)(STORE_TARIFF_CENT_MIN + (esp_random() % STORE_TARIFF_CENT_SPAN)) / 100.0f;
       ringRecord.tariffAmountGasEuro =
           (float)(STORE_TARIFF_CENT_MIN + (esp_random() % STORE_TARIFF_CENT_SPAN)) / 100.0f;
@@ -1418,14 +1521,16 @@ static bool storeSnapshot(uint64_t* outTimeStamp)
   }
 
   //-- One summary line per snapshot: the hour key leads, the counters keep
-  //-- the units of the telegram (kWh and m³), the tariffs are in EUR.
+  //-- the units of the telegram (kWh and m³), the tariff amounts are in EUR
+  //-- (import, export and gas) and the tariff is the indicator the meter
+  //-- published (0 when it named none).
   ESP_LOGI(tag,
            "stored h=%08" PRIu64 " edT1=%8.3f edT2=%8.3f erT1=%8.3f erT2=%8.3f "
-           "gas=%8.3f t1=%5.2f t2=%5.2f tg=%5.2f%s",
+           "gas=%8.3f ti=%5.2f te=%5.2f tg=%5.2f tariff=%u%s",
            hourKey, record.energyDeliveredTariff1Kwh, record.energyDeliveredTariff2Kwh,
            record.energyReturnedTariff1Kwh, record.energyReturnedTariff2Kwh, record.gasDeliveredM3,
-           logged.tariffAmount1Euro, logged.tariffAmount2Euro, logged.tariffAmountGasEuro,
-           telegramSeen ? "" : " (no telegram yet)");
+           logged.tariffAmountImportEuro, logged.tariffAmountExportEuro, logged.tariffAmountGasEuro,
+           (unsigned)tariffIndicator, telegramSeen ? "" : " (no telegram yet)");
 
   *outTimeStamp = timeStamp;
   return true;

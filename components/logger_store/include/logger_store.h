@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.h - hour, day and month smart meter ring file store
-//-- Date: 2026-11-22 · Build: 11
+//-- Date: 2026-11-23 · Build: 12
 //--
 //-- Three fixed-capacity ring files land on the LittleFS storage partition,
 //-- written through mrwheel's ring_file_store component: the hours ring
@@ -61,11 +61,16 @@ bool loggerStoreRingFromName(const char* name, loggerMeterRing_t* outRing);
 //-- Meter counters of the most recently accepted telegram, in the units the
 //-- P1 telegram publishes them (kWh and m³). The tariff amounts come from
 //-- the registered tariff calculator (the tariff component's calculator
-//-- values them with the dynamic tariff table and the manual prices);
-//-- without a registered calculator they stay fictional billing figures: a
-//-- random few cents per tariff. The struct is
+//-- values them with the dynamic tariff table and the manual prices, and
+//-- picks the tariff 1 or tariff 2 price through the meter's tariff
+//-- indicator 0-0:96.14.0); without a registered calculator they stay
+//-- fictional billing figures: a random few cents per amount. The amounts
+//-- follow the direction of the energy: the import amount is what the used
+//-- energy costs, the export amount what the delivered-back energy earns
+//-- (a credit), the gas amount what the consumed gas costs. The struct is
 //-- stored as raw bytes: pointer-free fixed-width fields only, and any
-//-- layout change requires deleting the ring files. The key fields are
+//-- layout change rebuilds the ring files empty (the retained records of the
+//-- old layout cannot be read back). The key fields are
 //-- added by the ring_file_store component and are never part of this
 //-- struct.
 typedef struct
@@ -75,8 +80,8 @@ typedef struct
   float energyReturnedTariff1Kwh;
   float energyReturnedTariff2Kwh;
   float gasDeliveredM3;
-  float tariffAmount1Euro;
-  float tariffAmount2Euro;
+  float tariffAmountImportEuro;
+  float tariffAmountExportEuro;
   float tariffAmountGasEuro;
 } loggerMeterRecord;
 
@@ -84,16 +89,22 @@ typedef struct
 //-- Tariff calculator
 //-- --------------------------------------------------------------------------
 
-//-- Fills the three tariff amounts of one ring record. The store task calls
-//-- it on the store task, once per ring per snapshot, with the freshly read
-//-- counters and the period key of that ring: the calculator values the
-//-- energy consumed inside this ring's period (tariff 1, tariff 2 and gas)
-//-- and writes the amounts back into the record. The dynamic tariff table
-//-- and the manual fallback prices are the calculator's own concern; the
-//-- store only asks. Registering the tariff component's calculator replaces
-//-- the fictional demo amounts the store would otherwise write.
+//-- Fills the three tariff amounts of one ring record (import, export and
+//-- gas). The store task calls it on the store task, once per ring per
+//-- snapshot, with the freshly read counters, the period key of that ring
+//-- and the tariff indicator the meter published with them (OBIS
+//-- 0-0:96.14.0: 1 or 2; 0 when the meter names no active tariff, which
+//-- prices like tariff 1). The calculator values the energy that grew inside
+//-- this ring's period — the used energy against the import price, the
+//-- delivered-back energy against the export price and the gas against the
+//-- gas price — and writes the amounts back into the record; the tariff
+//-- indicator picks which of the two tariff prices of a direction applies.
+//-- The dynamic tariff table and the manual fallback prices are the
+//-- calculator's own concern; the store only asks. Registering the tariff
+//-- component's calculator replaces the fictional demo amounts the store
+//-- would otherwise write.
 typedef void (*loggerStoreTariffCalculator)(loggerMeterRing_t ring, uint64_t ringKey,
-                                            loggerMeterRecord* record);
+                                            uint8_t tariffIndicator, loggerMeterRecord* record);
 
 //-- Registers (or with NULL, unregisters) the calculator used for every
 //-- snapshot from now on. Called once at boot, before or after the store
@@ -167,7 +178,8 @@ typedef struct
 //-- (kWh) and the gas counter 0-1:24.1.0 (also accepted as 0-1:24.2.1 or
 //-- 0-1:24.2.3), all case-insensitive and with an optional "*255" method
 //-- suffix. The three tariff amounts carry the rubrics of the ring print:
-//-- t1, t2 and tg. Unknown columns - including the "#" and empty trailing
+//-- ti (import), te (export) and tg (gas). Unknown columns - including the
+//-- "#" and empty trailing
 //-- columns of handwritten files - are skipped. Every data line starts with
 //-- the period key and carries its values in header order; a blank or
 //-- missing value becomes 0.0. The mode picks how the ring's current records are
@@ -195,7 +207,7 @@ esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePa
 //-- separated csv file (the console's ring2csv command): the file lands at
 //-- the volume root as "RING<hours|days|months>.csv", carries the header
 //-- "YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;
-//-- 0-1:24.1.0*255;t1;t2;tg" and one line per retained record, oldest
+//-- 0-1:24.1.0*255;ti;te;tg" and one line per retained record, oldest
 //-- period first, with the key as eight digits, the five counters at three
 //-- decimals and the three tariff amounts at two.
 //-- The result re-imports through loggerStorePopulateRing() unchanged.

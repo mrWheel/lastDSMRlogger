@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_tariffs.h - dynamic electricity tariff schedules
-//-- Date: 2026-11-22 · Build: 3
+//-- Date: 2026-11-23 · Build: 4
 //--
 //-- The shared tariff domain of the logger: prices per kWh for imported and
 //-- exported energy plus a price per m³ for gas, submitted as one versioned
@@ -184,17 +184,21 @@ esp_err_t loggerTariffsAggregate(time_t from, time_t to, loggerTariffResolution_
 
 //-- Tariff calculator for the meter store (register it with
 //-- loggerStoreSetTariffCalculator). For one ring snapshot it values the
-//-- energy consumed inside that ring's period: every minute of consumption
-//-- is priced with the import price the table holds for that instant while
-//-- the dynamic tariffs switch is on, and with the manual tariff prices
-//-- otherwise or where the table covers nothing (a dynamic tariff is one
-//-- price that always applies, there is no normal/off-peak distinction).
-//-- Gas is priced with the gas price the table holds for that instant when
-//-- it has one, and with the manual gas price otherwise. The amounts
-//-- accumulate inside the current period (they restart when a new period
-//-- opens or after a reboot, as the staged record is rewritten anyway).
+//-- energy that grew inside that ring's period per direction: the used
+//-- energy against the import price (the tariff amount is a cost), the
+//-- delivered-back energy against the export price (the tariff amount is a
+//-- credit) and the gas against the gas price. While the dynamic tariffs
+//-- switch is on, the prices the table holds for that instant rule;
+//-- otherwise, or where the table covers nothing, the manual prices do (a
+//-- dynamic tariff is one price that always applies, there is no
+//-- normal/off-peak distinction). The meter's tariff indicator (OBIS
+//-- 0-0:96.14.0, passed in by the store with the snapshot's counters) picks
+//-- which of the two manual prices of a direction applies; a meter that
+//-- names no active tariff (0) prices like tariff 1. The amounts accumulate
+//-- inside the current period (they restart when a new period opens or after
+//-- a reboot, as the staged record is rewritten anyway).
 void loggerTariffsMeterAmountCalculator(loggerMeterRing_t ring, uint64_t ringKey,
-                                        loggerMeterRecord* record);
+                                        uint8_t tariffIndicator, loggerMeterRecord* record);
 
 //-- --------------------------------------------------------------------------
 //-- MQTT topic and timestamp helpers

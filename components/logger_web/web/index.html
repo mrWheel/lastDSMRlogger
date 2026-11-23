@@ -175,11 +175,17 @@
           </div>
         </fieldset>
 
-        <!-- Tariffs group: with Dynamic Tariffs on the stored tariff
-             amounts come from the dynamic tariff table (one price that
-             always applies, gas included when the table carries one);
-             periods or prices the table does not carry fall back to the
-             manual prices below. -->
+        <!-- Tariffs group: the manual prices follow the direction of the
+             energy. Delivered is what the grid delivers to the home (the
+             used energy, a cost); Received is what the home delivers back
+             (returned energy, a credit). The meter's tariff indicator
+             (OBIS 0-0:96.14.0) names which of the two tariff prices of a
+             direction values a reading. With Dynamic Tariffs on the stored
+             tariff amounts come from the dynamic tariff table (one price
+             that always applies per direction, gas included when the table
+             carries one); periods or prices the table does not carry fall
+             back to the manual prices below. Gas is only ever delivered to
+             the home, so it needs no Received price. -->
         <fieldset class="iosGroup">
           <legend>Tariffs</legend>
           <div class="iosRow">
@@ -189,19 +195,31 @@
           </div>
 
           <div class="iosRow">
-            <label for="inpTariff1">Tariff 1 (kWh)</label>
+            <label for="inpTariff1">Tariff 1 Delivered (kWh)</label>
             <input id="inpTariff1" type="number" step="0.001" min="-5" max="5" value="0"
-                   inputmode="decimal" placeholder="EUR per kWh">
+                   inputmode="decimal" placeholder="EUR per kWh used">
           </div>
 
           <div class="iosRow">
-            <label for="inpTariff2">Tariff 2 (kWh)</label>
+            <label for="inpTariff2">Tariff 2 Delivered (kWh)</label>
             <input id="inpTariff2" type="number" step="0.001" min="-5" max="5" value="0"
-                   inputmode="decimal" placeholder="EUR per kWh">
+                   inputmode="decimal" placeholder="EUR per kWh used">
           </div>
 
           <div class="iosRow">
-            <label for="inpTariffGas">Tariff Gas (m3)</label>
+            <label for="inpTariff1Export">Tariff 1 Received (kWh)</label>
+            <input id="inpTariff1Export" type="number" step="0.001" min="-5" max="5" value="0"
+                   inputmode="decimal" placeholder="EUR per kWh returned">
+          </div>
+
+          <div class="iosRow">
+            <label for="inpTariff2Export">Tariff 2 Received (kWh)</label>
+            <input id="inpTariff2Export" type="number" step="0.001" min="-5" max="5" value="0"
+                   inputmode="decimal" placeholder="EUR per kWh returned">
+          </div>
+
+          <div class="iosRow">
+            <label for="inpTariffGas">Tariff Gas Delivered (m3)</label>
             <input id="inpTariffGas" type="number" step="0.001" min="-5" max="5" value="0"
                    inputmode="decimal" placeholder="EUR per m3">
           </div>
@@ -289,12 +307,16 @@
       <!-- The records of the selected on-device ring file, newest period
            first (the device walks its ring from the newest slot): one row
            per stored period with the five meter counters (kWh and m³) and
-           the three fictional tariff amounts (EUR). The first column header
-           follows the ring (Hour / Day / Month). Rows are built by app.js. -->
+           the three tariff amounts (EUR) per direction of the energy: the
+           import amount (what the used energy costs), the export amount
+           (what the delivered-back energy earns) and the gas amount;
+           fictional billing cents while no calculator runs. The first
+           column header follows the ring (Hour / Day / Month). Rows are
+           built by app.js. -->
       <div class="tableWrap">
         <table id="ringFileTable">
           <thead>
-            <tr><th id="ringFileKeyHeader">Hour</th><th class="valueNumeric">Ed T1 kWh</th><th class="valueNumeric">Ed T2 kWh</th><th class="valueNumeric">Er T1 kWh</th><th class="valueNumeric">Er T2 kWh</th><th class="valueNumeric">Gas m³</th><th class="valueNumeric">Tariff 1 €</th><th class="valueNumeric">Tariff 2 €</th><th class="valueNumeric">Tariff Gas €</th></tr>
+            <tr><th id="ringFileKeyHeader">Hour</th><th class="valueNumeric">Ed T1 kWh</th><th class="valueNumeric">Ed T2 kWh</th><th class="valueNumeric">Er T1 kWh</th><th class="valueNumeric">Er T2 kWh</th><th class="valueNumeric">Gas m³</th><th class="valueNumeric">Import €</th><th class="valueNumeric">Export €</th><th class="valueNumeric">Gas €</th></tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -432,21 +454,22 @@
       </div>
       <!-- The Costs presentation of the same frame, styled after the old
            DSMRlogger32 history page (assets/oldMonthsCosts.png): per month
-           the electricity amount (the ring's two tariff amounts added),
-           the gas amount and the fixed monthly network fee from Settings
-           (its Netw. column), with the total, each month paired with the
-           same month of the year before. The Advance row prints each
-           half's advance payment: the sum of that column's totals over
-           twelve (the old page's Voorschot Bedrag). Rows are built by
-           app.js. -->
+           the electricity amount (the ring's import amount, what the used
+           energy costs), the export amount (the credit the delivered-back
+           energy earns, subtracted in the total), the gas amount and the
+           fixed monthly network fee from Settings (its Netw. column), with
+           the total, each month paired with the same month of the year
+           before. The Advance row prints each half's advance payment: the
+           sum of that column's totals over twelve (the old page's Voorschot
+           Bedrag). Rows are built by app.js. -->
       <div class="tableWrap" id="monthsGraphCostsTableWrap" hidden>
         <table id="monthsGraphCostsTable">
           <thead>
             <tr>
               <th>Month</th><th class="valueNumeric">Year</th>
-              <th class="valueNumeric">Electra (€)</th><th class="valueNumeric">Gas (€)</th><th class="valueNumeric">Netw. (€)</th><th class="valueNumeric">Total (€)</th>
+              <th class="valueNumeric">Electra (€)</th><th class="valueNumeric">Export (€)</th><th class="valueNumeric">Gas (€)</th><th class="valueNumeric">Netw. (€)</th><th class="valueNumeric">Total (€)</th>
               <th class="valueNumeric">Year</th>
-              <th class="valueNumeric">Electra (€)</th><th class="valueNumeric">Gas (€)</th><th class="valueNumeric">Netw. (€)</th><th class="valueNumeric">Total (€)</th>
+              <th class="valueNumeric">Electra (€)</th><th class="valueNumeric">Export (€)</th><th class="valueNumeric">Gas (€)</th><th class="valueNumeric">Netw. (€)</th><th class="valueNumeric">Total (€)</th>
             </tr>
           </thead>
           <tbody></tbody>

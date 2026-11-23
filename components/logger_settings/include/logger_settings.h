@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.h - versioned settings service
-//-- Date: 2026-11-22 · Build: 9
+//-- Date: 2026-11-23 · Build: 10
 //--
 //-- The settings service stores the complete versioned configuration in
 //-- ESP-IDF NVS, validates it against the parserDSMR built-in profiles and
@@ -86,6 +86,11 @@ typedef enum
 //-- costs were appended at the end of the struct. Blobs of any earlier size
 //-- migrate on load: the appended field gets its default, so no save is
 //-- required after updating.
+//-- Version 5 (extended a fifth time): the two export (delivered-back)
+//-- tariff prices were appended at the end of the struct, and the manual
+//-- import tariff prices gained their import/export names (identical layout,
+//-- names only). Blobs of any earlier size migrate on load: the appended
+//-- prices get their default, so no save is required after updating.
 #define LOGGER_SETTINGS_VERSION 5u
 #define LOGGER_SETTINGS_PROFILE_ID_MAX 32
 #define LOGGER_SETTINGS_COUNTRY_MAX 3
@@ -112,10 +117,12 @@ typedef enum
 #define LOGGER_SETTINGS_RFS_SYNC_MAX_MINUTES 60u
 #define LOGGER_SETTINGS_RFS_SYNC_DEFAULT_MINUTES 10u
 
-//-- Bounds of the manual tariff prices in EUR per kWh (both energy
-//-- tariffs) and EUR per m³ (gas). Negative prices are valid: negative
-//-- spot prices occur. The prices apply when the dynamic tariff table has
-//-- no import price for the period, and always for gas.
+//-- Bounds of the manual tariff prices in EUR per kWh (the import and the
+//-- export price of both energy tariffs) and EUR per m³ (gas). Negative
+//-- prices are valid: negative spot prices occur. The prices apply when the
+//-- dynamic tariff table has no price for the period, and always for gas.
+//-- The tariff 1 or tariff 2 price of a direction applies as the meter's
+//-- tariff indicator (OBIS 0-0:96.14.0) names the active tariff.
 #define LOGGER_SETTINGS_TARIFF_PRICE_MIN (-5.0f)
 #define LOGGER_SETTINGS_TARIFF_PRICE_MAX 5.0f
 
@@ -202,18 +209,25 @@ typedef struct
   //-- task commits the staged ring records at least this often.
   uint16_t rfsSyncIntervalMinutes;
 
-  //-- Manual tariff prices in EUR per kWh (both energy tariffs) and EUR
-  //-- per m³ (gas): the fallback for periods the dynamic tariff table does
-  //-- not price, and the only price for gas.
-  float tariff1PricePerKwh;
-  float tariff2PricePerKwh;
+  //-- Manual import (delivered, used) tariff prices in EUR per kWh for the
+  //-- two energy tariffs: the fallback for periods the dynamic tariff table
+  //-- does not price. The meter's tariff indicator (OBIS 0-0:96.14.0) names
+  //-- the tariff active at the moment of a reading and picks which of the
+  //-- two prices values that reading's consumed energy. The matching export
+  //-- prices live at the end of the struct (appended later).
+  float tariff1ImportPricePerKwh;
+  float tariff2ImportPricePerKwh;
+
+  //-- Manual gas price in EUR per m³: gas is only ever delivered to the
+  //-- home, so it needs no import/export pair, and it is the only gas price
+  //-- (the dynamic table's gas price overrides it when present).
   float tariffGasPricePerM3;
 
   //-- Dynamic tariffs switch. True lets the meter store value the consumed
-  //-- energy with the import prices of the dynamic tariff table (through
-  //-- the registered tariff calculator); periods without a stored price
-  //-- fall back to the manual prices above. False always uses the manual
-  //-- prices.
+  //-- and the delivered-back energy with the import and export prices of the
+  //-- dynamic tariff table (through the registered tariff calculator);
+  //-- periods without a stored price fall back to the manual prices. False
+  //-- always uses the manual prices.
   bool dynamicTariffsEnabled;
 
   //-- ------------------------------------------------------------------------
@@ -241,6 +255,19 @@ typedef struct
   //-- and gas amounts (the "Netw." column, like the old DSMRlogger32
   //-- history pages). 0 earns nothing until it is filled in.
   float networkCostsPerMonthEuro;
+
+  //-- ------------------------------------------------------------------------
+  //-- Export (delivered-back) tariff prices (appended with the fifth version
+  //-- 5 extension; older blobs leave these at their default)
+  //-- ------------------------------------------------------------------------
+
+  //-- Manual export (returned, delivered back to the grid) tariff prices in
+  //-- EUR per kWh for the two energy tariffs: the counterpart of the manual
+  //-- import prices above, valued against the energy the meter reports on
+  //-- its return registers. The tariff indicator picks which of the two
+  //-- applies; the dynamic table's export price overrides both when present.
+  float tariff1ExportPricePerKwh;
+  float tariff2ExportPricePerKwh;
 } loggerSettingsConfig;
 
 //-- Loads the stored configuration and validates it. Returns ESP_ERR_NOT_FOUND

@@ -1,7 +1,7 @@
 # Dynamic pricing with lastDSMRlogger
 
-fileVersion: [1] - 22-11-2026 - 19:10
-Buildnumber: 1 - Last update-date: 22-11-2026
+fileVersion: [2] - 23-11-2026 - 14:29
+Buildnumber: 2 - Last update-date: 23-11-2026
 
 Who is this for: users who want the logger to show real energy costs (and the
 current kWh price) instead of fixed manual prices, and who are comfortable
@@ -32,19 +32,30 @@ flash volume and uses it to price the energy your meter reports.
 
 - `GET /api/v3/tariffs` answers the interval that is active right now
   (import, export and gas price), or says it is unavailable.
+- The ring stores its tariff amounts **per direction of the energy**: the
+  import amount (what the grid delivered to the home — the used energy, a
+  cost), the export amount (what the home delivered back — returned energy,
+  a credit) and the gas amount.
 - With the **Dynamic Tariffs** switch on (Settings view, **Tariffs** group),
   the meter store values the stored ring records with the table instead of
-  the manual prices: each minute of consumption is priced with the import
-  price the table holds for that instant, gas with the `gasPricePerM3` for
+  the manual prices: each minute of used energy is priced with the import
+  price the table holds for that instant, each minute of delivered-back
+  energy with its export price, gas with the `gasPricePerM3` for
   that instant. Minutes the table does not cover fall back to the manual
-  **Tariff 1 (kWh)**, **Tariff 2 (kWh)** and **Tariff Gas (m3)** prices
-  (Settings, same group). A dynamic tariff is **one price that always
-  applies** — there is no normal/off-peak distinction; tariff 1 and tariff 2
-  only follow the meter's own tariff registration.
+  **Tariff 1 Delivered (kWh)**, **Tariff 2 Delivered (kWh)**, **Tariff 1
+  Received (kWh)**, **Tariff 2 Received (kWh)** and **Tariff Gas Delivered
+  (m3)** prices
+  (Settings, same group). The meter's tariff indicator (OBIS `0-0:96.14.0`)
+  names which of the two tariff prices of a direction values a minute; a
+  meter that names no active tariff prices like tariff 1. A dynamic tariff
+  is **one price that always
+  applies per direction** — there is no normal/off-peak distinction.
 - The amounts become visible in the **Show RingFile** view
-  (columns **Tariff 1 €**, **Tariff 2 €**, **Tariff Gas €**) and in the
-  **Months** view under **Presentation: Costs** (Electra, Gas, Netw., Total
-  and the advance amount; the Netw. column is the fixed monthly
+  (columns **Import €**, **Export €**, **Gas €**) and in the
+  **Months** view under **Presentation: Costs** (Electra, Export, Gas,
+  Netw., Total
+  and the advance amount; the Total subtracts the Export credit, and the
+  Netw. column is the fixed monthly
   **Network & transport costs** setting).
 
 There is **no dedicated tariff screen** in the SPA: the current price is read

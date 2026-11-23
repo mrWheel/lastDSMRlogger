@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-22 · Build: 25
+//-- Date: 2026-11-23 · Build: 26
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -672,11 +672,14 @@ static void appendSettingsJson(stringBuilder* sb, const loggerSettingsConfig* co
   sbAppendJsonString(sb, config->hostname);
   sbAppendFmt(sb, ",\"fixedIpLastOctet\":%u", (unsigned)config->fixedIpLastOctet);
 
-  //-- Meter store and tariffs: the rfs synchronisation interval, the
-  //-- manual tariff prices and the dynamic tariffs switch.
+  //-- Meter store and tariffs: the rfs synchronisation interval, the manual
+  //-- tariff prices (the import and export price of both energy tariffs and
+  //-- the gas price) and the dynamic tariffs switch.
   sbAppendFmt(sb, ",\"rfsSyncIntervalMinutes\":%u", (unsigned)config->rfsSyncIntervalMinutes);
-  sbAppendFmt(sb, ",\"tariff1PricePerKwh\":%.3f", (double)config->tariff1PricePerKwh);
-  sbAppendFmt(sb, ",\"tariff2PricePerKwh\":%.3f", (double)config->tariff2PricePerKwh);
+  sbAppendFmt(sb, ",\"tariff1ImportPricePerKwh\":%.3f", (double)config->tariff1ImportPricePerKwh);
+  sbAppendFmt(sb, ",\"tariff2ImportPricePerKwh\":%.3f", (double)config->tariff2ImportPricePerKwh);
+  sbAppendFmt(sb, ",\"tariff1ExportPricePerKwh\":%.3f", (double)config->tariff1ExportPricePerKwh);
+  sbAppendFmt(sb, ",\"tariff2ExportPricePerKwh\":%.3f", (double)config->tariff2ExportPricePerKwh);
   sbAppendFmt(sb, ",\"tariffGasPricePerM3\":%.3f", (double)config->tariffGasPricePerM3);
   sbAppend(sb, ",\"dynamicTariffsEnabled\":");
   sbAppend(sb, config->dynamicTariffsEnabled ? "true" : "false");
@@ -1123,12 +1126,18 @@ static const char* applySettingsFromForm(const char* body)
 
   candidate.rfsSyncIntervalMinutes = (uint16_t)rfsSyncMinutes;
 
-  //-- Manual tariff prices: an unusable value becomes 0.0 (out of range or
-  //-- not a number), which simply earns nothing until it is corrected.
-  candidate.tariff1PricePerKwh =
+  //-- Manual tariff prices (the import and export price of both energy
+  //-- tariffs and the gas price): an unusable value becomes 0.0 (out of
+  //-- range or not a number), which simply earns nothing until it is
+  //-- corrected.
+  candidate.tariff1ImportPricePerKwh =
       formGet(body, "tariff1", text, sizeof text) ? parseTariffPrice(text) : 0.0f;
-  candidate.tariff2PricePerKwh =
+  candidate.tariff2ImportPricePerKwh =
       formGet(body, "tariff2", text, sizeof text) ? parseTariffPrice(text) : 0.0f;
+  candidate.tariff1ExportPricePerKwh =
+      formGet(body, "tariff1Export", text, sizeof text) ? parseTariffPrice(text) : 0.0f;
+  candidate.tariff2ExportPricePerKwh =
+      formGet(body, "tariff2Export", text, sizeof text) ? parseTariffPrice(text) : 0.0f;
   candidate.tariffGasPricePerM3 =
       formGet(body, "tariffGas", text, sizeof text) ? parseTariffPrice(text) : 0.0f;
 
@@ -1431,8 +1440,10 @@ static void appendPowerJson(stringBuilder* sb)
 //-- Ring file frame for the SPA Show RingFile view: every retained record
 //-- of the selected meter ring (hours, days or months), newest period
 //-- first, exactly as the ring walk returns them. The counters keep the
-//-- units of the telegram (kWh and m³), the tariff amounts are the
-//-- fictional billing cents in EUR. ring echoes the walked selector and
+//-- units of the telegram (kWh and m³), the tariff amounts are in EUR under
+//-- the direction rubrics ti (import), te (export) and tG (gas) — the
+//-- fictional billing cents while no calculator is registered. ring echoes
+//-- the walked selector and
 //-- available reports whether the store walk completed: while the store
 //-- task never opened its rings the records array simply stays empty.
 typedef struct
@@ -1450,11 +1461,12 @@ static bool appendRingFileRecord(uint64_t key, const loggerMeterRecord* record, 
 
   sbAppendFmt(sb,
               "%s{\"key\":%" PRIu64 ",\"edT1\":%.3f,\"edT2\":%.3f,\"erT1\":%.3f,\"erT2\":%.3f,"
-              "\"gas\":%.3f,\"t1\":%.2f,\"t2\":%.2f,\"tG\":%.2f}",
+              "\"gas\":%.3f,\"ti\":%.2f,\"te\":%.2f,\"tG\":%.2f}",
               (emit->emitted > 0u) ? "," : "", key, record->energyDeliveredTariff1Kwh,
               record->energyDeliveredTariff2Kwh, record->energyReturnedTariff1Kwh,
-              record->energyReturnedTariff2Kwh, record->gasDeliveredM3, record->tariffAmount1Euro,
-              record->tariffAmount2Euro, record->tariffAmountGasEuro);
+              record->energyReturnedTariff2Kwh, record->gasDeliveredM3,
+              record->tariffAmountImportEuro, record->tariffAmountExportEuro,
+              record->tariffAmountGasEuro);
   emit->emitted++;
 
   //-- Stop the walk the moment the buffer is full: the client receives the
@@ -1666,8 +1678,9 @@ static uint64_t nextPeriodKey(loggerMeterRing_t ring, uint64_t key)
 //-- Emits one period graph frame under a caller-chosen type name: one line
 //-- per retained period (except the oldest) with the per-period
 //-- used/returned kWh and gas m³ plus that period's three tariff amounts
-//-- in EUR (the fictional billing figures the ring stores per record, as
-//-- the RingFile table prints them), oldest first, plus the ring's
+//-- in EUR under the direction rubrics ti (import), te (export) and tG
+//-- (gas) (the fictional billing figures while no calculator is registered,
+//-- as the RingFile table prints them), oldest first, plus the ring's
 //-- selector name as the walk echoed it.
 static void appendPeriodGraphFrame(stringBuilder* sb, loggerMeterRing_t ring, const char* typeName)
 {
@@ -1714,9 +1727,10 @@ static void appendPeriodGraphFrame(stringBuilder* sb, loggerMeterRing_t ring, co
 
     sbAppendFmt(sb,
                 "%s{\"key\":%" PRIu64 ",\"used\":%.3f,\"returned\":%.3f,\"gas\":%.3f"
-                ",\"t1\":%.2f,\"t2\":%.2f,\"tG\":%.2f}",
+                ",\"ti\":%.2f,\"te\":%.2f,\"tG\":%.2f}",
                 (emitted > 0u) ? "," : "", collect->keys[index - 1u], usedKwh, returnedKwh, gasM3,
-                newer->tariffAmount1Euro, newer->tariffAmount2Euro, newer->tariffAmountGasEuro);
+                newer->tariffAmountImportEuro, newer->tariffAmountExportEuro,
+                newer->tariffAmountGasEuro);
     emitted++;
   }
 

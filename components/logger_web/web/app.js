@@ -139,7 +139,8 @@ function bindElements()
                "inpMqttClientId", "inpMqttSubTopic",
                "inpMqttInterval", "inpHostname", "inpFixedIp",
                "inpRfsSync", "rfsWearEstimate", "inpDynamicTariffs",
-               "inpTariff1", "inpTariff2", "inpTariffGas", "inpNetworkCosts",
+               "inpTariff1", "inpTariff2", "inpTariff1Export", "inpTariff2Export",
+               "inpTariffGas", "inpNetworkCosts",
                "saveSettings", "telegramState", "showTelegram", "telegramLog",
                "telegramDetail", "recordMeta", "recordNotes", "summaryTable", "rawView", "footerInfo",
                "powerPanel", "powerTelegram", "powerRows",
@@ -814,13 +815,18 @@ function renderSettings(message)
   el.inpFixedIp.value = (settings && settings.fixedIpLastOctet) ? String(settings.fixedIpLastOctet) : "0";
 
   // Meter store and tariffs prefill from storage: the sync interval, the
-  // manual tariff prices and the dynamic tariffs switch.
+  // manual tariff prices (the import and export price of both energy
+  // tariffs and the gas price) and the dynamic tariffs switch.
   el.inpRfsSync.value =
       (settings && settings.rfsSyncIntervalMinutes) ? String(settings.rfsSyncIntervalMinutes) : "10";
   el.inpTariff1.value =
-      (settings && Number.isFinite(settings.tariff1PricePerKwh)) ? String(settings.tariff1PricePerKwh) : "0";
+      (settings && Number.isFinite(settings.tariff1ImportPricePerKwh)) ? String(settings.tariff1ImportPricePerKwh) : "0";
   el.inpTariff2.value =
-      (settings && Number.isFinite(settings.tariff2PricePerKwh)) ? String(settings.tariff2PricePerKwh) : "0";
+      (settings && Number.isFinite(settings.tariff2ImportPricePerKwh)) ? String(settings.tariff2ImportPricePerKwh) : "0";
+  el.inpTariff1Export.value =
+      (settings && Number.isFinite(settings.tariff1ExportPricePerKwh)) ? String(settings.tariff1ExportPricePerKwh) : "0";
+  el.inpTariff2Export.value =
+      (settings && Number.isFinite(settings.tariff2ExportPricePerKwh)) ? String(settings.tariff2ExportPricePerKwh) : "0";
   el.inpTariffGas.value =
       (settings && Number.isFinite(settings.tariffGasPricePerM3)) ? String(settings.tariffGasPricePerM3) : "0";
   el.inpNetworkCosts.value =
@@ -943,14 +949,17 @@ function saveSettings(event)
 
   el.inpFixedIp.value = String(fixedIp);
 
-  // The rfs sync interval and the manual tariff prices are clamped to the
-  // published bounds; the wear estimate follows the value that will be
+  // The rfs sync interval and the manual tariff prices (the import and
+  // export price of both energy tariffs and the gas price) are clamped to
+  // the published bounds; the wear estimate follows the value that will be
   // applied. The switch position maps to the stored dynamicTariffsEnabled
   // flag.
   const rfsSyncMinutes = clampRfsSync();
   updateRfsWearEstimate();
   const tariff1 = clampTariff(el.inpTariff1);
   const tariff2 = clampTariff(el.inpTariff2);
+  const tariff1Export = clampTariff(el.inpTariff1Export);
+  const tariff2Export = clampTariff(el.inpTariff2Export);
   const tariffGas = clampTariff(el.inpTariffGas);
   const networkCosts = clampNetworkCosts(el.inpNetworkCosts);
   const dynamicTariffs = el.inpDynamicTariffs.checked ? "1" : "0";
@@ -985,6 +994,8 @@ function saveSettings(event)
                "&rfsSyncMinutes=" + encodeURIComponent(rfsSyncMinutes) +
                "&tariff1=" + encodeURIComponent(tariff1) +
                "&tariff2=" + encodeURIComponent(tariff2) +
+               "&tariff1Export=" + encodeURIComponent(tariff1Export) +
+               "&tariff2Export=" + encodeURIComponent(tariff2Export) +
                "&tariffGas=" + encodeURIComponent(tariffGas) +
                "&networkCosts=" + encodeURIComponent(networkCosts) +
                "&dynamicTariffs=" + dynamicTariffs;
@@ -1698,8 +1709,8 @@ function renderRingFileList(message)
       (typeof record.erT1 === "number") ? record.erT1.toFixed(3) : "-",
       (typeof record.erT2 === "number") ? record.erT2.toFixed(3) : "-",
       (typeof record.gas === "number") ? record.gas.toFixed(3) : "-",
-      (typeof record.t1 === "number") ? record.t1.toFixed(2) : "-",
-      (typeof record.t2 === "number") ? record.t2.toFixed(2) : "-",
+      (typeof record.ti === "number") ? record.ti.toFixed(2) : "-",
+      (typeof record.te === "number") ? record.te.toFixed(2) : "-",
       (typeof record.tG === "number") ? record.tG.toFixed(2) : "-",
     ];
 
@@ -1761,8 +1772,9 @@ function renderRingFileList(message)
 // each row pairing every amount with the same month one year back and
 // closing with Total and Balance rows. Its third option Costs lists the
 // month's money amounts in the same paired layout (assets/
-// oldMonthsCosts.png): Electra (the ring's two tariff amounts added),
-// Gas, the fixed monthly Netw. fee from Settings and the Total, with an
+// oldMonthsCosts.png): Electra (the ring's import amount), Export (the
+// ring's export amount, a credit subtracted in the total), Gas, the fixed
+// monthly Netw. fee from Settings and the Total, with an
 // Advance row of each half's total sum over twelve (the old page's
 // Voorschot Bedrag).
 
@@ -2438,20 +2450,21 @@ function renderMonthsCompareTable()
   ], true);
 }
 
-// The month's Electra amount in EUR: the two tariff amounts the ring
-// stores for the consumed energy (tariff 1 + tariff 2), or null when the
-// record carries neither.
+// The month's Electra amount in EUR: the import amount the ring stores for
+// the used energy (what the grid delivered to the home), or null when the
+// record carries none.
 function monthsElectraEuro(record)
 {
-  const tariff1 = ((typeof record.t1 === "number") && Number.isFinite(record.t1)) ? record.t1 : null;
-  const tariff2 = ((typeof record.t2 === "number") && Number.isFinite(record.t2)) ? record.t2 : null;
+  return ((typeof record.ti === "number") && Number.isFinite(record.ti)) ? record.ti : null;
+}
 
-  if ((tariff1 === null) && (tariff2 === null))
-  {
-    return null;
-  }
-
-  return (tariff1 || 0) + (tariff2 || 0);
+// The month's export credit in EUR: the export amount the ring stores for
+// the energy delivered back to the grid, or null when the record carries
+// none. The Costs presentation prints it as its own column and subtracts
+// it in the month's total.
+function monthsExportEuro(record)
+{
+  return ((typeof record.te === "number") && Number.isFinite(record.te)) ? record.te : null;
 }
 
 // The fixed monthly network and transport amount stored in Settings (the
@@ -2466,10 +2479,12 @@ function monthsNetworkCostsEuro()
 
 // The months view's Costs presentation (the old DSMRlogger32 history
 // page, assets/oldMonthsCosts.png): per drawn month the money amounts —
-// Electra (the ring's two tariff amounts added), Gas (the gas tariff
-// amount), Netw. (the fixed monthly network fee from Settings) and their
-// Total — each month paired with the same month one year back, the ring
-// partner supplying the right half. A month the ring does not retain
+// Electra (the ring's import amount, what the used energy costs), Export
+// (the ring's export amount, the credit the delivered-back energy earns),
+// Gas (the gas tariff amount), Netw. (the fixed monthly network fee from
+// Settings) and their Total (Electra minus Export plus Gas plus Netw.) —
+// each month paired with the same month one year back, the ring partner
+// supplying the right half. A month the ring does not retain
 // shows dashes. The Advance row prints each half's advance payment: that
 // column's total sum divided by twelve (the old page's Voorschot
 // Bedrag). Rows are built with textContent only.
@@ -2485,14 +2500,20 @@ function renderMonthsCostsTable()
   const costsOf = (record) =>
   {
     const electra = monthsElectraEuro(record);
+    const exported = monthsExportEuro(record);
     const gas = ((typeof record.tG === "number") && Number.isFinite(record.tG)) ? record.tG : null;
 
-    if ((electra === null) && (gas === null))
+    if ((electra === null) && (exported === null) && (gas === null))
     {
-      return {electra: null, gas: null, total: null};
+      return {electra: null, exported: null, gas: null, total: null};
     }
 
-    return {electra: electra, gas: gas, total: (electra || 0) + (gas || 0) + netw};
+    return {
+      electra: electra,
+      exported: exported,
+      gas: gas,
+      total: (electra || 0) - (exported || 0) + (gas || 0) + netw
+    };
   };
 
   let columnTotal = 0;
@@ -2510,7 +2531,9 @@ function renderMonthsCostsTable()
 
     const previous = periodYearAgoRecordByKey(records, record.key);
     const costs = costsOf(record);
-    const yearAgo = previous ? costsOf(previous) : {electra: null, gas: null, total: null};
+    const yearAgo = previous
+        ? costsOf(previous)
+        : {electra: null, exported: null, gas: null, total: null};
 
     columnTotal += costs.total || 0;
     columnTotalYearAgo += yearAgo.total || 0;
@@ -2519,18 +2542,20 @@ function renderMonthsCostsTable()
     [
       parts.monthName,
       parts.yearLabel,
-      graphCellNumber(costs.electra, 2), graphCellNumber(costs.gas, 2),
+      graphCellNumber(costs.electra, 2), graphCellNumber(costs.exported, 2),
+      graphCellNumber(costs.gas, 2),
       graphCellNumber(netw, 2), graphCellNumber(costs.total, 2),
       parts.yearAgoLabel,
-      graphCellNumber(yearAgo.electra, 2), graphCellNumber(yearAgo.gas, 2),
+      graphCellNumber(yearAgo.electra, 2), graphCellNumber(yearAgo.exported, 2),
+      graphCellNumber(yearAgo.gas, 2),
       previous ? graphCellNumber(netw, 2) : "-", graphCellNumber(yearAgo.total, 2),
     ]);
   });
 
   appendGraphTableRow(tbody,
   [
-    "", "", "", "", "Advance amount", graphCellNumber(columnTotal / 12, 2),
-    "", "", "", "Advance amount", graphCellNumber(columnTotalYearAgo / 12, 2),
+    "", "", "", "", "", "Advance amount", graphCellNumber(columnTotal / 12, 2),
+    "", "", "", "", "Advance amount", graphCellNumber(columnTotalYearAgo / 12, 2),
   ], true);
 }
 

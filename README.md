@@ -1,6 +1,6 @@
 # lastDSMRlogger
 <!--
-fileVersion: [51] - 23-11-2026 - 10:21
+fileVersion: [52] - 23-11-2026 - 14:29
 -->
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -201,11 +201,20 @@ Phase Load view is the default screen at every start and reload of the page.
   entered value (device-published volume block count, estimated block-sized
   writes per synchronisation and flash cycle rating, uniform wear assumed);
   a **Tariffs** group carries the **Dynamic Tariffs** switch, the manual
-  prices **Tariff 1 (kWh)**, **Tariff 2 (kWh)** and **Tariff Gas (m3)** in
-  EUR (see *Dynamic electricity tariffs*) and a fixed monthly **Network &
+  prices **Tariff 1 Delivered (kWh)**, **Tariff 2 Delivered (kWh)**,
+  **Tariff 1 Received (kWh)**, **Tariff 2 Received (kWh)** and **Tariff Gas
+  Delivered (m3)** in EUR (see *Dynamic electricity tariffs*) and a fixed
+  monthly **Network &
   transport costs (month)** amount in EUR — the *Netw.* column of the
   Months Graph *Costs* presentation (a flat fee added to every month; a
-  more advanced treatment of the network costs may follow later). Save validates and
+  more advanced treatment of the network costs may follow later). The
+  manual prices follow the direction of the energy: *Delivered* is what the
+  grid delivers to the home (the used energy, a cost), *Received* is what
+  the home delivers back to the grid (returned energy, a credit). The
+  meter's tariff indicator (OBIS `0-0:96.14.0`) names which of the two
+  tariff prices of a direction values a reading; a meter that names no
+  active tariff prices like tariff 1. Gas is only ever delivered to the
+  home, so it needs no Received price. Save validates and
   applies the complete configuration as one operation and stores it in NVS;
   on any failure the active configuration is preserved and the reason is
   shown.
@@ -245,7 +254,10 @@ Phase Load view is the default screen at every start and reload of the page.
 - **Show RingFile**: the stored records of one on-device meter ring (hours,
   days or months; a radio group picks the ring, a Refresh button re-requests
   it), newest period first: one table row per stored period with the five
-  meter counters (kWh and m³) and the three fictional tariff amounts (EUR).
+  meter counters (kWh and m³) and the three tariff amounts (EUR) per
+  direction of the energy: *Import* (what the used energy costs), *Export*
+  (what the delivered-back energy earns) and *Gas* — fictional billing cents
+  while no tariff calculator runs.
   `cmd=ringfile&ring=<period>` on the WebSocket, `GET /api/v3/ringfile` with
   the optional `?ring=` query serve the same JSON.
 - **Hours Graph / Days Graph / Months Graph**: the usage overview of one
@@ -296,10 +308,13 @@ Phase Load view is the default screen at every start and reload of the page.
   closing with a **Total** row that sums the drawn rows column by column
   and a **Balance** row that nets used against returned per year. The
   months view has a third option **Costs** (`assets/oldMonthsCosts.png`):
-  per drawn month the *Electra* amount (the ring's two tariff amounts
-  added), the *Gas* amount (the gas tariff amount), *Netw.* (the fixed
+  per drawn month the *Electra* amount (the ring's import amount, what the
+  used energy costs), the *Export* amount (the ring's export amount, the
+  credit the delivered-back energy earns), the *Gas* amount (the gas tariff
+  amount), *Netw.* (the fixed
   monthly network and transport fee from the Settings view) and their
-  *Total*, each month paired with the same month one year back, and an
+  *Total* (Electra minus Export plus Gas plus Netw.), each month paired
+  with the same month one year back, and an
   **Advance** row printing each half's advance payment: that column's
   total sum divided by twelve (the old page's *Voorschot Bedrag*).
 - **Actual Graph**: the realtime per-phase power overview, styled after the
@@ -721,16 +736,32 @@ the bucket's total seconds, so partial coverage is distinguishable from
 full coverage; a bucket with no coverage reports `null` prices and 0
 covered seconds — unknown stays unknown.
 
-**Stored tariff amounts.** With the **Dynamic Tariffs** switch on (Settings
-view, **Tariffs** group) the meter store values every ring record from the
-table instead of the fictional demo amounts: each minute of energy
-consumed in tariff 1 or tariff 2 is priced with the single import price the
-table holds for that instant (a dynamic tariff has no normal/off-peak
-distinction), and periods the table does not cover fall back to the manual
-**Tariff 1 (kWh)** and **Tariff 2 (kWh)** prices. Gas is priced with the
+**Stored tariff amounts.** The ring stores three tariff amounts per period,
+named for the direction of the energy they value: the **import** amount
+(what the grid delivered to the home — the used energy, a cost), the
+**export** amount (what the home delivered back to the grid — returned
+energy, a credit) and the **gas** amount. With the **Dynamic Tariffs**
+switch on (Settings view, **Tariffs** group) the meter store values every
+ring record from the table instead of the fictional demo amounts: each
+minute of used energy is priced with the single `importPricePerKwh` the
+table holds for that instant and each minute of delivered-back energy with
+the `exportPricePerKwh` it holds (a dynamic tariff has no normal/off-peak
+distinction); minutes the table does not cover — or prices it does not
+carry — fall back to the manual prices. Gas is priced with the
 **gasPricePerM3** the table holds for that instant when it carries one, and
-with the manual **Tariff Gas (m3)** price otherwise. With the switch off
-all three amounts use the manual prices. The
+with the manual **Tariff Gas Delivered (m3)** price otherwise. With the
+switch off all three amounts use the manual prices.
+
+The manual prices come in pairs per direction: **Tariff 1 Delivered (kWh)**
+and **Tariff 2 Delivered (kWh)** for the used energy, **Tariff 1 Received
+(kWh)** and **Tariff 2 Received (kWh)** for the delivered-back energy. The
+meter's tariff indicator (OBIS `0-0:96.14.0`, published with every reading)
+names the tariff that is active at that moment and picks which price of a
+direction values that minute's energy; a meter that names no active tariff
+prices like tariff 1. Both registers of a direction (the tariff 1 and
+tariff 2 counters) grow into the one amount of their direction, so meters
+that publish everything in a single register per direction price correctly
+too. The
 amounts accumulate inside the current period and restart when a new period
 opens (or after a reboot, when the staged record is rewritten anyway);
 counter jumps (a meter replacement, or a meter that never published a
@@ -768,11 +799,22 @@ meter ring. After the ring selector the command asks for the input file,
 relative to the volume root (typically `RINGmonths.csv`); an empty
 line cancels.
 
+The ring files carry a record layout marker on the volume (the tariff
+amounts moved from one per tariff — `t1`, `t2` — to one per direction of the
+energy — `ti`, `te`, `tg` — so the old amounts would read back under the
+wrong heading). A volume whose marker names another layout rebuilds its
+three rings empty once, on the model of a ring whose configured capacity
+changed, and the log asks for a repopulate; a retained file whose header
+disagrees with the current record size rebuilds the same way. The tariff
+schedule and the import csv files on the volume are untouched. Export the
+rings with `ring2csv` before flashing a firmware that bumps the layout if the
+retained periods matter.
+
 The file starts with a header line. Its first column names the period key
 (`YYMMDDHH`, `YYMMDD` or `YYMM`); the value columns are named by OBIS code
 (with or without the `*255` method suffix) or, for the three tariff amounts
-that have no code of their own, by the rubrics of the ring print (`t1`, `t2`
-and `tg`):
+that have no code of their own, by the rubrics of the ring print (`ti`, `te`
+and `tg`, named for the direction of the energy they value):
 
 |Column                             |Ring field                |Unit|
 |-----------------------------------|--------------------------|----|
@@ -781,8 +823,8 @@ and `tg`):
 |`1-0:2.8.1`                        |energy returned tariff 1  |kWh |
 |`1-0:2.8.2`                        |energy returned tariff 2  |kWh |
 |`0-1:24.1.0` (or `0-1:24.2.1`/`.3`)|gas delivered             |m³  |
-|`t1`                               |tariff 1 amount           |€   |
-|`t2`                               |tariff 2 amount           |€   |
+|`ti`                               |import amount (used)      |€   |
+|`te`                               |export amount (returned)  |€   |
 |`tg`                               |gas amount                |€   |
 
 Unknown columns — including the `#` and the empty trailing columns
@@ -817,7 +859,7 @@ logger> showring hours
 The console command `ring2csv {hours|days|months}` writes one meter ring
 back to the LittleFS volume as a semicolon separated csv file named
 `RING<ring>.csv` at the volume root: the header
-`YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255;t1;t2;tg`
+`YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255;ti;te;tg`
 followed by one line per retained record, oldest period first, the key as
 eight `YYMMDDHH` digits, the five counters at three decimals and the three
 tariff amounts at two. Every field the ring file holds is exported, so the

@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.c - versioned settings service
-//-- Date: 2026-11-22 · Build: 9
+//-- Date: 2026-11-23 · Build: 10
 //--
 //-- The complete configuration is stored as one versioned blob so a save is
 //-- atomic. A stored blob that fails validation is treated as absent: the
@@ -132,6 +132,42 @@ typedef struct
   char mqttClientId[LOGGER_MQTT_CLIENTID_MAX];
   char mqttSubTopic[LOGGER_MQTT_TOPIC_MAX];
 } loggerSettingsConfigPreNetworkCosts;
+
+//-- Layout of the stored blob before the export (delivered-back) tariff
+//-- prices were appended (the manual import prices carry their old names
+//-- here: this is exactly the layout that was stored at the time). A stored
+//-- blob of exactly this size migrates like the four above: its fields land
+//-- in the identical prefix of the current struct and the appended prices
+//-- get their default.
+typedef struct
+{
+  uint32_t structVersion;
+  int rxGpio;
+  bool rxInverted;
+  bool txInverted;
+  uint32_t intervalSeconds;
+  char countryCode[LOGGER_SETTINGS_COUNTRY_MAX];
+  char profileId[LOGGER_SETTINGS_PROFILE_ID_MAX];
+  loggerMbusMode mbusMode[DSMR_MBUS_CHANNEL_MAX + 1];
+  dsmrMbusDeviceType mbusType[DSMR_MBUS_CHANNEL_MAX + 1];
+  bool displayFlipped;
+  char mqttBroker[LOGGER_MQTT_BROKER_MAX];
+  uint16_t mqttPort;
+  char mqttUser[LOGGER_MQTT_USER_MAX];
+  char mqttPassword[LOGGER_MQTT_PASSWORD_MAX];
+  char mqttTopTopic[LOGGER_MQTT_TOPIC_MAX];
+  uint32_t mqttIntervalSeconds;
+  char hostname[LOGGER_HOSTNAME_MAX];
+  uint8_t fixedIpLastOctet;
+  uint16_t rfsSyncIntervalMinutes;
+  float tariff1PricePerKwh;
+  float tariff2PricePerKwh;
+  float tariffGasPricePerM3;
+  bool dynamicTariffsEnabled;
+  char mqttClientId[LOGGER_MQTT_CLIENTID_MAX];
+  char mqttSubTopic[LOGGER_MQTT_TOPIC_MAX];
+  float networkCostsPerMonthEuro;
+} loggerSettingsConfigPreExportTariffs;
 
 //-- Human readable protocol version labels for the built-in profiles. The
 //-- stable profile identifier is what gets persisted.
@@ -409,25 +445,30 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
     return false;
   }
 
-  //-- The manual tariff prices must be finite and within the sanity bounds;
-  //-- negative prices are valid (negative spot prices occur).
-  if (!isfinite(config->tariff1PricePerKwh) || !isfinite(config->tariff2PricePerKwh) ||
-      !isfinite(config->tariffGasPricePerM3))
-  {
-    ESP_LOGW(tag, "rejecting non-finite manual tariff prices");
-    return false;
-  }
+  //-- The five manual tariff prices (the import and export price of both
+  //-- energy tariffs and the gas price) must be finite and within the sanity
+  //-- bounds; negative prices are valid (negative spot prices occur).
+  const float manualTariffPrices[] = {
+      config->tariff1ImportPricePerKwh, config->tariff2ImportPricePerKwh,
+      config->tariff1ExportPricePerKwh, config->tariff2ExportPricePerKwh,
+      config->tariffGasPricePerM3,
+  };
 
-  if ((config->tariff1PricePerKwh < LOGGER_SETTINGS_TARIFF_PRICE_MIN) ||
-      (config->tariff1PricePerKwh > LOGGER_SETTINGS_TARIFF_PRICE_MAX) ||
-      (config->tariff2PricePerKwh < LOGGER_SETTINGS_TARIFF_PRICE_MIN) ||
-      (config->tariff2PricePerKwh > LOGGER_SETTINGS_TARIFF_PRICE_MAX) ||
-      (config->tariffGasPricePerM3 < LOGGER_SETTINGS_TARIFF_PRICE_MIN) ||
-      (config->tariffGasPricePerM3 > LOGGER_SETTINGS_TARIFF_PRICE_MAX))
+  for (size_t index = 0u; index < sizeof manualTariffPrices / sizeof manualTariffPrices[0]; index++)
   {
-    ESP_LOGW(tag, "rejecting manual tariff price outside %g..%g",
-             (double)LOGGER_SETTINGS_TARIFF_PRICE_MIN, (double)LOGGER_SETTINGS_TARIFF_PRICE_MAX);
-    return false;
+    if (!isfinite(manualTariffPrices[index]))
+    {
+      ESP_LOGW(tag, "rejecting non-finite manual tariff price %u", (unsigned)index);
+      return false;
+    }
+
+    if ((manualTariffPrices[index] < LOGGER_SETTINGS_TARIFF_PRICE_MIN) ||
+        (manualTariffPrices[index] > LOGGER_SETTINGS_TARIFF_PRICE_MAX))
+    {
+      ESP_LOGW(tag, "rejecting manual tariff price %u outside %g..%g", (unsigned)index,
+               (double)LOGGER_SETTINGS_TARIFF_PRICE_MIN, (double)LOGGER_SETTINGS_TARIFF_PRICE_MAX);
+      return false;
+    }
   }
 
   //-- The fixed monthly network and transport amount must be finite and
@@ -472,9 +513,11 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
   bool migratedTariff = (blobSize == sizeof(loggerSettingsConfigPreTariff));
   bool migratedTopic = (blobSize == sizeof(loggerSettingsConfigPreTopic));
   bool migratedCosts = (blobSize == sizeof(loggerSettingsConfigPreNetworkCosts));
+  bool migratedExport = (blobSize == sizeof(loggerSettingsConfigPreExportTariffs));
 
-  if ((result != ESP_OK) || ((blobSize != sizeof(loggerSettingsConfig)) && !migrated &&
-                             !migratedTariff && !migratedTopic && !migratedCosts))
+  if ((result != ESP_OK) ||
+      ((blobSize != sizeof(loggerSettingsConfig)) && !migrated && !migratedTariff &&
+       !migratedTopic && !migratedCosts && !migratedExport))
   {
     nvs_close(handle);
 
@@ -517,6 +560,14 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
   {
     config->networkCostsPerMonthEuro = 0.0f;
     ESP_LOGI(tag, "stored settings migrated: the network costs field takes its default");
+  }
+  else if (migratedExport && (result == ESP_OK))
+  {
+    //-- The stored blob stopped before the export prices: both zero, which
+    //-- simply earns nothing for delivered-back energy until they are saved.
+    config->tariff1ExportPricePerKwh = 0.0f;
+    config->tariff2ExportPricePerKwh = 0.0f;
+    ESP_LOGI(tag, "stored settings migrated: the export tariff prices take their default");
   }
 
   if (result != ESP_OK)

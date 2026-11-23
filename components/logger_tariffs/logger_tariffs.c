@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_tariffs.c - dynamic electricity tariff schedules
-//-- Date: 2026-11-22 · Build: 2
+//-- Date: 2026-11-23 · Build: 3
 //--
 //-- One sorted interval array in PSRAM is the live schedule; the same
 //-- content lands in a binary file on the meter store's LittleFS volume so
@@ -1708,18 +1708,22 @@ esp_err_t loggerTariffsAggregate(time_t from, time_t to, loggerTariffResolution_
 #define TARIFF_MAX_MINUTE_M3 20.0f
 
 //-- Accumulation state of one ring: the counters of the previous snapshot
-//-- and the amounts earned inside the period named by ringKey. Only the
-//-- store task drives the calculator, so no lock guards these entries (the
-//-- price lookup below takes the component lock itself).
+//-- and the amounts earned inside the period named by ringKey. The amounts
+//-- follow the direction of the energy: import (what the used energy costs),
+//-- export (what the delivered-back energy earns) and gas. Only the store
+//-- task drives the calculator, so no lock guards these entries (the price
+//-- lookup below takes the component lock itself).
 typedef struct
 {
   bool haveState;
   uint64_t ringKey;
   float lastEdT1Kwh;
   float lastEdT2Kwh;
+  float lastErT1Kwh;
+  float lastErT2Kwh;
   float lastGasM3;
-  float amount1Euro;
-  float amount2Euro;
+  float amountImportEuro;
+  float amountExportEuro;
   float amountGasEuro;
 } RingAmountState;
 
@@ -1740,7 +1744,7 @@ static float counterDelta(float now, float previous, float maxPerSnapshot)
 }
 
 void loggerTariffsMeterAmountCalculator(loggerMeterRing_t ring, uint64_t ringKey,
-                                        loggerMeterRecord* record)
+                                        uint8_t tariffIndicator, loggerMeterRecord* record)
 {
   if ((record == NULL) || (ring >= LOGGER_RING_COUNT))
   {
@@ -1750,15 +1754,26 @@ void loggerTariffsMeterAmountCalculator(loggerMeterRing_t ring, uint64_t ringKey
   loggerSettingsConfig settings;
   bool haveSettings = (loggerSettingsLoad(&settings) == ESP_OK);
 
-  double priceT1 = haveSettings ? (double)settings.tariff1PricePerKwh : 0.0;
-  double priceT2 = haveSettings ? (double)settings.tariff2PricePerKwh : 0.0;
+  //-- The meter's tariff indicator (OBIS 0-0:96.14.0) names the tariff that
+  //-- is active at the moment of the reading and picks which price of a
+  //-- direction values this snapshot's energy. A meter that names no active
+  //-- tariff (indicator 0) prices like tariff 1.
+  const bool tariff2Active = (tariffIndicator == 2u);
+
+  double priceImport = haveSettings ? (double)(tariff2Active ? settings.tariff2ImportPricePerKwh
+                                                             : settings.tariff1ImportPricePerKwh)
+                                    : 0.0;
+  double priceExport = haveSettings ? (double)(tariff2Active ? settings.tariff2ExportPricePerKwh
+                                                             : settings.tariff1ExportPricePerKwh)
+                                    : 0.0;
   double priceGas = haveSettings ? (double)settings.tariffGasPricePerM3 : 0.0;
 
-  //-- With dynamic tariffs on, the import price the table holds for this
-  //-- instant prices both energy tariffs (one dynamic tariff always applies,
-  //-- there is no normal/off-peak distinction) and the gas price the table
-  //-- holds prices the gas; minutes the table does not cover — or prices it
-  //-- does not carry — keep the manual prices.
+  //-- With dynamic tariffs on, the import and export prices the table holds
+  //-- for this instant replace both manual prices of their direction (one
+  //-- dynamic tariff always applies, there is no normal/off-peak
+  //-- distinction) and the gas price the table holds prices the gas; minutes
+  //-- the table does not cover — or prices it does not carry — keep the
+  //-- manual prices.
   if (haveSettings && settings.dynamicTariffsEnabled)
   {
     loggerTariffInterval active;
@@ -1769,8 +1784,12 @@ void loggerTariffsMeterAmountCalculator(loggerMeterRing_t ring, uint64_t ringKey
     {
       if (active.hasImport)
       {
-        priceT1 = (double)active.importPricePerKwh;
-        priceT2 = (double)active.importPricePerKwh;
+        priceImport = (double)active.importPricePerKwh;
+      }
+
+      if (active.hasExport)
+      {
+        priceExport = (double)active.exportPricePerKwh;
       }
 
       if (active.hasGas)
@@ -1788,30 +1807,40 @@ void loggerTariffsMeterAmountCalculator(loggerMeterRing_t ring, uint64_t ringKey
     //-- amounts restart together with the period.
     state->haveState = true;
     state->ringKey = ringKey;
-    state->amount1Euro = 0.0f;
-    state->amount2Euro = 0.0f;
+    state->amountImportEuro = 0.0f;
+    state->amountExportEuro = 0.0f;
     state->amountGasEuro = 0.0f;
     state->lastEdT1Kwh = record->energyDeliveredTariff1Kwh;
     state->lastEdT2Kwh = record->energyDeliveredTariff2Kwh;
+    state->lastErT1Kwh = record->energyReturnedTariff1Kwh;
+    state->lastErT2Kwh = record->energyReturnedTariff2Kwh;
     state->lastGasM3 = record->gasDeliveredM3;
   }
 
-  float deltaT1 =
-      counterDelta(record->energyDeliveredTariff1Kwh, state->lastEdT1Kwh, TARIFF_MAX_MINUTE_KWH);
-  float deltaT2 =
+  //-- Both registers of a direction grew inside this snapshot's minute and
+  //-- are valued as one amount: the tariff indicator, not the register a
+  //-- reading landed in, names the tariff that prices the energy (meters
+  //-- with a single register per direction publish everything in one).
+  float deltaUsed =
+      counterDelta(record->energyDeliveredTariff1Kwh, state->lastEdT1Kwh, TARIFF_MAX_MINUTE_KWH) +
       counterDelta(record->energyDeliveredTariff2Kwh, state->lastEdT2Kwh, TARIFF_MAX_MINUTE_KWH);
+  float deltaReturned =
+      counterDelta(record->energyReturnedTariff1Kwh, state->lastErT1Kwh, TARIFF_MAX_MINUTE_KWH) +
+      counterDelta(record->energyReturnedTariff2Kwh, state->lastErT2Kwh, TARIFF_MAX_MINUTE_KWH);
   float deltaGas = counterDelta(record->gasDeliveredM3, state->lastGasM3, TARIFF_MAX_MINUTE_M3);
 
   state->lastEdT1Kwh = record->energyDeliveredTariff1Kwh;
   state->lastEdT2Kwh = record->energyDeliveredTariff2Kwh;
+  state->lastErT1Kwh = record->energyReturnedTariff1Kwh;
+  state->lastErT2Kwh = record->energyReturnedTariff2Kwh;
   state->lastGasM3 = record->gasDeliveredM3;
 
-  state->amount1Euro += (float)((double)deltaT1 * priceT1);
-  state->amount2Euro += (float)((double)deltaT2 * priceT2);
+  state->amountImportEuro += (float)((double)deltaUsed * priceImport);
+  state->amountExportEuro += (float)((double)deltaReturned * priceExport);
   state->amountGasEuro += (float)((double)deltaGas * priceGas);
 
-  record->tariffAmount1Euro = state->amount1Euro;
-  record->tariffAmount2Euro = state->amount2Euro;
+  record->tariffAmountImportEuro = state->amountImportEuro;
+  record->tariffAmountExportEuro = state->amountExportEuro;
   record->tariffAmountGasEuro = state->amountGasEuro;
 }
 
