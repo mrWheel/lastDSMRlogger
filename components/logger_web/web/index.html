@@ -480,6 +480,34 @@
       </div>
     </section>
 
+    <section id="viewTariffs" class="card" hidden>
+      <h2>Tariffs</h2>
+      <div id="tariffsState" class="message"></div>
+      <div class="listToolbar">
+        <!-- The tariff table is read over plain HTTP from GET
+             /api/v3/tariffs?from=<utc>&to=<utc>&resolution=raw (see
+             refreshTariffs in app.js): the button re-reads the schedule
+             and switching to the view loads it as well. -->
+        <button id="refreshTariffs" type="button">Refresh</button>
+      </div>
+      <!-- The stored dynamic tariff schedule (see app.js): one row per
+           interval that is in use now or starts in the future, oldest
+           first; intervals that already expired are not shown. Times are
+           the browser's local time, prices are per kWh (delivered and
+           returned) and per m³ (gas) in the currency the device reports;
+           an unknown price shows a dash. The row covering the present
+           moment is highlighted (see the tariffNowRow style). Rows are
+           built by app.js. -->
+      <div class="tableWrap">
+        <table id="tariffsTable">
+          <thead>
+            <tr><th>Date/Time from</th><th>Date/Time to</th><th class="valueNumeric">Tariff Delivered</th><th class="valueNumeric">Tariff Returned</th><th class="valueNumeric">Tariff Gas</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
     <section id="viewApi" class="card" hidden>
       <h2>API documentation</h2>
       <div id="apiState" class="message"></div>

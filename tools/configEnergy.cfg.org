@@ -7,23 +7,31 @@ host = YOUR_MQTT_BROKER
 port = 1883
 username =
 password =
-clientId =
+client_id =
 tls = false
 # Optional PEM CA file, relative to this config file or an absolute path.
 ca_file =
 
 [logger]
-# Enter just the hostname (all lowecase). The script also accepts a .local suffix.
+# Enter just the hostname (lowercase). The script also accepts a .local suffix.
 hostname = lastdsmrlogger
-# Leave empty to use lastdsmrlogger/<hostname>/tariffs.
-# Set the complete topic here if the logger uses a different prefix or device ID.
-topic = subTopic
+# The scripts always publish to <hostname>/<topic>. Set both to the device
+# tariff topic reported by GET /api/v3/tariffs (field "mqttTopic"): hostname
+# is the first segment (the device Top topic) and topic is everything after
+# it (the Client ID segment followed by the Sub topic when the device names a
+# Client ID, otherwise just the Sub topic). The topic cannot be empty.
+topic = newTariffs
 
 [tariffs]
+# EUR amounts including VAT, added to the VAT-included market price.
+# Zero is valid.
 import_surcharge_kwh = 0
 energy_tax_kwh = 0
 gas_surcharge_m3 = 0
 energy_tax_m3 = 0
+# REQUIRED (empty aborts getPrices.py). Signed adjustment added to the
+# market price to form the export price; 0 uses the plain VAT-included
+# market price as export price.
 export_surcharge_kwh = 0
 
 

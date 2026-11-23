@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: app_main.c - application entry
-//-- Date: 2026-11-22 · Build: 17
+//-- Date: 2026-11-23 · Build: 18
 //--
 //-- Boot order: the board debug lines come up first, then NVS, then the P1
 //-- receiver. Reception starts as soon as a valid configuration is stored and
@@ -15,7 +15,7 @@
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
 extern const char* PROG_VERSION;
-const char* PROG_VERSION = "v0.5.10";
+const char* PROG_VERSION = "v0.5.11";
 
 #include <stdio.h>
 #include <string.h>
@@ -39,6 +39,7 @@ const char* PROG_VERSION = "v0.5.10";
 #include "logger_tariffs.h"
 #include "logger_telnet.h"
 #include "logger_web.h"
+#include "mdns.h"
 #include "nvs_flash.h"
 #include "smb_server.h"
 #include "wifi_provisioner.h"
@@ -76,6 +77,51 @@ static bool fixedIpApplied = false;
 static volatile bool pendingFixedIp = false;
 static volatile bool pendingHostnameAnnounce = false;
 
+//-- True once the mDNS responder is up (one init per boot; the retry path
+//-- lives in announceMdns).
+static bool mdnsStarted = false;
+
+//-- mDNS: announces the stored hostname so the SPA is reachable as
+//-- http://<hostname>.local whatever the DHCP lease currently is, plus an
+//-- _http._tcp service so browsers and service browsers find the logger on
+//-- the local network without any address knowledge. The responder is
+//-- inited once and the hostname is re-set on every application, so a save
+//-- that renames the device moves the .local name along with the DHCP
+//-- announcement. A failure (typically esp_netif not up yet before the
+//-- first join) is not fatal: the next application — at the station join or
+//-- on the next save — tries again.
+static void announceMdns(const char* hostname)
+{
+  if (!mdnsStarted)
+  {
+    esp_err_t result = mdns_init();
+
+    if (result != ESP_OK)
+    {
+      ESP_LOGW(tag, "mDNS could not start yet: %s (retrying at the next application)",
+               esp_err_to_name(result));
+      return;
+    }
+
+    mdnsStarted = true;
+  }
+
+  //-- The hostname must be set before a service is added: the responder
+  //-- refuses a service while the server still has no hostname, and the
+  //-- service records the host name it was created under — so a rename
+  //-- re-creates the service instead of leaving it pointing at the old name.
+  mdns_hostname_set(hostname);
+  mdns_instance_name_set("lastDSMRlogger");
+  mdns_service_remove_all();
+
+  esp_err_t serviceResult = mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+
+  if (serviceResult != ESP_OK)
+  {
+    ESP_LOGW(tag, "mDNS _http._tcp service could not be added: %s", esp_err_to_name(serviceResult));
+  }
+}
+
 //-- Applies the stored hostname and fixed IP to the station interface. Safe
 //-- before the join (only the hostname is stored then); after the join a
 //-- changed hostname is re-announced through a DHCP re-request and the fixed
@@ -104,6 +150,10 @@ static void applyNetworkIdentity(const loggerSettingsConfig* config, bool connec
   {
     ESP_LOGW(tag, "hostname '%s' could not be set", wanted);
   }
+
+  //-- The very same name travels over mDNS (see announceMdns): the lease
+  //-- address may come and go with the router, the .local name must not.
+  announceMdns(wanted);
 
   if (!connected)
   {

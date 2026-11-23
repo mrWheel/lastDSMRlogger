@@ -1,5 +1,5 @@
 ## lastDSMRlogger - managed component dependencies
-## Date: 2026-11-22 · Build: 6
+## Date: 2026-11-23 · Build: 7
 ##
 ## The parserdsmr component decodes the P1 telegrams and is pulled as the
 ## ESP Component Registry release mrwheel/parserdsmr (registry names are
@@ -17,6 +17,8 @@
 ## The espressif/cjson component parses the dynamic tariff JSON documents
 ## submitted through MQTT and the API (cJSON was moved out of the ESP-IDF
 ## core in 6.0 and lives in the registry since).
+## The espressif/mdns component announces the stored hostname (and an
+## _http._tcp service) so the SPA is reachable as http://<hostname>.local.
 ##
 ## Format for local component dependencies:
 ##   component_name:
@@ -30,4 +32,5 @@ dependencies:
   espressif/mqtt: ^1.1.0
   espressif/cjson: ^1.7.19
   mrwheel/parserdsmr: ^0.9.2
+  espressif/mdns: ^1.15.1
 

@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-22 · Build: 27 */
+   Date: 2026-11-22 · Build: 28 */
 
 :root
 {
@@ -1115,6 +1115,26 @@ footer
 {
   font-weight: 600;
   border-top: 1px solid var(--hairline);
+}
+
+/* --------------------------------------------------------------------------
+   Tariffs view: the table of the stored dynamic tariff schedule (only the
+   intervals in use now or coming up; see refreshTariffs in app.js). The
+   price columns reuse td.valueNumeric (right aligned); nowrap keeps every
+   interval on one line inside .tableWrap. The row covering the present
+   moment rides on a soft accent wash so the interval in use stands out in
+   both light and dark mode.
+   ------------------------------------------------------------------------ */
+#tariffsTable th,
+#tariffsTable td
+{
+  white-space: nowrap;
+}
+
+#tariffsTable tr.tariffNowRow td
+{
+  background: rgba(0, 122, 255, 0.12);
+  font-weight: 600;
 }
 
 /* --------------------------------------------------------------------------

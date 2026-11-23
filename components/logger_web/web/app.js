@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-22 · Build: 32
+// Date: 2026-11-22 · Build: 33
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -83,6 +83,11 @@ const VIEWS =
    command: "cmd=graph&ring=months"},
   {id: "actualGraph", label: "Actual", section: "viewActualGraph",
    command: "cmd=actualgraph"},
+  // The Tariffs view reads the stored schedule over plain HTTP (see
+  // refreshTariffs), so it carries a refresh hook like the API view
+  // instead of a WebSocket command.
+  {id: "tariffs", label: "Tariffs", section: "viewTariffs", command: null,
+   refresh: refreshTariffs},
   // The API view needs no WebSocket command: it fetches the device's own
   // endpoint index from GET /api/v3 (see refreshApiList), so it carries a
   // refresh hook instead of a command.
@@ -130,8 +135,9 @@ function bindElements()
                "monthsGraphCanvasWrap", "monthsGraphTableWrap", "monthsGraphTable",
                "monthsGraphCostsTableWrap", "monthsGraphCostsTable",
                "actualGraphState", "refreshActualGraph", "actualGraphCanvas", "actualGraphChecks",
+               "tariffsState", "refreshTariffs", "tariffsTable",
                "viewSettings", "viewTelegrams", "viewPower", "viewRingFile", "viewHoursGraph",
-               "viewDaysGraph", "viewMonthsGraph", "viewActualGraph", "viewApi",
+               "viewDaysGraph", "viewMonthsGraph", "viewActualGraph", "viewTariffs", "viewApi",
                "apiState", "apiList",
                "takeoverModal", "takeoverMessage", "takeoverTakeBack"];
 
@@ -3561,6 +3567,159 @@ function renderApiList(data)
 }
 
 //-- --------------------------------------------------------------------------
+//-- Tariffs view
+//-- --------------------------------------------------------------------------
+
+function setTariffsState(message)
+{
+  el.tariffsState.textContent = message;
+}
+
+// Formats a Date as the "YYYY-MM-DDTHH:MM:SSZ" the tariff query API
+// expects for its from and to parameters (always UTC, whole seconds).
+function toUtcIsoText(date)
+{
+  const pad = (value) => String(value).padStart(2, "0");
+
+  return date.getUTCFullYear() + "-" + pad(date.getUTCMonth() + 1) + "-" + pad(date.getUTCDate()) +
+         "T" + pad(date.getUTCHours()) + ":" + pad(date.getUTCMinutes()) + ":" +
+         pad(date.getUTCSeconds()) + "Z";
+}
+
+// Formats one tariff boundary the way the device prints its wall clock
+// ("DD-MM-YYYY HH:MM") in the browser's local time zone, so a quarter-hour
+// price reads as the local instant it applies to. Text that does not parse
+// as a date is shown verbatim instead of blanking the cell.
+function formatTariffDateTime(isoText)
+{
+  const date = new Date(isoText);
+
+  if (!Number.isFinite(date.getTime()))
+  {
+    return String(isoText);
+  }
+
+  const pad = (value) => String(value).padStart(2, "0");
+
+  return pad(date.getDate()) + "-" + pad(date.getMonth() + 1) + "-" + date.getFullYear() +
+         " " + pad(date.getHours()) + ":" + pad(date.getMinutes());
+}
+
+// Reads the stored schedule from GET /api/v3/tariffs with resolution=raw
+// (the same answer the API view can open in a tab): the query window starts
+// a week back so an interval that covers the present but started earlier
+// (a gas day spanning many quarter-hours) is never cut off, and runs a
+// year ahead so it reaches the last stored interval whatever the supplier
+// posted. The walk returns every interval overlapping the window; the
+// render pass keeps only those that still stand (their end lies ahead of
+// now), so expired records never show. Plain HTTP like the API view: no
+// WebSocket command is involved.
+function refreshTariffs()
+{
+  setTariffsState("Reading the tariff schedule from /api/v3/tariffs...");
+
+  const nowMs = Date.now();
+  const from = new Date(nowMs - 7 * 24 * 60 * 60 * 1000);
+  const to = new Date(nowMs + 366 * 24 * 60 * 60 * 1000);
+  const url = "/api/v3/tariffs?from=" + toUtcIsoText(from) +
+              "&to=" + toUtcIsoText(to) + "&resolution=raw";
+
+  fetch(url, {cache: "no-store"})
+    .then((response) =>
+    {
+      // The device answers refusals with a small {"ok":false,"error":...}
+      // document: its reason is shown instead of the bare status code.
+      return response.json().then((data) =>
+      {
+        if (!response.ok)
+        {
+          throw new Error(data.error || ("HTTP " + response.status));
+        }
+
+        return data;
+      });
+    })
+    .then((data) =>
+    {
+      renderTariffTable(data);
+    })
+    .catch((error) =>
+    {
+      setTariffsState("Could not read the tariff schedule: " + error.message + ".");
+    });
+}
+
+// Builds the tariff table: one row per still-standing interval (end after
+// now), oldest first — the row that covers the present moment carries the
+// tariffNowRow highlight. All text goes in through textContent.
+function renderTariffTable(data)
+{
+  const tbody = el.tariffsTable.tBodies[0];
+  tbody.textContent = "";
+
+  const intervals = (data && Array.isArray(data.intervals)) ? data.intervals : [];
+  const currency = (data && data.currency) ? data.currency : "EUR";
+  const nowMs = Date.now();
+
+  const standing = intervals.filter((interval) =>
+  {
+    const endMs = Date.parse(interval.end);
+    return Number.isFinite(endMs) && (endMs > nowMs);
+  });
+
+  if (standing.length === 0)
+  {
+    setTariffsState("No tariff interval is in use or coming up " +
+                    "(expired records are not shown).");
+    return;
+  }
+
+  standing.forEach((interval) =>
+  {
+    const startMs = Date.parse(interval.start);
+    const endMs = Date.parse(interval.end);
+
+    const row = document.createElement("tr");
+
+    if (Number.isFinite(startMs) && Number.isFinite(endMs) &&
+        (startMs <= nowMs) && (nowMs < endMs))
+    {
+      row.className = "tariffNowRow";
+    }
+
+    const cells = [
+      formatTariffDateTime(interval.start),
+      formatTariffDateTime(interval.end),
+      graphCellNumber(interval.importPricePerKwh, 4),
+      graphCellNumber(interval.exportPricePerKwh, 4),
+      graphCellNumber(interval.gasPricePerM3, 4),
+    ];
+
+    cells.forEach((text, index) =>
+    {
+      const cell = document.createElement("td");
+      cell.textContent = text;
+
+      // The price columns align right so the digits of successive
+      // intervals line up; the two time columns keep the default left.
+      if (index > 1)
+      {
+        cell.className = "valueNumeric";
+      }
+
+      row.appendChild(cell);
+    });
+
+    tbody.appendChild(row);
+  });
+
+  setTariffsState(standing.length + ((standing.length === 1) ? " interval" : " intervals") +
+                  " in use or coming up · prices in " + currency +
+                  " per kWh (delivered and returned) and per m³ (gas) · read at " +
+                  new Date().toLocaleTimeString("en-GB"));
+}
+
+//-- --------------------------------------------------------------------------
 //-- View switching and boot
 //-- --------------------------------------------------------------------------
 
@@ -3711,6 +3870,14 @@ function boot()
   el.actualGraphChecks.addEventListener("change", () =>
   {
     drawActualGraph();
+  });
+
+  // The tariff table is read on demand (and when the view opens): tariff
+  // batches arrive at their own pace, so the view does not poll and this
+  // button re-reads the schedule from /api/v3/tariffs right away.
+  el.refreshTariffs.addEventListener("click", () =>
+  {
+    refreshTariffs();
   });
 
   // Take over control again after another browser page evicted this page:

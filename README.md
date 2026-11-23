@@ -1,13 +1,13 @@
 # lastDSMRlogger
 
-fileVersion: [45] - 22-11-2026 - 16:43
+fileVersion: [49] - 23-11-2026 - 07:02
 
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
-shows recent telegrams in a single-page web application with eight views:
+shows recent telegrams in a single-page web application with nine views:
 Settings, Telegrams, Phase Load (a web replica of the on-device power
-panel), Show RingFile, Hours Graph, Days Graph, Months Graph and Actual
-Graph. Configuration is stored in NVS and survives a power cycle; the recent
+panel), Show RingFile, Hours Graph, Days Graph, Months Graph, Actual
+Graph and Tariffs. Configuration is stored in NVS and survives a power cycle; the recent
 telegram history lives in RAM.
 
 ## 1. Project layout
@@ -54,6 +54,7 @@ automatically.
 |littlefs                  |ESP Component Registry `joltwallet/littlefs`                                                                |`^1.23.1` |
 |smb_server                |ESP Component Registry `mrwheel/smb_server`                                                                 |`^0.3.0` (GPL-3.0, guest-only SMB2/SMB3 file server) |
 |cjson                     |ESP Component Registry `espressif/cjson`                                                                    |`^1.7.19` (tariff document parsing) |
+|mdns                      |ESP Component Registry `espressif/mdns`                                                                     |`^1.15.1` (hostname and `_http._tcp` discovery on the local network) |
 
 parserDSMR is consumed as the ESP Component Registry release
 `mrwheel/parserdsmr`, resolved into `managed_components/` by the component
@@ -311,6 +312,16 @@ the device.
   shifts one slot left with every accepted telegram once the table is
   full. The view polls on the Phase Load timer; hovering a slot pops up a
   chip with the sample time, the per-phase kW and the gas m³/h.
+- **Tariffs**: the stored dynamic tariff schedule as a plain table — one
+  row per interval that is **in use now or starts in the future**, oldest
+  first, with the columns *Date/Time from*, *Date/Time to*, *Tariff
+  Delivered*, *Tariff Returned* and *Tariff Gas* (prices per kWh and per m³ in
+  the document currency; an unknown price shows a dash and the row
+  covering the present moment is highlighted). Expired intervals are not
+  shown. The table reads `GET /api/v3/tariffs?from=&to=&resolution=raw`
+  over plain HTTP when the view opens and on **Refresh** (like the API
+  view the tariff table needs no WebSocket command), so it always shows
+  what the tariff store holds right now.
 
 On-device TFT debug lines show the active browser screen, the last accepted
 telegram, and the Wi-Fi portal/connected state. With the first accepted
@@ -587,8 +598,14 @@ live when the settings are saved.
 The hostname and fixed IP in the **Network** group take effect at the same
 save: the hostname is stored right away and announced to DHCP and mDNS, and
 the fixed IP pins the last octet of the granted address (the network part
-comes from the router's lease; empty or 0 returns to plain DHCP). Work that
-touches the lease itself — re-requesting it for a new name, pinning or
+comes from the router's lease; empty or 0 returns to plain DHCP). The mDNS
+announcement comes from the `espressif/mdns` responder started with the
+network identity: the SPA is reachable as `http://<hostname>.local/`
+whatever the current lease address is (the default hostname gives
+`http://dsmrlogger.local/` when no name is configured), and the responder
+also publishes an `_http._tcp` service for service browsers. A save that
+renames the device moves the `.local` name along with the DHCP name. Work
+that touches the lease itself — re-requesting it for a new name, pinning or
 withdrawing a fixed address — is performed by the Wi-Fi task within seconds
 after the save replies, because it briefly leaves the station interface and
 would otherwise abort the very browser request that saved it.
@@ -599,7 +616,9 @@ The device keeps **per-kWh electricity prices** for imported and exported
 energy so tariff-aware views and automations can ask what a kWh costs (or
 earned) at any instant. The logger does not fetch prices itself: an
 application on the network publishes them — the supplier feed, Home
-Assistant, Node-RED or the example script `tools/publishEnergyTariffs.py`.
+Assistant, Node-RED or the example scripts `tools/getPrices.py` (EnergyZero
+day-ahead feed) and `tools/randomEnergyTariffs.py` (synthetic test schedule).
+End-user guidance lives in `dynamicPricing.md` and `how2GetTariffs.md`.
 Both delivery paths share one validator and one store (the
 `logger_tariffs` component), so a publisher does not need to know which
 path carried its document.
@@ -667,7 +686,7 @@ mosquitto_pub -h <broker> -p 1883 -q 1 -r \
 curl -s -X POST -H 'Content-Type: application/json' \
   --data-binary @batch.json http://<device>/api/v3/newTariffs
 # -> {"ok":true,"storedIntervals":192,"currency":"EUR"}
-#    400 (or 500 for store problems) with {"ok":false,"reason":"…"} on refusal
+#    400 (or 500 for store problems) with {"ok":false,"error":"…"} on refusal
 
 curl -s http://<device>/api/v3/tariffs
 # -> current: mqttTopic, clockSynced, currency, storedIntervals and, when
@@ -714,10 +733,13 @@ time everything older than the start of the previous calendar month is
 pruned, so at least the current and the previous month always remain
 queryable.
 
-**Documented bounds.** Payload ≤ 96 KiB per document (both paths),
-≤ 1024 intervals per batch, ≤ 8192 stored intervals (over 60 days of
-quarter-hour prices), ≤ 744 buckets per aggregation (a full local month at
-hour resolution). A submission or query over a bound is refused — payload
+**Documented bounds.** Payload ≤ 96 KiB per document (both paths) carrying
+printable ASCII only (bytes 0x20–0x7E): the document must be **one single
+line**, pretty-printed JSON with newlines or tabs is refused, so minify it
+first (for example `jq -c`), ≤ 1024 intervals per batch, ≤ 8192 stored
+intervals (over 60 days of quarter-hour prices), ≤ 744 buckets per
+aggregation (a full local month at hour resolution). A submission or query
+over a bound is refused — payload
 and batch problems as 400, storage problems as 500 — and never applies
 partially.
 

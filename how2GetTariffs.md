@@ -1,4 +1,4 @@
-fileVersion: [1] - 22-11-2026 - 15:30
+fileVersion: [2] - 22-11-2026 - 19:55
 
 # How to get dynamic energy tariffs for lastDSMRlogger
 
@@ -94,8 +94,9 @@ Sources: [ANWB current energy tariffs](https://www.anwb.nl/energie/actuele-tarie
 - Send final variable prices as JSON numbers in EUR per kWh for electricity and EUR per m³ for gas. If a source reports EUR per MWh for electricity, divide by 1,000. Check which costs are included before adding tax, VAT, or supplier charges. Keep fixed monthly charges out of the payload.
 - Include at least one price per interval. Omit unknown prices. An actual zero or negative price is valid. Carry the gas price on the intervals it covers; intervals inside one document may not overlap each other, so a gas day is priced inside the electricity intervals rather than as a separate overlapping interval.
 - If tomorrow's prices are unavailable, send the valid schedule you have and publish an updated schedule once the remaining prices arrive.
+- The device validator accepts **printable ASCII only** (bytes 0x20–0x7E), so the document must be **one single line**: newlines and tabs are refused with `the document must be printable ASCII`. Minify before sending (for example `jq -c . tariffs.json`) or have your integration emit compact JSON.
 
-Save the following example as `tariffs.json`. Replace the sample dates and prices with the intervals produced by your integration.
+Save the following example as `tariffs.json`. Replace the sample dates and prices with the intervals produced by your integration. The block is spread over several lines here to read; keep your real file on one single line (or minify when sending, as the commands below show).
 
 ```json
 {
@@ -126,7 +127,7 @@ Publish the complete available schedule as a retained QoS 1 message to the topic
 
 ```sh
 mosquitto_pub -h mqtt.example.net -q 1 -r \
-  -t lastlogger/newTariffs -f tariffs.json
+  -t lastlogger/newTariffs -m "$(jq -c . tariffs.json)"
 ```
 
 ### HTTP API
@@ -136,7 +137,7 @@ Send the JSON to `POST /api/v3/newTariffs`. Replace `lastlogger.local` with your
 ```sh
 curl --fail-with-body -X POST \
   -H 'Content-Type: application/json' \
-  --data-binary @tariffs.json \
+  --data-binary "$(jq -c . tariffs.json)" \
   http://lastlogger.local/api/v3/newTariffs
 ```
 
@@ -161,8 +162,8 @@ parser.add_argument("file", nargs="?", default="tariffs.json", type=Path)
 args = parser.parse_args()
 
 try:
-    data = args.file.read_bytes()
-    json.loads(data)
+    schedule = json.loads(args.file.read_text(encoding="utf-8"))
+    data = json.dumps(schedule, separators=(",", ":"), allow_nan=False).encode("ascii")
     request = Request(
         args.logger.rstrip("/") + "/api/v3/newTariffs",
         data=data,
@@ -185,7 +186,7 @@ python3 post_tariffs.py http://lastlogger.local tariffs.json
 
 ### C++ with libcurl
 
-Save as `post_tariffs.cpp`. This desktop example requires a C++ compiler and libcurl development headers.
+Save as `post_tariffs.cpp`. This desktop example requires a C++ compiler and libcurl development headers. It posts the file bytes unchanged, so keep `tariffs.json` on one single line (no pretty-printing); the device refuses newlines and tabs.
 
 ```cpp
 #include <curl/curl.h>
