@@ -1,13 +1,17 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_telnet.c - telnet console server on port 23
-//-- Date: 2026-11-24 · Build: 22
+//-- Date: 2026-11-24 · Build: 24
 //--
 //-- A plain BSD-socket console task: it listens on port 23, serves exactly
 //-- one session at a time and answers a command set from the receiver,
 //-- store and settings APIs (read-only except populate (imports a LittleFS
 //-- csv file into one meter ring), ring2csv (writes one meter ring to the
-//-- volume), sync (commits all ring files at once) and restart (first
+//-- volume), filesystem delete/rename (remove or rename one volume file,
+//-- each after a typed confirmation), settings save/load (export every
+//-- settings field as a plain ascii ini file on the volume and read one
+//-- back into NVS),
+//-- sync (commits all ring files at once) and restart (first
 //-- synchronises the ring files and then reboots the device, all after a
 //-- typed confirmation)). The verbose {0,1,2,3} command sets
 //-- the reporting level at which the background event lines the store, MQTT
@@ -18,7 +22,7 @@
 //-- arbiter so event and mirror lines end on a re-printed prompt instead of
 //-- a blank line; every write of this task brackets the shared console
 //-- lock so an event line never interleaves into a command answer. The console slot is decided by
-//the
+// the
 //-- shared logger_control arbiter, which keeps one slot per channel: the
 //-- web page holds its own slot and is never displaced from here. Accepting
 //-- a telnet client claims the console slot, and when a newer telnet client
@@ -122,13 +126,30 @@ static bool exportAwaitingName = false;
 static loggerMeterRing_t exportRing = LOGGER_RING_HOURS;
 static bool restartAwaitingConfirm = false;
 
+//-- Pending filesystem and settings questions (the filesystem and settings
+//-- commands below): while one is pending the next typed line is its answer
+//-- and never a command. One session at a time, so plain file-scope
+//-- variables are enough; a fresh client resets them. fsPendingName holds
+//-- the file a delete removes or rename renames (the old name), fsPending-
+//-- NewName the rename target awaiting the typed confirmation.
+static bool fsAwaitingDeleteName = false;
+static bool fsAwaitingOldName = false;
+static bool fsAwaitingNewName = false;
+static bool fsAwaitingShowName = false;
+static bool fsAwaitingConfirm = false;
+static bool fsConfirmIsRename = false;
+static char fsPendingName[TELNET_LINE_MAX];
+static char fsPendingNewName[TELNET_LINE_MAX];
+static bool settingsAwaitingSaveName = false;
+static bool settingsAwaitingLoadName = false;
+
 //-- Every command word the console knows. Synonyms stay separate entries
 //-- (raw for the raw telegram dump, ringfile and exit as older spellings)
 //-- so a shortened word can name them too.
 static const char* const telnetCommands[] = {
-    "help",  "status",   "version",  "telegrams", "telegram", "raw",
-    "power", "showring", "ringfile", "store",     "populate", "quit",
-    "exit",  "ring2csv", "sync",     "verbose",   "restart",
+    "help",  "status",   "version",  "telegrams",  "telegram", "raw",
+    "power", "showring", "ringfile", "filesystem", "settings", "populate",
+    "quit",  "exit",     "ring2csv", "sync",       "verbose",  "restart",
 };
 
 //-- The printf-style session writer is defined further down, the device
@@ -347,7 +368,19 @@ static void printHelp(int fd)
           "                     import a LittleFS csv file into one meter ring: merge\r\n"
           "                     (default) fills free slots, overwrite clears the ring\r\n"
           "                     first, update only revises stored periods\r\n"
-          "  store              LittleFS volume: files with sizes, capacity and free space\r\n"
+          "  filesystem {list|delete|rename|show}\r\n"
+          "                     LittleFS volume: list files with sizes, capacity\r\n"
+          "                     and free space; delete and rename ask the file\r\n"
+          "                     names (and an Are you sure (N/y) confirmation);\r\n"
+          "                     show prints a file's contents skipping control\r\n"
+          "                     characters except tab, CR and LF (shown as-is)\r\n"
+          "  settings {save|load}\r\n"
+          "                     save asks the ini file name (empty =\r\n"
+          "                     YYMMDDhhmm-settings.ini, a plain name gets the\r\n"
+          "                     .ini suffix) and writes every settings field as\r\n"
+          "                     plain ascii ini to the volume; load asks the\r\n"
+          "                     file and stores its values back into NVS\r\n"
+          "                     (restart to apply them)\r\n"
           "  sync               write all ring files to storage now (resets the interval)\r\n");
 
   //-- The verbose line carries the reporting level currently set, so the
@@ -1014,8 +1047,9 @@ static void printRingFile(int fd, const char* periodText)
   free(buffer);
 }
 
-//-- LittleFS volume overview: every file on the mounted storage volume with
-//-- its size, followed by the total capacity and the free space. The walk
+//-- LittleFS volume overview (the filesystem list action): every file on the
+//-- mounted storage volume with its size, followed by the total capacity and
+//-- the free space. The walk
 //-- runs on the console task while the store task keeps writing its ring
 //-- snapshots: the LittleFS VFS layer serialises both sides, and the answer is
 //-- built in memory (like the ring file walk) so the socket is never written
@@ -1114,6 +1148,145 @@ static void printStore(int fd)
 
   telnetSend(fd, out.buffer, out.length);
   free(buffer);
+}
+
+//-- --------------------------------------------------------------------------
+//-- Volume file helpers (the filesystem and settings commands)
+//-- --------------------------------------------------------------------------
+
+//-- Answers the mount question shared by the volume-touching commands.
+static bool telnetVolumeMounted(int fd)
+{
+  if (loggerStoreMountPoint() != NULL)
+  {
+    return true;
+  }
+
+  telnetPrintf(fd, "\r\nthe LittleFS storage volume is not mounted (meter store disabled)\r\n");
+  return false;
+}
+
+//-- True when fileName names a regular file at the volume root.
+static bool telnetFileExists(const char* fileName)
+{
+  char path[TELNET_PATH_BYTES];
+  snprintf(path, sizeof path, "%s/%s", loggerStoreMountPoint(), fileName);
+
+  struct stat details;
+  memset(&details, 0, sizeof details);
+
+  return (stat(path, &details) == 0) && S_ISREG(details.st_mode);
+}
+
+//-- Upper bound for a filesystem show dump: the bytes the console prints
+//-- from one file before it reports the rest as truncated.
+#define TELNET_SHOW_MAX_BYTES 65536u
+
+//-- Bytes filesystem show passes on to the session: every printable byte
+//-- plus tab, carriage return and line feed, which are shown as they are.
+static bool isShownByte(uint8_t byte)
+{
+  return isprint((int)byte) || (byte == '\t') || (byte == '\r') || (byte == '\n');
+}
+
+//-- Prints a volume file to the session skipping every control character
+//-- except tab, CR and LF: only bytes meant to be seen reach the socket, so
+//-- a binary file can never emit escape or flow bytes into the console. The
+//-- answer streams in chunks and stops after TELNET_SHOW_MAX_BYTES content
+//-- bytes.
+static void printVolumeFile(int fd, const char* fileName)
+{
+  char path[TELNET_PATH_BYTES];
+  snprintf(path, sizeof path, "%s/%s", loggerStoreMountPoint(), fileName);
+
+  FILE* file = fopen(path, "rb");
+
+  if (file == NULL)
+  {
+    telnetPrintf(fd, "file '%s' could not be opened (errno %d)\r\n", fileName, errno);
+    return;
+  }
+
+  telnetPrintf(fd, "\r\n%s:\r\n", fileName);
+
+  uint8_t chunk[128];
+  char printable[TELNET_PRINT_LINE_BYTES];
+  size_t printablePos = 0u;
+  size_t shownBytes = 0u;
+  bool truncated = false;
+  size_t readCount = 0u;
+
+  while (!truncated && ((readCount = fread(chunk, 1u, sizeof chunk, file)) > 0u))
+  {
+    for (size_t index = 0u; index < readCount; index++)
+    {
+      if (shownBytes >= TELNET_SHOW_MAX_BYTES)
+      {
+        truncated = true;
+        break;
+      }
+
+      if (isShownByte(chunk[index]))
+      {
+        shownBytes++;
+        printable[printablePos++] = (char)chunk[index];
+
+        if (printablePos == sizeof printable)
+        {
+          telnetSend(fd, printable, printablePos);
+          printablePos = 0u;
+        }
+      }
+    }
+  }
+
+  if (printablePos > 0u)
+  {
+    telnetSend(fd, printable, printablePos);
+  }
+
+  fclose(file);
+
+  if (truncated)
+  {
+    telnetPrintf(fd, "\r\n... contents truncated at %" PRIu32 " bytes\r\n", (uint32_t)shownBytes);
+  }
+  else
+  {
+    telnetPrintf(fd, "\r\n(%" PRIu32 " bytes shown from '%s')\r\n", (uint32_t)shownBytes, fileName);
+  }
+}
+
+//-- Final name of a settings export: the empty answer keeps the wall-clock
+//-- stamp YYMMDDhhmm-settings.ini, a typed name gets the .ini suffix when
+//-- it does not carry one (the same rule ring2csv applies to .csv names).
+static void buildSettingsFileName(const char* requested, char* outName, size_t outSize)
+{
+  if ((requested == NULL) || (requested[0] == '\0'))
+  {
+    char stamp[16] = "0000000000";
+    time_t now = time(NULL);
+    struct tm brokenTime;
+
+    if ((now >= 1700000000) && (localtime_r(&now, &brokenTime) != NULL))
+    {
+      strftime(stamp, sizeof stamp, "%y%m%d%H%M", &brokenTime);
+    }
+
+    snprintf(outName, outSize, "%s-settings.ini", stamp);
+    return;
+  }
+
+  size_t length = strlen(requested);
+
+  if ((length >= 4u) && (strcasecmp(requested + length - 4u, ".ini") == 0))
+  {
+    snprintf(outName, outSize, "%s", requested);
+  }
+  else
+  {
+    snprintf(outName, outSize, "%s.ini", requested);
+  }
 }
 
 //-- Runs the populate import of one csv file into the pending ring and
@@ -1237,6 +1410,226 @@ static bool handleLine(int fd, char* line)
     }
 
     telnetPrintf(fd, "restart cancelled\r\n");
+    telnetShowPrompt(fd);
+    return true;
+  }
+
+  //-- filesystem delete awaits the name of the file to remove: an unknown
+  //-- file is reported, an existing one is confirmed before it is removed.
+  if (fsAwaitingDeleteName)
+  {
+    fsAwaitingDeleteName = false;
+
+    if (*line == '\0')
+    {
+      telnetPrintf(fd, "delete cancelled\r\n");
+    }
+    else if (!telnetFileExists(line))
+    {
+      telnetPrintf(fd, "no such file on the volume: '%s'\r\n", line);
+    }
+    else
+    {
+      snprintf(fsPendingName, sizeof fsPendingName, "%s", line);
+      fsConfirmIsRename = false;
+      fsAwaitingConfirm = true;
+      loggerControlConsoleSetPrompt(NULL);
+      telnetPrintf(fd, "\r\ndelete '%s' from the volume.\r\nAre you sure (N/y)? ", fsPendingName);
+      return true;
+    }
+
+    telnetShowPrompt(fd);
+    return true;
+  }
+
+  //-- filesystem rename awaits the old name first: the target is only asked
+  //-- for when there really is a file to rename.
+  if (fsAwaitingOldName)
+  {
+    fsAwaitingOldName = false;
+
+    if (*line == '\0')
+    {
+      telnetPrintf(fd, "rename cancelled\r\n");
+    }
+    else if (!telnetFileExists(line))
+    {
+      telnetPrintf(fd, "no such file on the volume: '%s'\r\n", line);
+    }
+    else
+    {
+      snprintf(fsPendingName, sizeof fsPendingName, "%s", line);
+      fsAwaitingNewName = true;
+      loggerControlConsoleSetPrompt(NULL);
+      telnetPrintf(fd, "new name: ");
+      return true;
+    }
+
+    telnetShowPrompt(fd);
+    return true;
+  }
+
+  //-- The second rename question awaits the new name: an existing name is
+  //-- refused, a free one is confirmed before the rename happens.
+  if (fsAwaitingNewName)
+  {
+    fsAwaitingNewName = false;
+
+    if (*line == '\0')
+    {
+      telnetPrintf(fd, "rename cancelled\r\n");
+    }
+    else if (telnetFileExists(line))
+    {
+      telnetPrintf(fd, "a file named '%s' already exists on the volume\r\n", line);
+    }
+    else
+    {
+      snprintf(fsPendingNewName, sizeof fsPendingNewName, "%s", line);
+      fsConfirmIsRename = true;
+      fsAwaitingConfirm = true;
+      loggerControlConsoleSetPrompt(NULL);
+      telnetPrintf(fd, "\r\nrename '%s' to '%s'.\r\nAre you sure (N/y)? ", fsPendingName,
+                   fsPendingNewName);
+      return true;
+    }
+
+    telnetShowPrompt(fd);
+    return true;
+  }
+
+  //-- filesystem show awaits the file to print (tab, CR and LF shown as-is).
+  if (fsAwaitingShowName)
+  {
+    fsAwaitingShowName = false;
+
+    if (*line == '\0')
+    {
+      telnetPrintf(fd, "show cancelled\r\n");
+    }
+    else if (!telnetFileExists(line))
+    {
+      telnetPrintf(fd, "no such file on the volume: '%s'\r\n", line);
+    }
+    else
+    {
+      printVolumeFile(fd, line);
+    }
+
+    telnetShowPrompt(fd);
+    return true;
+  }
+
+  //-- The delete and rename confirmations default to no like the restart
+  //-- question does: anything but y/yes (an empty line included) cancels.
+  if (fsAwaitingConfirm)
+  {
+    fsAwaitingConfirm = false;
+
+    if ((strcasecmp(line, "y") == 0) || (strcasecmp(line, "yes") == 0))
+    {
+      char path[TELNET_PATH_BYTES];
+      snprintf(path, sizeof path, "%s/%s", loggerStoreMountPoint(), fsPendingName);
+
+      if (!fsConfirmIsRename)
+      {
+        if (remove(path) == 0)
+        {
+          telnetPrintf(fd, "deleted '%s' from the volume\r\n", fsPendingName);
+        }
+        else
+        {
+          telnetPrintf(fd, "delete of '%s' failed (errno %d)\r\n", fsPendingName, errno);
+        }
+      }
+      else
+      {
+        char newPath[TELNET_PATH_BYTES];
+        snprintf(newPath, sizeof newPath, "%s/%s", loggerStoreMountPoint(), fsPendingNewName);
+
+        if (rename(path, newPath) == 0)
+        {
+          telnetPrintf(fd, "renamed '%s' to '%s' on the volume\r\n", fsPendingName,
+                       fsPendingNewName);
+        }
+        else
+        {
+          telnetPrintf(fd, "rename of '%s' failed (errno %d)\r\n", fsPendingName, errno);
+        }
+      }
+    }
+    else
+    {
+      telnetPrintf(fd, "cancelled\r\n");
+    }
+
+    telnetShowPrompt(fd);
+    return true;
+  }
+
+  //-- settings save awaits the ini file name: the empty answer keeps the
+  //-- stamped default, a typed name gets the .ini suffix; every settings
+  //-- field then lands at the volume root as one plain ascii ini file.
+  if (settingsAwaitingSaveName)
+  {
+    settingsAwaitingSaveName = false;
+
+    char finalName[TELNET_LINE_MAX + 8];
+    buildSettingsFileName((*line != '\0') ? line : NULL, finalName, sizeof finalName);
+
+    char path[TELNET_PATH_BYTES];
+    snprintf(path, sizeof path, "%s/%s", loggerStoreMountPoint(), finalName);
+
+    uint32_t fields = 0u;
+    esp_err_t outcome = loggerSettingsExportToFile(path, &fields);
+
+    if (outcome != ESP_OK)
+    {
+      telnetPrintf(fd, "settings save to %s failed: %s\r\n", finalName, esp_err_to_name(outcome));
+    }
+    else
+    {
+      telnetPrintf(fd, "wrote %" PRIu32 " setting(s) to %s on the volume\r\n", fields, finalName);
+    }
+
+    telnetShowPrompt(fd);
+    return true;
+  }
+
+  //-- settings load awaits the file to read back: the load needs a name, so
+  //-- an empty line cancels; the values land in NVS and apply on a restart.
+  if (settingsAwaitingLoadName)
+  {
+    settingsAwaitingLoadName = false;
+
+    if (*line == '\0')
+    {
+      telnetPrintf(fd, "load cancelled\r\n");
+    }
+    else if (!telnetFileExists(line))
+    {
+      telnetPrintf(fd, "no such file on the volume: '%s'\r\n", line);
+    }
+    else
+    {
+      char path[TELNET_PATH_BYTES];
+      snprintf(path, sizeof path, "%s/%s", loggerStoreMountPoint(), line);
+
+      uint32_t fields = 0u;
+      esp_err_t outcome = loggerSettingsImportFromFile(path, &fields);
+
+      if (outcome != ESP_OK)
+      {
+        telnetPrintf(fd, "settings load of %s failed: %s\r\n", line, esp_err_to_name(outcome));
+      }
+      else
+      {
+        telnetPrintf(fd,
+                     "loaded %" PRIu32 " setting(s) from %s into NVS - restart to apply them\r\n",
+                     fields, line);
+      }
+    }
+
     telnetShowPrompt(fd);
     return true;
   }
@@ -1430,9 +1823,105 @@ static bool handleLine(int fd, char* line)
     telnetPrintf(fd, "\r\nrestart the device now? are you sure (N/y)? ");
     return true; //-- the answer replaces the next prompt
   }
-  else if (strcmp(command, "store") == 0)
+  else if (strcmp(command, "filesystem") == 0)
   {
-    printStore(fd);
+    //-- The action word picks the volume operation: list reports the volume
+    //-- (the old store command), delete and rename ask their questions and
+    //-- confirm before they touch a file, show prints one file's contents
+    //-- (tab, CR and LF shown as-is, other control characters skipped).
+    char actionText[32];
+    actionText[0] = '\0';
+
+    if (arguments != NULL)
+    {
+      (void)sscanf(arguments, "%31s", actionText);
+    }
+
+    if (actionText[0] == '\0')
+    {
+      telnetPrintf(fd, "usage: filesystem {list|delete|rename|show}\r\n");
+    }
+    else if (strcasecmp(actionText, "list") == 0)
+    {
+      printStore(fd);
+    }
+    else if (strcasecmp(actionText, "delete") == 0)
+    {
+      if (telnetVolumeMounted(fd))
+      {
+        fsAwaitingDeleteName = true;
+        loggerControlConsoleSetPrompt(NULL);
+        telnetPrintf(fd, "\r\ndelete what file: ");
+        return true;
+      }
+    }
+    else if (strcasecmp(actionText, "rename") == 0)
+    {
+      if (telnetVolumeMounted(fd))
+      {
+        fsAwaitingOldName = true;
+        loggerControlConsoleSetPrompt(NULL);
+        telnetPrintf(fd, "\r\nrename old name: ");
+        return true;
+      }
+    }
+    else if (strcasecmp(actionText, "show") == 0)
+    {
+      if (telnetVolumeMounted(fd))
+      {
+        fsAwaitingShowName = true;
+        loggerControlConsoleSetPrompt(NULL);
+        telnetPrintf(fd, "\r\nshow what file: ");
+        return true;
+      }
+    }
+    else
+    {
+      telnetPrintf(fd, "unknown filesystem action '%s' - use list, delete, rename or show\r\n",
+                   actionText);
+    }
+  }
+  else if (strcmp(command, "settings") == 0)
+  {
+    //-- save writes every settings field as a plain ascii ini file on the
+    //-- volume, load reads such a file back into NVS; both ask their
+    //-- question first.
+    char actionText[32];
+    actionText[0] = '\0';
+
+    if (arguments != NULL)
+    {
+      (void)sscanf(arguments, "%31s", actionText);
+    }
+
+    if (actionText[0] == '\0')
+    {
+      telnetPrintf(fd, "usage: settings {save|load}\r\n");
+    }
+    else if (strcasecmp(actionText, "save") == 0)
+    {
+      if (telnetVolumeMounted(fd))
+      {
+        settingsAwaitingSaveName = true;
+        loggerControlConsoleSetPrompt(NULL);
+        telnetPrintf(fd, "\r\nsave settings to (empty = YYMMDDhhmm-settings.ini): ");
+        return true;
+      }
+    }
+    else if (strcasecmp(actionText, "load") == 0)
+    {
+      if (telnetVolumeMounted(fd))
+      {
+        settingsAwaitingLoadName = true;
+        loggerControlConsoleSetPrompt(NULL);
+        telnetPrintf(fd, "\r\nload what settings file: ");
+        return true;
+      }
+    }
+    else
+    {
+      telnetPrintf(fd, "unknown settings action '%s' - use save or load\r\n", actionText);
+    }
   }
   else if (strcmp(command, "populate") == 0)
   {
@@ -1704,8 +2193,10 @@ static void telnetTaskLoop(void* argument)
 
             //-- Every finished line goes to the command handler: an empty
             //-- line prints the help list there, and while a question is
-            //-- open (populate file, ring2csv name, restart confirmation)
-            //-- the empty line is the answer.
+            //-- open (populate file, ring2csv name, restart confirmation,
+            //-- the filesystem delete/rename/show names and their
+            //-- confirmations, the settings save/load names) the empty line
+            //-- is the answer.
             {
               line[linePos] = '\0';
               telnetSendText(clientFd, "\r\n");
@@ -1775,6 +2266,13 @@ static void telnetTaskLoop(void* argument)
         populateMode = LOGGER_POPULATE_MERGE;
         exportAwaitingName = false;
         restartAwaitingConfirm = false;
+        fsAwaitingDeleteName = false;
+        fsAwaitingOldName = false;
+        fsAwaitingNewName = false;
+        fsAwaitingShowName = false;
+        fsAwaitingConfirm = false;
+        settingsAwaitingSaveName = false;
+        settingsAwaitingLoadName = false;
 
         const uint8_t willEcho[3] = {TELNET_IAC, TELNET_WILL, TELNET_OPT_ECHO};
         const uint8_t willSga[3] = {TELNET_IAC, TELNET_WILL, TELNET_OPT_SGA};

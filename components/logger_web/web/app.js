@@ -629,6 +629,20 @@ function updateRotationLabels()
   el.rotUpsideDownLabel.classList.toggle("active", isFlipped);
 }
 
+//-- Shows only the fields of one settings section: the radio bar on top of
+//-- the settings screen picks which .settingsGroup div of index.html stays
+//-- on screen (p1port, display, mbus, mqtt, network, store or tariffs — the
+//-- same groups the telnet settings ini writes). Hidden fields keep their
+//-- values and Save always submits the complete configuration (see
+//-- saveSettings), so the picker only changes what is visible.
+function showSettingsGroup(group)
+{
+  document.querySelectorAll(".settingsGroup").forEach((section) =>
+  {
+    section.hidden = (section.dataset.group !== group);
+  });
+}
+
 // The bounds of the rfs sync interval, taken from the published choices
 // with the documented fallback when the frame carries none.
 function rfsSyncBounds()
@@ -1756,11 +1770,10 @@ function renderRingFileList(message)
 // retains draws its pair alone. Each panel has grid lines, y labels and rotated period
 // labels; the label band reserves exactly the room the slanted text
 // needs, so nothing is cut off and no dead space is left between the
-// panels. Hovering pops up a separate chip per series: on the hours and
-// days views the used kWh and the returned kWh each get their own chip
-// riding along their bar on the energy panel; on the months view the
-// energy panel shows exactly one chip, named for and riding along the bar
-// the cursor sits on. The gas m³ gets one chip over the gas panel.
+// panels. Hovering pops up exactly one chip on the energy panel, named
+// for and riding along the bar the cursor sits on: above the zero line a
+// used (red) bar, below it a returned (green) one. The gas m³ gets one
+// chip over the gas panel.
 // The state line names the on-device API that serves the underlying ring
 // records. Everything is drawn straight from the frame's numbers, nothing
 // is interpreted. The toolbar radio group picks the presentation (see
@@ -2860,15 +2873,13 @@ function drawPeriodGraph(viewId)
 }
 
 // Hover popups: separate chips per series (same chip style as the power
-// history popup). While the cursor is over the energy panel of the hours
-// and days views the used kWh and the returned kWh each get their own
-// chip, one riding above the top of the red bar and one just under the
-// tip of the green bar, so the two amounts are read apart instead of
-// merged into a net figure. The months view reads one bar at a time: the
-// cursor gets exactly one chip, for the bar it sits on (left column the
-// same month one year back, right column this period; above the zero line
-// that bar is a used bar, below it a returned one), riding along that
-// bar. Over the gas panel a single chip shows the gas m³. The chips
+// history popup). Every view reads one bar at a time: while the cursor is
+// over the energy panel it gets exactly one chip, for the bar it sits on
+// (above the zero line that bar is a used (red) bar, below it a returned
+// (green) one), riding along that bar. The months view additionally
+// splits the slot in two columns (left the same month one year back,
+// right this period); the hours and days views read the hovered period's
+// own bars. Over the gas panel a single chip shows the gas m³. The chips
 // centre on their own bar and stay inside the plot.
 function updatePeriodGraphTooltip(viewId)
 {
@@ -2948,23 +2959,25 @@ function updatePeriodGraphTooltip(viewId)
 
   if (!paired)
   {
-    const usedValue = record.used || 0;
-    const returnedValue = record.returned || 0;
+    // Hours and days views read one bar at a time, like the months view:
+    // above the zero line the cursor sits on the used (red) bar, below it
+    // on the returned (green) one, and only that bar's chip shows.
+    const isUsed = (graph.hoverY < layout.yOfEnergy(0));
+    const tip = isUsed ? tips.used : tips.returned;
+    const value = (isUsed ? record.used : record.returned) || 0;
 
-    tips.used.textContent = "Used " + usedValue.toFixed(3) + " kWh";
-    tips.returned.textContent = "Returned " + returnedValue.toFixed(3) + " kWh";
+    tip.textContent = (isUsed ? "Used " : "Returned ") + value.toFixed(3) + " kWh";
 
-    // Each chip rides along its own bar (clamped inside the panel), so the
+    // The chip rides along its own bar (clamped inside the panel), so the
     // used chip reads with the red series and the returned chip with the
     // green one.
-    const usedTop = Math.max(energy.y + 2,
-                             Math.min(layout.yOfEnergy(usedValue) - 22, energy.y + energy.height - 22));
-    const returnedTop = Math.max(energy.y + 2,
-                                 Math.min(layout.yOfEnergy(-returnedValue) + 3,
-                                          energy.y + energy.height - 22));
+    const chipTop = isUsed
+                  ? Math.max(energy.y + 2,
+                             Math.min(layout.yOfEnergy(value) - 22, energy.y + energy.height - 22))
+                  : Math.max(energy.y + 2,
+                             Math.min(layout.yOfEnergy(-value) + 3, energy.y + energy.height - 22));
 
-    place(tips.used, usedTop, centre);
-    place(tips.returned, returnedTop, centre);
+    place(tip, chipTop, centre);
 
     return;
   }
@@ -3961,6 +3974,17 @@ function boot()
   el.txPolarityToggle.addEventListener("change", updateTxPolarityLabels);
   el.displayRotationToggle.addEventListener("change", updateRotationLabels);
   el.inpRfsSync.addEventListener("input", updateRfsWearEstimate);
+
+  // The settings section picker: one radio button per group shows only the
+  // fields of that group; the Save button below the groups stays visible on
+  // every section.
+  document.querySelectorAll('input[name="settingsSection"]').forEach((radio) =>
+  {
+    radio.addEventListener("change", () =>
+    {
+      showSettingsGroup(radio.value);
+    });
+  });
 
   // Show starts the live follow of every newly accepted telegram (the
   // button becomes Pause); Pause freezes the shown telegram again.

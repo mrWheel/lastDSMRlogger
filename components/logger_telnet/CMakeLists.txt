@@ -1,5 +1,5 @@
 # lastDSMRlogger - telnet console server
-# Date: 2026-11-22 · Build: 3
+# Date: 2026-11-24 · Build: 4
 #
 # Plain BSD-socket telnet console on port 23. The single-client rule lives in
 # the shared logger_control arbiter, so this component depends on it and on

@@ -31,151 +31,184 @@
     <section id="viewSettings" class="card" hidden>
       <h2>Settings</h2>
       <div id="settingsMessage" class="message"></div>
+      <!-- The settings screen is divided into sections picked by the radio
+           bar on top (P1 port, Display, M-Bus, MQTT, Network, Store,
+           Tariffs — the same groups the telnet settings ini writes). Only
+           the fields of the selected section are on screen; hidden fields
+           keep their values and Save always submits the complete
+           configuration (see showSettingsGroup in app.js). The [Save]
+           button below the groups is visible on every section. -->
       <form id="settingsForm">
-        <label for="srcToggle">Data source</label>
-        <div class="toggleRow">
-          <span id="srcLiveLabel" class="toggleEnd active">Live data</span>
-          <input id="srcToggle" type="checkbox" role="switch" aria-label="Test data">
-          <label class="switch" for="srcToggle" aria-hidden="true"><span class="switchKnob"></span></label>
-          <span id="srcTestLabel" class="toggleEnd">Test data</span>
+        <div id="settingsGroupBar" class="ringRadioGroup" role="radiogroup" aria-label="Settings sections">
+          <label><input type="radio" name="settingsSection" value="p1port" checked> P1 port</label>
+          <label><input type="radio" name="settingsSection" value="display"> Display</label>
+          <label><input type="radio" name="settingsSection" value="mbus"> M-Bus</label>
+          <label><input type="radio" name="settingsSection" value="mqtt"> MQTT</label>
+          <label><input type="radio" name="settingsSection" value="network"> Network</label>
+          <label><input type="radio" name="settingsSection" value="store"> Store</label>
+          <label><input type="radio" name="settingsSection" value="tariffs"> Tariffs</label>
         </div>
 
-        <label for="rxPolarityToggle">P1 RX polarity (live data)</label>
-        <div class="toggleRow">
-          <span id="polNormalLabel" class="toggleEnd active">Normal</span>
-          <input id="rxPolarityToggle" type="checkbox" role="switch" aria-label="Invert P1 RX polarity">
-          <label class="switch" for="rxPolarityToggle" aria-hidden="true"><span class="switchKnob"></span></label>
-          <span id="polInvertedLabel" class="toggleEnd">Inverted</span>
-        </div>
-
-        <label for="txPolarityToggle">P1 Tx polarity (Forwarding Data)</label>
-        <div class="toggleRow">
-          <span id="txPolNormalLabel" class="toggleEnd active">Normal</span>
-          <input id="txPolarityToggle" type="checkbox" role="switch" aria-label="Invert P1 Tx polarity for forwarded data">
-          <label class="switch" for="txPolarityToggle" aria-hidden="true"><span class="switchKnob"></span></label>
-          <span id="txPolInvertedLabel" class="toggleEnd">Inverted</span>
-        </div>
-
-        <label for="displayRotationToggle">Display orientation</label>
-        <div class="toggleRow">
-          <span id="rotNormalLabel" class="toggleEnd active">Normal</span>
-          <input id="displayRotationToggle" type="checkbox" role="switch" aria-label="Turn the display upside down">
-          <label class="switch" for="displayRotationToggle" aria-hidden="true"><span class="switchKnob"></span></label>
-          <span id="rotUpsideDownLabel" class="toggleEnd">Upside down</span>
-        </div>
-
-        <label for="inpInterval">Interval</label>
-        <div class="intervalRow">
-          <input id="inpInterval" type="number" step="1" value="10" inputmode="numeric">
-        </div>
-
-        <label for="selCountry">Country</label>
-        <select id="selCountry"></select>
-
-        <label for="selProfile">Protocol version</label>
-        <select id="selProfile"></select>
-
-        <fieldset>
-          <legend>M-Bus channels</legend>
-          <div class="mbusRow">
-            <label for="selMbus1">Channel 1</label>
-            <select id="selMbus1"></select>
+        <!-- P1 port: the receive path — data source, the two polarities,
+             the read interval, country and protocol version. -->
+        <div class="settingsGroup" data-group="p1port">
+          <label for="srcToggle">Data source</label>
+          <div class="toggleRow">
+            <span id="srcLiveLabel" class="toggleEnd active">Live data</span>
+            <input id="srcToggle" type="checkbox" role="switch" aria-label="Test data">
+            <label class="switch" for="srcToggle" aria-hidden="true"><span class="switchKnob"></span></label>
+            <span id="srcTestLabel" class="toggleEnd">Test data</span>
           </div>
-          <div class="mbusRow">
-            <label for="selMbus2">Channel 2</label>
-            <select id="selMbus2"></select>
+
+          <label for="rxPolarityToggle">P1 RX polarity (live data)</label>
+          <div class="toggleRow">
+            <span id="polNormalLabel" class="toggleEnd active">Normal</span>
+            <input id="rxPolarityToggle" type="checkbox" role="switch" aria-label="Invert P1 RX polarity">
+            <label class="switch" for="rxPolarityToggle" aria-hidden="true"><span class="switchKnob"></span></label>
+            <span id="polInvertedLabel" class="toggleEnd">Inverted</span>
           </div>
-          <div class="mbusRow">
-            <label for="selMbus3">Channel 3</label>
-            <select id="selMbus3"></select>
+
+          <label for="txPolarityToggle">P1 Tx polarity (Forwarding Data)</label>
+          <div class="toggleRow">
+            <span id="txPolNormalLabel" class="toggleEnd active">Normal</span>
+            <input id="txPolarityToggle" type="checkbox" role="switch" aria-label="Invert P1 Tx polarity for forwarded data">
+            <label class="switch" for="txPolarityToggle" aria-hidden="true"><span class="switchKnob"></span></label>
+            <span id="txPolInvertedLabel" class="toggleEnd">Inverted</span>
           </div>
-          <div class="mbusRow">
-            <label for="selMbus4">Channel 4</label>
-            <select id="selMbus4"></select>
+
+          <label for="inpInterval">Interval</label>
+          <div class="intervalRow">
+            <input id="inpInterval" type="number" step="1" value="10" inputmode="numeric">
           </div>
-        </fieldset>
+
+          <label for="selCountry">Country</label>
+          <select id="selCountry"></select>
+
+          <label for="selProfile">Protocol version</label>
+          <select id="selProfile"></select>
+        </div>
+
+        <!-- Display: the TFT orientation switch. -->
+        <div class="settingsGroup" data-group="display" hidden>
+          <label for="displayRotationToggle">Display orientation</label>
+          <div class="toggleRow">
+            <span id="rotNormalLabel" class="toggleEnd active">Normal</span>
+            <input id="displayRotationToggle" type="checkbox" role="switch" aria-label="Turn the display upside down">
+            <label class="switch" for="displayRotationToggle" aria-hidden="true"><span class="switchKnob"></span></label>
+            <span id="rotUpsideDownLabel" class="toggleEnd">Upside down</span>
+          </div>
+        </div>
+
+        <!-- M-Bus: the four channel selections of the P1 telegram. -->
+        <div class="settingsGroup" data-group="mbus" hidden>
+          <fieldset>
+            <legend>M-Bus channels</legend>
+            <div class="mbusRow">
+              <label for="selMbus1">Channel 1</label>
+              <select id="selMbus1"></select>
+            </div>
+            <div class="mbusRow">
+              <label for="selMbus2">Channel 2</label>
+              <select id="selMbus2"></select>
+            </div>
+            <div class="mbusRow">
+              <label for="selMbus3">Channel 3</label>
+              <select id="selMbus3"></select>
+            </div>
+            <div class="mbusRow">
+              <label for="selMbus4">Channel 4</label>
+              <select id="selMbus4"></select>
+            </div>
+          </fieldset>
+        </div>
 
         <!-- MQTT and Network groups: iOS Settings style list rows (one row
              per field, label left, gray filled input, hairline separators;
              see the .iosGroup rules in style.css). -->
-        <fieldset class="iosGroup">
-          <legend>MQTT</legend>
-          <div class="iosRow">
-            <label for="inpMqttBroker">Broker IP or URL</label>
-            <input id="inpMqttBroker" type="text" maxlength="127" autocomplete="off"
-                   placeholder="192.168.1.50 or mqtt.example.com">
-          </div>
+        <div class="settingsGroup" data-group="mqtt" hidden>
+          <fieldset class="iosGroup">
+            <legend>MQTT</legend>
+            <div class="iosRow">
+              <label for="inpMqttBroker">Broker IP or URL</label>
+              <input id="inpMqttBroker" type="text" maxlength="127" autocomplete="off"
+                     placeholder="192.168.1.50 or mqtt.example.com">
+            </div>
 
-          <div class="iosRow">
-            <label for="inpMqttPort">Broker port</label>
-            <input id="inpMqttPort" type="number" min="1" max="65535" step="1" value="1883" inputmode="numeric">
-          </div>
+            <div class="iosRow">
+              <label for="inpMqttPort">Broker port</label>
+              <input id="inpMqttPort" type="number" min="1" max="65535" step="1" value="1883" inputmode="numeric">
+            </div>
 
-          <div class="iosRow">
-            <label for="inpMqttUser">User</label>
-            <input id="inpMqttUser" type="text" maxlength="63" autocomplete="off">
-          </div>
+            <div class="iosRow">
+              <label for="inpMqttUser">User</label>
+              <input id="inpMqttUser" type="text" maxlength="63" autocomplete="off">
+            </div>
 
-          <div class="iosRow">
-            <label for="inpMqttPassword">Password</label>
-            <input id="inpMqttPassword" type="password" maxlength="63" autocomplete="new-password" placeholder="unchanged (empty keeps the stored one)">
-          </div>
+            <div class="iosRow">
+              <label for="inpMqttPassword">Password</label>
+              <input id="inpMqttPassword" type="password" maxlength="63" autocomplete="new-password" placeholder="unchanged (empty keeps the stored one)">
+            </div>
 
-          <div class="iosRow">
-            <label for="inpMqttTopic">Top topic</label>
-            <input id="inpMqttTopic" type="text" maxlength="63" autocomplete="off"
-                   placeholder="lastdsmrlogger">
-          </div>
+            <div class="iosRow">
+              <label for="inpMqttTopic">Top topic</label>
+              <input id="inpMqttTopic" type="text" maxlength="63" autocomplete="off"
+                     placeholder="lastdsmrlogger">
+            </div>
 
-          <!-- The tariff topic is <top topic>/<client id>/<sub topic>: the
-               client id segment is left out while the field is empty, and a
-               blank sub topic means newTariffs. The client id is also what
-               the broker sees for this device. -->
-          <div class="iosRow">
-            <label for="inpMqttClientId">Client ID</label>
-            <input id="inpMqttClientId" type="text" maxlength="63" autocomplete="off"
-                   placeholder="empty = no device segment">
-          </div>
+            <!-- The tariff topic is <top topic>/<client id>/<sub topic>: the
+                 client id segment is left out while the field is empty, and a
+                 blank sub topic means newTariffs. The client id is also what
+                 the broker sees for this device. -->
+            <div class="iosRow">
+              <label for="inpMqttClientId">Client ID</label>
+              <input id="inpMqttClientId" type="text" maxlength="63" autocomplete="off"
+                     placeholder="empty = no device segment">
+            </div>
 
-          <div class="iosRow">
-            <label for="inpMqttSubTopic">Sub topic</label>
-            <input id="inpMqttSubTopic" type="text" maxlength="63" autocomplete="off"
-                   placeholder="newTariffs">
-          </div>
+            <div class="iosRow">
+              <label for="inpMqttSubTopic">Sub topic</label>
+              <input id="inpMqttSubTopic" type="text" maxlength="63" autocomplete="off"
+                     placeholder="newTariffs">
+            </div>
 
-          <div class="iosRow">
-            <label for="inpMqttInterval">Broadcast interval (0 = no broadcast)</label>
-            <input id="inpMqttInterval" type="number" min="0" max="86400" step="1" value="0" inputmode="numeric">
-          </div>
-        </fieldset>
+            <div class="iosRow">
+              <label for="inpMqttInterval">Broadcast interval (0 = no broadcast)</label>
+              <input id="inpMqttInterval" type="number" min="0" max="86400" step="1" value="0" inputmode="numeric">
+            </div>
+          </fieldset>
+        </div>
 
-        <fieldset class="iosGroup">
-          <legend>Network</legend>
-          <div class="iosRow">
-            <label for="inpHostname">Hostname</label>
-            <input id="inpHostname" type="text" maxlength="32" autocomplete="off" placeholder="dsmrlogger">
-          </div>
+        <div class="settingsGroup" data-group="network" hidden>
+          <fieldset class="iosGroup">
+            <legend>Network</legend>
+            <div class="iosRow">
+              <label for="inpHostname">Hostname</label>
+              <input id="inpHostname" type="text" maxlength="32" autocomplete="off" placeholder="dsmrlogger">
+            </div>
 
-          <div class="iosRow">
-            <label for="inpFixedIp">Fixed IP (last part; empty or 0 = no fixed IP)</label>
-            <input id="inpFixedIp" type="number" min="0" max="254" step="1" value="0" inputmode="numeric">
-          </div>
-        </fieldset>
+            <div class="iosRow">
+              <label for="inpFixedIp">Fixed IP (last part; empty or 0 = no fixed IP)</label>
+              <input id="inpFixedIp" type="number" min="0" max="254" step="1" value="0" inputmode="numeric">
+            </div>
+          </fieldset>
+        </div>
 
-        <!-- Meter store group: the rfs synchronisation interval commits the
-             staged ring records to the LittleFS volume; the span beside the
-             field shows the rough wear estimate for the entered value
-             (computed by app.js from the wear inputs in the config frame). -->
-        <fieldset class="iosGroup">
-          <legend>Meter store</legend>
-          <div class="iosRow">
-            <label for="inpRfsSync">rfs Sync Interval (minutes)</label>
-            <input id="inpRfsSync" type="number" min="1" max="60" step="1" value="10" inputmode="numeric">
-            <span id="rfsWearEstimate" class="wearEstimate"></span>
-          </div>
-        </fieldset>
+        <!-- Store: the rfs synchronisation interval commits the staged ring
+             records to the LittleFS volume; the span beside the field shows
+             the rough wear estimate for the entered value (computed by
+             app.js from the wear inputs in the config frame). -->
+        <div class="settingsGroup" data-group="store" hidden>
+          <fieldset class="iosGroup">
+            <legend>Meter store</legend>
+            <div class="iosRow">
+              <label for="inpRfsSync">rfs Sync Interval (minutes)</label>
+              <input id="inpRfsSync" type="number" min="1" max="60" step="1" value="10" inputmode="numeric">
+              <span id="rfsWearEstimate" class="wearEstimate"></span>
+            </div>
+          </fieldset>
+        </div>
 
-        <!-- Tariffs group: the manual prices follow the direction of the
+        <!-- Tariffs: the manual prices follow the direction of the
              energy. Delivered is what the grid delivers to the home (the
              used energy, a cost); Received is what the home delivers back
              (returned energy, a credit). The meter's tariff indicator
@@ -186,57 +219,63 @@
              carries one); periods or prices the table does not carry fall
              back to the manual prices below. Gas is only ever delivered to
              the home, so it needs no Received price. -->
-        <fieldset class="iosGroup">
-          <legend>Tariffs</legend>
-          <div class="iosRow">
-            <label for="inpDynamicTariffs">Dynamic Tariffs</label>
-            <input id="inpDynamicTariffs" type="checkbox"
-                   aria-label="Use the dynamic tariff table for the stored tariff amounts">
-          </div>
+        <div class="settingsGroup" data-group="tariffs" hidden>
+          <fieldset class="iosGroup">
+            <legend>Tariffs</legend>
+            <div class="iosRow">
+              <label for="inpDynamicTariffs">Dynamic Tariffs</label>
+              <input id="inpDynamicTariffs" type="checkbox"
+                     aria-label="Use the dynamic tariff table for the stored tariff amounts">
+            </div>
 
-          <div class="iosRow">
-            <label for="inpTariff1">Tariff 1 Delivered (kWh)</label>
-            <input id="inpTariff1" type="number" step="0.00001" min="-5" max="5" value="0"
-                   inputmode="decimal" placeholder="EUR per kWh used">
-          </div>
+            <div class="iosRow">
+              <label for="inpTariff1">Tariff 1 Delivered (kWh)</label>
+              <input id="inpTariff1" type="number" step="0.00001" min="-5" max="5" value="0"
+                     inputmode="decimal" placeholder="EUR per kWh used">
+            </div>
 
-          <div class="iosRow">
-            <label for="inpTariff2">Tariff 2 Delivered (kWh)</label>
-            <input id="inpTariff2" type="number" step="0.00001" min="-5" max="5" value="0"
-                   inputmode="decimal" placeholder="EUR per kWh used">
-          </div>
+            <div class="iosRow">
+              <label for="inpTariff2">Tariff 2 Delivered (kWh)</label>
+              <input id="inpTariff2" type="number" step="0.00001" min="-5" max="5" value="0"
+                     inputmode="decimal" placeholder="EUR per kWh used">
+            </div>
 
-          <div class="iosRow">
-            <label for="inpTariff1Export">Tariff 1 Received (kWh)</label>
-            <input id="inpTariff1Export" type="number" step="0.00001" min="-5" max="5" value="0"
-                   inputmode="decimal" placeholder="EUR per kWh returned">
-          </div>
+            <div class="iosRow">
+              <label for="inpTariff1Export">Tariff 1 Received (kWh)</label>
+              <input id="inpTariff1Export" type="number" step="0.00001" min="-5" max="5" value="0"
+                     inputmode="decimal" placeholder="EUR per kWh returned">
+            </div>
 
-          <div class="iosRow">
-            <label for="inpTariff2Export">Tariff 2 Received (kWh)</label>
-            <input id="inpTariff2Export" type="number" step="0.00001" min="-5" max="5" value="0"
-                   inputmode="decimal" placeholder="EUR per kWh returned">
-          </div>
+            <div class="iosRow">
+              <label for="inpTariff2Export">Tariff 2 Received (kWh)</label>
+              <input id="inpTariff2Export" type="number" step="0.00001" min="-5" max="5" value="0"
+                     inputmode="decimal" placeholder="EUR per kWh returned">
+            </div>
 
-          <div class="iosRow">
-            <label for="inpTariffGas">Tariff Gas Delivered (m3)</label>
-            <input id="inpTariffGas" type="number" step="0.00001" min="-5" max="5" value="0"
-                   inputmode="decimal" placeholder="EUR per m3">
-          </div>
+            <div class="iosRow">
+              <label for="inpTariffGas">Tariff Gas Delivered (m3)</label>
+              <input id="inpTariffGas" type="number" step="0.00001" min="-5" max="5" value="0"
+                     inputmode="decimal" placeholder="EUR per m3">
+            </div>
 
-          <!-- Fixed monthly network and transport fee: every ring record
-               stores this amount (prorated to its period: days a
-               thirtieth, hours a thirtieth of a day) and the Costs
-               presentation of the Months view prints the stored figure in
-               its Netw. column. A more advanced treatment of the
-               network costs may follow later. -->
-          <div class="iosRow">
-            <label for="inpNetworkCosts">Network &amp; transport costs (month)</label>
-            <input id="inpNetworkCosts" type="number" step="0.01" min="0" max="1000" value="0"
-                   inputmode="decimal" placeholder="EUR per month">
-          </div>
-        </fieldset>
+            <!-- Fixed monthly network and transport fee: every ring record
+                 stores this amount (prorated to its period: days a
+                 thirtieth, hours a thirtieth of a day) and the Costs
+                 presentation of the Months view prints the stored figure in
+                 its Netw. column. A more advanced treatment of the
+                 network costs may follow later. -->
+            <div class="iosRow">
+              <label for="inpNetworkCosts">Network &amp; transport costs (month)</label>
+              <input id="inpNetworkCosts" type="number" step="0.01" min="0" max="1000" value="0"
+                     inputmode="decimal" placeholder="EUR per month">
+            </div>
+          </fieldset>
+        </div>
 
+        <!-- The one Save button of the settings screen: it stands below the
+             sections and is visible on all of them, submitting the complete
+             configuration (every group's fields, shown or not) as one
+             operation. -->
         <button id="saveSettings" type="submit">Save</button>
       </form>
     </section>

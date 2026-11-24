@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.h - versioned settings service
-//-- Date: 2026-11-23 · Build: 10
+//-- Date: 2026-11-24 · Build: 11
 //--
 //-- The settings service stores the complete versioned configuration in
 //-- ESP-IDF NVS, validates it against the parserDSMR built-in profiles and
@@ -281,6 +281,34 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config);
 
 //-- Validates and persists the complete configuration as one operation.
 esp_err_t loggerSettingsSave(const loggerSettingsConfig* config);
+
+//-- --------------------------------------------------------------------------
+//-- Plain ascii ini export and import (the telnet console's settings
+//-- {save|load})
+//-- --------------------------------------------------------------------------
+
+//-- Serialises the complete stored configuration to a plain ascii ini file
+//-- at the given absolute path: one "[section]" header per group of the
+//-- settings view, then one "key = value" line per settings field (text
+//-- quoted, numbers plain). The fields: [p1port] dataSource, P1RXPolarity,
+//-- P1TXPolarity, interval, country and profile; [display] orientation;
+//-- [mbus] channel1 through channel4 (auto, disabled or a device type);
+//-- [mqtt] brokerUrl, brokerPort, user, password, topTopic, clientId,
+//-- subTopic and broadcastInterval; [network] hostname and fixedIpLastOctet;
+//-- [store] rfsSyncIntervalMinutes; [tariffs] dynamicTariffs, the five
+//-- manual prices and networkCostsPerMonth. Returns the number of fields
+//-- written; without a valid stored configuration nothing is written and
+//-- ESP_ERR_NOT_FOUND is returned.
+esp_err_t loggerSettingsExportToFile(const char* absolutePath, uint32_t* outFields);
+
+//-- Reads back a file written by loggerSettingsExportToFile() (the absolute
+//-- path again) into the configuration. The currently stored values form the
+//-- base: a key the file omits keeps its stored value. An unknown section or
+//-- key and a malformed value abort the load, and the complete candidate is
+//-- validated before anything is stored, so a hand-edited file can never
+//-- leave an invalid configuration in NVS. Returns the number of fields
+//-- applied; they apply after a restart.
+esp_err_t loggerSettingsImportFromFile(const char* absolutePath, uint32_t* outFields);
 
 //-- Copies the expected M-Bus device declarations (explicit selections only)
 //-- into outDevices and returns the number of entries written.

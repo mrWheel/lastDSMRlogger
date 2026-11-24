@@ -2848,8 +2848,8 @@ static bool appendStoreFileEntry(const char* name, bool isDirectory, bool readab
 
 static esp_err_t handleApiV3StoreGet(httpd_req_t* req)
 {
-  //-- The console's store command as JSON: every file on the mounted
-  //-- LittleFS volume with its size, then the capacity block.
+  //-- The console's filesystem list command as JSON: every file on the
+  //-- mounted LittleFS volume with its size, then the capacity block.
   char* buffer = malloc(WEB_STORE_JSON_BYTES);
 
   if (buffer == NULL)

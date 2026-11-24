@@ -1,5 +1,5 @@
 # lastDSMRlogger - versioned settings service
-# Date: 2026-11-24 · Build: 2
+# Date: 2026-11-24 · Build: 3
 
 idf_component_register(
   SRCS "logger_settings.c"

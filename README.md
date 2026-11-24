@@ -1,6 +1,6 @@
 # lastDSMRlogger
 <!--
-fileVersion: [57] - 24-11-2026 - 07:41
+fileVersion: [59] - 24-11-2026 - 16:13
 -->
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -283,11 +283,11 @@ Phase Load view is the default screen at every start and reload of the page.
   labels (hours `19-11 16:00`, days `Thursday 22-10`, months `November`,
   January carrying the year); the label band is sized to the slanted text,
   so nothing is cut off and no dead space survives between the panels.
-  Hovering pops up separate chips: one for the used kWh and one for the
-  returned kWh riding along their bar on the energy panel, one for the gas
-  m³ over the gas panel — except on the months view, where the energy
-  panel shows exactly one chip: the one for the bar the cursor sits on
-  (this period or previous year, used or returned); the
+  Hovering pops up exactly one chip on the energy panel: the one for the
+  bar the cursor sits on (above the zero line the used red bar, below it
+  the returned green one; on the months view also split per column — this
+  period or previous year); a chip for the gas m³ rides over the gas
+  panel; the
   state line names the API the records come from
   (`/api/v3/ringfile?ring=hours|days|months`). The device turns the retained
   cumulative counters into per-period differences
@@ -451,7 +451,7 @@ and a save that omits the `mqttPassword` field keeps the stored password
 |GET    |`/api/v3/ringfile?ring=hours\|days\|months` |Records of one meter ring (hours by default), newest first |
 |GET    |`/api/v3/graph?ring=hours\|days\|months`|Per-period used/returned kWh and gas m³ of one ring (hours by default; differences of consecutive counters), plus the tariff amounts (`ti`/`te`/`tG`) and network costs (`nc`) stored with the period, oldest first |
 |GET    |`/api/v3/actualgraph`                   |Rolling table of the newest ~100 accepted telegrams: delivered and returned watts per phase, held gas m³/h and sample time, oldest first |
-|GET    |`/api/v3/store`                         |Console `store` command as JSON: every LittleFS volume file with its size, plus capacity, used and free bytes |
+|GET    |`/api/v3/store`                         |Console `filesystem list` command as JSON: every LittleFS volume file with its size, plus capacity, used and free bytes |
 |GET    |`/api/v3/csv?ring=hours\|days\|months`  |Console `ring2csv` content as a `text/csv` download: the same header and rows a ring2csv writes (re-importable through populate; the download lists oldest first while the volume file lists newest first), without touching the volume |
 |POST   |`/api/v3/view`                          |Reports the active browser screen name to the device display  |
 
@@ -546,7 +546,10 @@ operators.
 
 The console greets with the firmware version and the peer address and answers
 these commands (read-only except `populate` and `ring2csv`, which write to
-the LittleFS volume, `sync`, which commits the ring files to storage, and
+the LittleFS volume, `filesystem delete` and `filesystem rename`, which remove
+or rename one volume file after a typed confirmation, `settings save` and
+`settings load`, which export the NVS settings to an ini file on the volume
+and import one back, `sync`, which commits the ring files to storage, and
 `restart`, which synchronises the ring files and reboots the device after a
 typed confirmation):
 
@@ -562,7 +565,8 @@ typed confirmation):
 |`showring <ring>`|stored records of one meter ring: `month`, `days` or `hours`       |
 |`ring2csv <ring>`|writes one meter ring to the volume (asks the csv file name; empty = `YYMMDDhhmm-<ring>.csv`, newest period first) (see below) |
 |`populate <ring> [mode]`|imports a LittleFS csv file into one meter ring: `hours`, `days` or `months`, mode `overwrite` or `update` (see below) |
-|`store`          |LittleFS volume: files with sizes, capacity and free space       |
+|`filesystem <action>`|LittleFS volume: `list` shows files with sizes, capacity and free space (the old `store` command); `delete` asks `delete what file: ` and, when the file exists, `Are you sure (N/y)?`; `rename` asks the old name, the new name and `Are you sure (N/y)?`; `show` asks `show what file` and prints its contents skipping every control character (only visible characters) |
+|`settings <action>`|`save` asks the ini file name (empty = `YYMMDDhhmm-settings.ini`, a plain name gets the `.ini` suffix) and writes every NVS entry to the volume; `load` asks the file and stores its values back into NVS (a restart applies them) |
 |`sync`           |write all ring files to storage at once and restart the synchronisation interval |
 |`verbose {0..3}`  |set console event reporting: 0 no debug lines, 1 events + errors, 2 + telegram related, 3 + info + warnings (see below) |
 |`restart`        |synchronise the ring files and reboot the device (asks `are you sure (N/y)?`, anything but `y`/`yes` cancels) |
