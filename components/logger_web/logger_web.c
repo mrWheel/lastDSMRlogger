@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-23 · Build: 27
+//-- Date: 2026-11-24 · Build: 31
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -61,9 +61,10 @@ static const char* tag = "loggerWeb";
 //-- installed through loggerWebSetSettingsSavedCallback.
 static loggerWebSettingsSavedCb settingsSavedCallback = NULL;
 
-//-- The program version string is defined by the application entry
-//-- (main/app_main.c) and shown in the SPA header through the status JSON.
-extern const char* PROG_VERSION;
+//-- The program version string is defined (static) by the application entry
+//-- (main/app_main.c) and read through its getter; the SPA header shows it
+//-- through the status JSON.
+extern const char* getAppVersion(void);
 
 //-- Embedded SPA assets (EMBED_TXTFILES in CMakeLists.txt).
 extern const char indexHtmlStart[] asm("_binary_index_html_start");
@@ -189,8 +190,8 @@ static void wsClientAdd(int fd)
 
   if (!known)
   {
-    ESP_LOGI(tag, "websocket client %d %s", fd,
-             stored ? "connected" : "rejected: client limit reached");
+    LOGGER_LOGI(tag, "websocket client %d %s", fd,
+                stored ? "connected" : "rejected: client limit reached");
   }
 }
 
@@ -676,11 +677,11 @@ static void appendSettingsJson(stringBuilder* sb, const loggerSettingsConfig* co
   //-- tariff prices (the import and export price of both energy tariffs and
   //-- the gas price) and the dynamic tariffs switch.
   sbAppendFmt(sb, ",\"rfsSyncIntervalMinutes\":%u", (unsigned)config->rfsSyncIntervalMinutes);
-  sbAppendFmt(sb, ",\"tariff1ImportPricePerKwh\":%.3f", (double)config->tariff1ImportPricePerKwh);
-  sbAppendFmt(sb, ",\"tariff2ImportPricePerKwh\":%.3f", (double)config->tariff2ImportPricePerKwh);
-  sbAppendFmt(sb, ",\"tariff1ExportPricePerKwh\":%.3f", (double)config->tariff1ExportPricePerKwh);
-  sbAppendFmt(sb, ",\"tariff2ExportPricePerKwh\":%.3f", (double)config->tariff2ExportPricePerKwh);
-  sbAppendFmt(sb, ",\"tariffGasPricePerM3\":%.3f", (double)config->tariffGasPricePerM3);
+  sbAppendFmt(sb, ",\"tariff1ImportPricePerKwh\":%.5f", (double)config->tariff1ImportPricePerKwh);
+  sbAppendFmt(sb, ",\"tariff2ImportPricePerKwh\":%.5f", (double)config->tariff2ImportPricePerKwh);
+  sbAppendFmt(sb, ",\"tariff1ExportPricePerKwh\":%.5f", (double)config->tariff1ExportPricePerKwh);
+  sbAppendFmt(sb, ",\"tariff2ExportPricePerKwh\":%.5f", (double)config->tariff2ExportPricePerKwh);
+  sbAppendFmt(sb, ",\"tariffGasPricePerM3\":%.5f", (double)config->tariffGasPricePerM3);
   sbAppend(sb, ",\"dynamicTariffsEnabled\":");
   sbAppend(sb, config->dynamicTariffsEnabled ? "true" : "false");
 
@@ -1234,12 +1235,13 @@ static const char* applySettingsFromForm(const char* body)
   }
 
   //-- The password itself is never logged: only what happened to it.
-  ESP_LOGI(tag,
-           "configuration applied and stored: gpio %d, profile %s, rx polarity %s, tx polarity %s, "
-           "display %s, mqtt password %s",
-           candidate.rxGpio, candidate.profileId, candidate.rxInverted ? "inverted" : "normal",
-           candidate.txInverted ? "inverted" : "normal",
-           candidate.displayFlipped ? "upside down" : "normal", mqttPasswordOutcome);
+  LOGGER_LOGI(
+      tag,
+      "configuration applied and stored: gpio %d, profile %s, rx polarity %s, tx polarity %s, "
+      "display %s, mqtt password %s",
+      candidate.rxGpio, candidate.profileId, candidate.rxInverted ? "inverted" : "normal",
+      candidate.txInverted ? "inverted" : "normal",
+      candidate.displayFlipped ? "upside down" : "normal", mqttPasswordOutcome);
   return NULL;
 }
 
@@ -1310,7 +1312,7 @@ static void appendStatusFields(stringBuilder* sb, const loggerReceiverStatus* st
   }
 
   sbAppend(sb, ",\"firmwareVersion\":");
-  sbAppendJsonString(sb, PROG_VERSION);
+  sbAppendJsonString(sb, getAppVersion());
   sbAppend(sb, ",\"deviceTime\":");
   sbAppendJsonString(sb, deviceTime);
   sbAppendFmt(sb, ",\"wallClock\":%s", wallClockAvailable ? "true" : "false");
@@ -1896,7 +1898,7 @@ static esp_err_t handleConfigGet(httpd_req_t* req)
 
   if (sb.overflow)
   {
-    ESP_LOGE(tag, "config json overflow");
+    LOGGER_LOGE(tag, "config json overflow");
   }
 
   esp_err_t result = sendJson(req, buffer);
@@ -1917,8 +1919,16 @@ static esp_err_t handleConfigSave(httpd_req_t* req)
 
   if (failure != NULL)
   {
+    loggerControlConsoleEvent(LOGGER_VERBOSE_EVENTS, LOGGER_CONSOLE_ERROR,
+                              "api: settings update via the web page refused - %s", failure);
     return sendError(req, 400, failure);
   }
+
+  //-- An update through the API is exactly the event the verbose console
+  //-- asks for (the values themselves are not printed, and esp_http_server
+  //-- hands no peer address to a plain handler so the client is not named).
+  loggerControlConsoleEvent(LOGGER_VERBOSE_EVENTS, LOGGER_CONSOLE_EVENT,
+                            "api: settings updated via the web page");
 
   return sendJson(req, "{\"ok\":true}");
 }
@@ -1932,7 +1942,7 @@ static esp_err_t handleTelegramsGet(httpd_req_t* req)
 
   if (sb.overflow)
   {
-    ESP_LOGE(tag, "telegram list json overflow");
+    LOGGER_LOGE(tag, "telegram list json overflow");
   }
 
   return sendJson(req, buffer);
@@ -1989,7 +1999,7 @@ static esp_err_t serveTelegramDetailJson(httpd_req_t* req, uint32_t sequence)
 
   if (sb.overflow)
   {
-    ESP_LOGE(tag, "detail json overflow for sequence %" PRIu32, sequence);
+    LOGGER_LOGE(tag, "detail json overflow for sequence %" PRIu32, sequence);
   }
 
   esp_err_t result = sendJson(req, json);
@@ -2014,7 +2024,7 @@ static esp_err_t handlePowerGet(httpd_req_t* req)
 
   if (sb.overflow)
   {
-    ESP_LOGE(tag, "power json overflow");
+    LOGGER_LOGE(tag, "power json overflow");
   }
 
   esp_err_t result = sendJson(req, buffer);
@@ -2048,7 +2058,7 @@ static esp_err_t handleRingFileGet(httpd_req_t* req)
 
   if (sb.overflow)
   {
-    ESP_LOGE(tag, "ring file json overflow");
+    LOGGER_LOGE(tag, "ring file json overflow");
   }
 
   esp_err_t result = sendJson(req, buffer);
@@ -2082,7 +2092,7 @@ static esp_err_t handleGraphGet(httpd_req_t* req)
 
   if (sb.overflow)
   {
-    ESP_LOGE(tag, "period graph json overflow");
+    LOGGER_LOGE(tag, "period graph json overflow");
   }
 
   esp_err_t result = sendJson(req, buffer);
@@ -2107,7 +2117,7 @@ static esp_err_t handleActualGraphGet(httpd_req_t* req)
 
   if (sb.overflow)
   {
-    ESP_LOGE(tag, "actual graph json overflow");
+    LOGGER_LOGE(tag, "actual graph json overflow");
     free(buffer);
     return sendError(req, 500, "actual graph json overflow");
   }
@@ -2536,7 +2546,7 @@ static esp_err_t handleTariffsElectricityPost(httpd_req_t* req)
     return sendJson(req, json);
   }
 
-  ESP_LOGW(tag, "tariff submission refused: %s", reason);
+  LOGGER_LOGW(tag, "tariff submission refused: %s", reason);
 
   if ((result == LOGGER_TARIFF_NO_SPACE) || (result == LOGGER_TARIFF_IO_ERROR))
   {
@@ -2696,7 +2706,7 @@ static esp_err_t handleApiV3VersionGet(httpd_req_t* req)
   stringBuilder sb;
   sbInit(&sb, buffer, sizeof buffer);
   sbAppend(&sb, "{\"type\":\"version\",\"firmwareVersion\":");
-  sbAppendJsonString(&sb, PROG_VERSION);
+  sbAppendJsonString(&sb, getAppVersion());
   sbAppend(&sb, ",\"parserVersion\":");
   sbAppendJsonString(&sb, dsmrParserVersion());
   sbAppend(&sb, ",\"idfVersion\":");
@@ -2804,7 +2814,7 @@ static esp_err_t handleApiV3DeviceGet(httpd_req_t* req)
 
   if (sb.overflow)
   {
-    ESP_LOGE(tag, "device json overflow");
+    LOGGER_LOGE(tag, "device json overflow");
   }
 
   esp_err_t result = sendJson(req, buffer);
@@ -2879,7 +2889,7 @@ static esp_err_t handleApiV3StoreGet(httpd_req_t* req)
 
   if (sb.overflow)
   {
-    ESP_LOGE(tag, "store json overflow");
+    LOGGER_LOGE(tag, "store json overflow");
   }
 
   esp_err_t result = sendJson(req, buffer);
@@ -2920,8 +2930,11 @@ static esp_err_t handleApiV3CsvGet(httpd_req_t* req)
   httpd_resp_set_hdr(req, "Content-Disposition", disposition);
   httpd_resp_set_type(req, "text/csv; charset=utf-8");
 
-  ESP_LOGI(tag, "v3 csv served %" PRIu32 " record(s) of the %s ring", records,
-           loggerStoreRingName(ring));
+  LOGGER_LOGI(tag, "v3 csv served %" PRIu32 " record(s) of the %s ring", records,
+              loggerStoreRingName(ring));
+  loggerControlConsoleEvent(LOGGER_VERBOSE_ALL, LOGGER_CONSOLE_INFO,
+                            "api: csv download of the %s ring (%" PRIu32 " record(s))",
+                            loggerStoreRingName(ring), records);
 
   esp_err_t result = httpd_resp_send(req, text, HTTPD_RESP_USE_STRLEN);
   free(text);
@@ -3088,7 +3101,7 @@ static void wsHandleCommand(httpd_req_t* req, const char* body)
 
     if (sb.overflow)
     {
-      ESP_LOGE(tag, "ring file json overflow");
+      LOGGER_LOGE(tag, "ring file json overflow");
     }
 
     wsSendReply(req, buffer);
@@ -3127,7 +3140,7 @@ static void wsHandleCommand(httpd_req_t* req, const char* body)
 
     if (sb.overflow)
     {
-      ESP_LOGE(tag, "period graph json overflow");
+      LOGGER_LOGE(tag, "period graph json overflow");
     }
 
     wsSendReply(req, buffer);
@@ -3152,7 +3165,7 @@ static void wsHandleCommand(httpd_req_t* req, const char* body)
 
     if (sb.overflow)
     {
-      ESP_LOGE(tag, "hours graph json overflow");
+      LOGGER_LOGE(tag, "hours graph json overflow");
     }
 
     wsSendReply(req, buffer);
@@ -3180,7 +3193,7 @@ static void wsHandleCommand(httpd_req_t* req, const char* body)
       //-- A truncated frame is malformed JSON: the SPA could not parse it
       //-- and the view stayed blank. Answer a clean error instead, which the
       //-- SPA shows as the view's state line.
-      ESP_LOGE(tag, "actual graph json overflow");
+      LOGGER_LOGE(tag, "actual graph json overflow");
       wsSendReply(req, "{\"type\":\"error\",\"request\":\"actualgraph\","
                        "\"error\":\"frame too large\"}");
     }
@@ -3364,7 +3377,7 @@ static esp_err_t handleWebSocket(httpd_req_t* req)
 
   if (result != ESP_OK)
   {
-    ESP_LOGW(tag, "websocket frame header failed: %s", esp_err_to_name(result));
+    LOGGER_LOGW(tag, "websocket frame header failed: %s", esp_err_to_name(result));
     wsClientRemove(httpd_req_to_sockfd(req));
     return result;
   }
@@ -3561,7 +3574,7 @@ static esp_err_t registerUri(httpd_handle_t handle, const char* uri, httpd_metho
 
   if (result != ESP_OK)
   {
-    ESP_LOGE(tag, "registering %s failed: %s", uri, esp_err_to_name(result));
+    LOGGER_LOGE(tag, "registering %s failed: %s", uri, esp_err_to_name(result));
   }
 
   return result;
@@ -3611,7 +3624,7 @@ esp_err_t loggerWebStart(void)
 
   if (result != ESP_OK)
   {
-    ESP_LOGE(tag, "starting http server failed: %s", esp_err_to_name(result));
+    LOGGER_LOGE(tag, "starting http server failed: %s", esp_err_to_name(result));
     return result;
   }
 
@@ -3666,12 +3679,12 @@ esp_err_t loggerWebStart(void)
 
     if (created != pdPASS)
     {
-      ESP_LOGE(tag, "could not create the websocket push task");
+      LOGGER_LOGE(tag, "could not create the websocket push task");
       wsPushTask = NULL;
     }
   }
 
-  ESP_LOGI(tag, "serving SPA, API and WebSocket on port %d", config.server_port);
+  LOGGER_LOGI(tag, "serving SPA, API and WebSocket on port %d", config.server_port);
   return ESP_OK;
 }
 

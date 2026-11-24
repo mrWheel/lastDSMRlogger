@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "logger_control.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -315,7 +316,7 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
 
   if (config->structVersion != LOGGER_SETTINGS_VERSION)
   {
-    ESP_LOGW(tag, "rejecting configuration with struct version %" PRIu32, config->structVersion);
+    LOGGER_LOGW(tag, "rejecting configuration with struct version %" PRIu32, config->structVersion);
     return false;
   }
 
@@ -324,8 +325,8 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
   //-- SPA and API input.
   if (!loggerSettingsIsLiveGpio(config->rxGpio) && !loggerSettingsIsTestGpio(config->rxGpio))
   {
-    ESP_LOGW(tag, "rejecting RX GPIO %d: neither the live UART0 pin nor the test selection",
-             config->rxGpio);
+    LOGGER_LOGW(tag, "rejecting RX GPIO %d: neither the live UART0 pin nor the test selection",
+                config->rxGpio);
     return false;
   }
 
@@ -334,8 +335,8 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
   if ((config->intervalSeconds < LOGGER_SETTINGS_INTERVAL_MIN_S) ||
       (config->intervalSeconds > LOGGER_SETTINGS_INTERVAL_MAX_S))
   {
-    ESP_LOGW(tag, "rejecting interval %u s: outside %u..%u s", (unsigned)config->intervalSeconds,
-             (unsigned)LOGGER_SETTINGS_INTERVAL_MIN_S, (unsigned)LOGGER_SETTINGS_INTERVAL_MAX_S);
+    LOGGER_LOGW(tag, "rejecting interval %u s: outside %u..%u s", (unsigned)config->intervalSeconds,
+                (unsigned)LOGGER_SETTINGS_INTERVAL_MIN_S, (unsigned)LOGGER_SETTINGS_INTERVAL_MAX_S);
     return false;
   }
 
@@ -348,14 +349,14 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
 
   if (profile == NULL)
   {
-    ESP_LOGW(tag, "rejecting unknown profile id %s", config->profileId);
+    LOGGER_LOGW(tag, "rejecting unknown profile id %s", config->profileId);
     return false;
   }
 
   //-- The country must match the profile so a mismatched pair is refused.
   if (!countryEquals(config->countryCode, profile->countryCode))
   {
-    ESP_LOGW(tag, "rejecting country %s for profile %s", config->countryCode, config->profileId);
+    LOGGER_LOGW(tag, "rejecting country %s for profile %s", config->countryCode, config->profileId);
     return false;
   }
 
@@ -370,7 +371,7 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
     if ((config->mbusMode[channel] == LOGGER_MBUS_MODE_EXPECTED) &&
         (config->mbusType[channel] > DSMR_MBUS_DEVICE_OTHER))
     {
-      ESP_LOGW(tag, "rejecting unsupported M-Bus device type for channel %u", channel);
+      LOGGER_LOGW(tag, "rejecting unsupported M-Bus device type for channel %u", channel);
       return false;
     }
   }
@@ -380,13 +381,13 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
   //-- host, IP or full mqtt:// URI.
   if (!plainTextOk(config->mqttBroker))
   {
-    ESP_LOGW(tag, "rejecting MQTT broker text");
+    LOGGER_LOGW(tag, "rejecting MQTT broker text");
     return false;
   }
 
   if (!plainTextOk(config->mqttUser) || !plainTextOk(config->mqttPassword))
   {
-    ESP_LOGW(tag, "rejecting MQTT credential text");
+    LOGGER_LOGW(tag, "rejecting MQTT credential text");
     return false;
   }
 
@@ -394,7 +395,7 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
   //-- of the broker's own reserved topics.
   if (!plainTextOk(config->mqttTopTopic) || (strpbrk(config->mqttTopTopic, "+#$") != NULL))
   {
-    ESP_LOGW(tag, "rejecting MQTT topic text");
+    LOGGER_LOGW(tag, "rejecting MQTT topic text");
     return false;
   }
 
@@ -402,20 +403,21 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
   //-- is a topic segment and shares the top topic's wildcard exclusion.
   if (!plainTextOk(config->mqttClientId))
   {
-    ESP_LOGW(tag, "rejecting MQTT client id text");
+    LOGGER_LOGW(tag, "rejecting MQTT client id text");
     return false;
   }
 
   if (!plainTextOk(config->mqttSubTopic) || (strpbrk(config->mqttSubTopic, "+#$") != NULL))
   {
-    ESP_LOGW(tag, "rejecting tariff sub topic text");
+    LOGGER_LOGW(tag, "rejecting tariff sub topic text");
     return false;
   }
 
   if (config->mqttIntervalSeconds > LOGGER_SETTINGS_MQTT_INTERVAL_MAX_S)
   {
-    ESP_LOGW(tag, "rejecting MQTT interval %u s: above %u s", (unsigned)config->mqttIntervalSeconds,
-             (unsigned)LOGGER_SETTINGS_MQTT_INTERVAL_MAX_S);
+    LOGGER_LOGW(tag, "rejecting MQTT interval %u s: above %u s",
+                (unsigned)config->mqttIntervalSeconds,
+                (unsigned)LOGGER_SETTINGS_MQTT_INTERVAL_MAX_S);
     return false;
   }
 
@@ -423,13 +425,13 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
   //-- label of letters, digits and dashes, not starting or ending on a dash.
   if (!hostnameOk(config->hostname))
   {
-    ESP_LOGW(tag, "rejecting hostname '%s'", config->hostname);
+    LOGGER_LOGW(tag, "rejecting hostname '%s'", config->hostname);
     return false;
   }
 
   if (config->fixedIpLastOctet > 254u)
   {
-    ESP_LOGW(tag, "rejecting fixed IP last octet %u", (unsigned)config->fixedIpLastOctet);
+    LOGGER_LOGW(tag, "rejecting fixed IP last octet %u", (unsigned)config->fixedIpLastOctet);
     return false;
   }
 
@@ -438,10 +440,10 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
   if ((config->rfsSyncIntervalMinutes < LOGGER_SETTINGS_RFS_SYNC_MIN_MINUTES) ||
       (config->rfsSyncIntervalMinutes > LOGGER_SETTINGS_RFS_SYNC_MAX_MINUTES))
   {
-    ESP_LOGW(tag, "rejecting rfs sync interval %u min: outside %u..%u min",
-             (unsigned)config->rfsSyncIntervalMinutes,
-             (unsigned)LOGGER_SETTINGS_RFS_SYNC_MIN_MINUTES,
-             (unsigned)LOGGER_SETTINGS_RFS_SYNC_MAX_MINUTES);
+    LOGGER_LOGW(tag, "rejecting rfs sync interval %u min: outside %u..%u min",
+                (unsigned)config->rfsSyncIntervalMinutes,
+                (unsigned)LOGGER_SETTINGS_RFS_SYNC_MIN_MINUTES,
+                (unsigned)LOGGER_SETTINGS_RFS_SYNC_MAX_MINUTES);
     return false;
   }
 
@@ -458,15 +460,16 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
   {
     if (!isfinite(manualTariffPrices[index]))
     {
-      ESP_LOGW(tag, "rejecting non-finite manual tariff price %u", (unsigned)index);
+      LOGGER_LOGW(tag, "rejecting non-finite manual tariff price %u", (unsigned)index);
       return false;
     }
 
     if ((manualTariffPrices[index] < LOGGER_SETTINGS_TARIFF_PRICE_MIN) ||
         (manualTariffPrices[index] > LOGGER_SETTINGS_TARIFF_PRICE_MAX))
     {
-      ESP_LOGW(tag, "rejecting manual tariff price %u outside %g..%g", (unsigned)index,
-               (double)LOGGER_SETTINGS_TARIFF_PRICE_MIN, (double)LOGGER_SETTINGS_TARIFF_PRICE_MAX);
+      LOGGER_LOGW(tag, "rejecting manual tariff price %u outside %g..%g", (unsigned)index,
+                  (double)LOGGER_SETTINGS_TARIFF_PRICE_MIN,
+                  (double)LOGGER_SETTINGS_TARIFF_PRICE_MAX);
       return false;
     }
   }
@@ -477,10 +480,10 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
       (config->networkCostsPerMonthEuro < LOGGER_SETTINGS_NETWORK_COST_MIN_EURO) ||
       (config->networkCostsPerMonthEuro > LOGGER_SETTINGS_NETWORK_COST_MAX_EURO))
   {
-    ESP_LOGW(tag, "rejecting network costs %g EUR: outside %g..%g",
-             (double)config->networkCostsPerMonthEuro,
-             (double)LOGGER_SETTINGS_NETWORK_COST_MIN_EURO,
-             (double)LOGGER_SETTINGS_NETWORK_COST_MAX_EURO);
+    LOGGER_LOGW(tag, "rejecting network costs %g EUR: outside %g..%g",
+                (double)config->networkCostsPerMonthEuro,
+                (double)LOGGER_SETTINGS_NETWORK_COST_MIN_EURO,
+                (double)LOGGER_SETTINGS_NETWORK_COST_MAX_EURO);
     return false;
   }
 
@@ -499,7 +502,7 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
 
   if (result != ESP_OK)
   {
-    ESP_LOGI(tag, "no settings namespace yet: %s", esp_err_to_name(result));
+    LOGGER_LOGI(tag, "no settings namespace yet: %s", esp_err_to_name(result));
     return ESP_ERR_NOT_FOUND;
   }
 
@@ -523,12 +526,12 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
 
     if (result == ESP_ERR_NVS_NOT_FOUND)
     {
-      ESP_LOGI(tag, "no stored settings yet, awaiting configuration");
+      LOGGER_LOGI(tag, "no stored settings yet, awaiting configuration");
       return ESP_ERR_NOT_FOUND;
     }
 
-    ESP_LOGW(tag, "stored settings have the wrong size %u, awaiting configuration",
-             (unsigned)blobSize);
+    LOGGER_LOGW(tag, "stored settings have the wrong size %u, awaiting configuration",
+                (unsigned)blobSize);
     return ESP_ERR_NOT_FOUND;
   }
 
@@ -543,23 +546,23 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
     if (migrated)
     {
       config->mqttPort = LOGGER_SETTINGS_MQTT_PORT_DEFAULT;
-      ESP_LOGI(
+      LOGGER_LOGI(
           tag,
           "stored settings migrated: MQTT, network, store and tariff fields take their defaults");
     }
     else
     {
-      ESP_LOGI(tag, "stored settings migrated: store and tariff fields take their defaults");
+      LOGGER_LOGI(tag, "stored settings migrated: store and tariff fields take their defaults");
     }
   }
   else if (migratedTopic && (result == ESP_OK))
   {
-    ESP_LOGI(tag, "stored settings migrated: the tariff topic fields take their defaults");
+    LOGGER_LOGI(tag, "stored settings migrated: the tariff topic fields take their defaults");
   }
   else if (migratedCosts && (result == ESP_OK))
   {
     config->networkCostsPerMonthEuro = 0.0f;
-    ESP_LOGI(tag, "stored settings migrated: the network costs field takes its default");
+    LOGGER_LOGI(tag, "stored settings migrated: the network costs field takes its default");
   }
   else if (migratedExport && (result == ESP_OK))
   {
@@ -567,25 +570,26 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
     //-- simply earns nothing for delivered-back energy until they are saved.
     config->tariff1ExportPricePerKwh = 0.0f;
     config->tariff2ExportPricePerKwh = 0.0f;
-    ESP_LOGI(tag, "stored settings migrated: the export tariff prices take their default");
+    LOGGER_LOGI(tag, "stored settings migrated: the export tariff prices take their default");
   }
 
   if (result != ESP_OK)
   {
-    ESP_LOGW(tag, "reading stored settings failed: %s", esp_err_to_name(result));
+    LOGGER_LOGW(tag, "reading stored settings failed: %s", esp_err_to_name(result));
     return ESP_ERR_NOT_FOUND;
   }
 
   if (!loggerSettingsValidate(config))
   {
-    ESP_LOGW(tag, "stored settings failed validation, awaiting configuration");
+    LOGGER_LOGW(tag, "stored settings failed validation, awaiting configuration");
     return ESP_ERR_NOT_FOUND;
   }
 
-  ESP_LOGI(tag, "loaded settings: gpio %d, profile %s, rx polarity %s, tx polarity %s, display %s",
-           config->rxGpio, config->profileId, config->rxInverted ? "inverted" : "normal",
-           config->txInverted ? "inverted" : "normal",
-           config->displayFlipped ? "upside down" : "normal");
+  LOGGER_LOGI(tag,
+              "loaded settings: gpio %d, profile %s, rx polarity %s, tx polarity %s, display %s",
+              config->rxGpio, config->profileId, config->rxInverted ? "inverted" : "normal",
+              config->txInverted ? "inverted" : "normal",
+              config->displayFlipped ? "upside down" : "normal");
   return ESP_OK;
 }
 
@@ -615,14 +619,15 @@ esp_err_t loggerSettingsSave(const loggerSettingsConfig* config)
 
   if (result != ESP_OK)
   {
-    ESP_LOGE(tag, "persisting settings failed: %s", esp_err_to_name(result));
+    LOGGER_LOGE(tag, "persisting settings failed: %s", esp_err_to_name(result));
     return result;
   }
 
-  ESP_LOGI(tag, "stored settings: gpio %d, profile %s, rx polarity %s, tx polarity %s, display %s",
-           config->rxGpio, config->profileId, config->rxInverted ? "inverted" : "normal",
-           config->txInverted ? "inverted" : "normal",
-           config->displayFlipped ? "upside down" : "normal");
+  LOGGER_LOGI(tag,
+              "stored settings: gpio %d, profile %s, rx polarity %s, tx polarity %s, display %s",
+              config->rxGpio, config->profileId, config->rxInverted ? "inverted" : "normal",
+              config->txInverted ? "inverted" : "normal",
+              config->displayFlipped ? "upside down" : "normal");
   return ESP_OK;
 }
 

@@ -1,6 +1,6 @@
 # lastDSMRlogger
 <!--
-fileVersion: [54] - 23-11-2026 - 22:35
+fileVersion: [57] - 24-11-2026 - 07:41
 -->
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -203,7 +203,8 @@ Phase Load view is the default screen at every start and reload of the page.
   a **Tariffs** group carries the **Dynamic Tariffs** switch, the manual
   prices **Tariff 1 Delivered (kWh)**, **Tariff 2 Delivered (kWh)**,
   **Tariff 1 Received (kWh)**, **Tariff 2 Received (kWh)** and **Tariff Gas
-  Delivered (m3)** in EUR (see *Dynamic electricity tariffs*) and a fixed
+  Delivered (m3)** in EUR, each accepted to five decimals (see *Dynamic
+  electricity tariffs*), and a fixed
   monthly **Network &
   transport costs (month)** amount in EUR — every ring record stores this
   amount prorated to its period (the days ring a thirtieth of the month,
@@ -451,7 +452,7 @@ and a save that omits the `mqttPassword` field keeps the stored password
 |GET    |`/api/v3/graph?ring=hours\|days\|months`|Per-period used/returned kWh and gas m³ of one ring (hours by default; differences of consecutive counters), plus the tariff amounts (`ti`/`te`/`tG`) and network costs (`nc`) stored with the period, oldest first |
 |GET    |`/api/v3/actualgraph`                   |Rolling table of the newest ~100 accepted telegrams: delivered and returned watts per phase, held gas m³/h and sample time, oldest first |
 |GET    |`/api/v3/store`                         |Console `store` command as JSON: every LittleFS volume file with its size, plus capacity, used and free bytes |
-|GET    |`/api/v3/csv?ring=hours\|days\|months`  |Console `ring2csv` content as a `text/csv` download: the exact `RING<name>.csv` a ring2csv would write (re-importable through populate), without touching the volume |
+|GET    |`/api/v3/csv?ring=hours\|days\|months`  |Console `ring2csv` content as a `text/csv` download: the same header and rows a ring2csv writes (re-importable through populate; the download lists oldest first while the volume file lists newest first), without touching the volume |
 |POST   |`/api/v3/view`                          |Reports the active browser screen name to the device display  |
 
 ### Test data mode
@@ -545,7 +546,9 @@ operators.
 
 The console greets with the firmware version and the peer address and answers
 these commands (read-only except `populate` and `ring2csv`, which write to
-the LittleFS volume):
+the LittleFS volume, `sync`, which commits the ring files to storage, and
+`restart`, which synchronises the ring files and reboots the device after a
+typed confirmation):
 
 |Command          |Shows                                                            |
 |-----------------|-----------------------------------------------------------------|
@@ -557,9 +560,12 @@ the LittleFS volume):
 |`raw [<seq>]`    |exact accepted bytes of one retained telegram; without a sequence the most recently accepted telegram |
 |`power`          |the realtime power frame of the newest accepted telegram         |
 |`showring <ring>`|stored records of one meter ring: `month`, `days` or `hours`       |
-|`ring2csv <ring>`|writes one meter ring to the volume as `RING<ring>.csv` (see below) |
+|`ring2csv <ring>`|writes one meter ring to the volume (asks the csv file name; empty = `YYMMDDhhmm-<ring>.csv`, newest period first) (see below) |
 |`populate <ring> [mode]`|imports a LittleFS csv file into one meter ring: `hours`, `days` or `months`, mode `overwrite` or `update` (see below) |
 |`store`          |LittleFS volume: files with sizes, capacity and free space       |
+|`sync`           |write all ring files to storage at once and restart the synchronisation interval |
+|`verbose {0..3}`  |set console event reporting: 0 no debug lines, 1 events + errors, 2 + telegram related, 3 + info + warnings (see below) |
+|`restart`        |synchronise the ring files and reboot the device (asks `are you sure (N/y)?`, anything but `y`/`yes` cancels) |
 |`quit`           |close the session                                                |
 
 Commands are case-insensitive and may be shortened to any leading part that
@@ -567,6 +573,30 @@ names exactly one command (`show` and `showri` both mean `showring`); a word
 that matches nothing is unknown and one that matches several commands is
 reported as ambiguous. `ringfile` stays available as the old synonym of
 `showring`.
+
+`verbose {0,1,2,3}` sets how loudly the console reports background lines:
+0 prints no debug lines, 1 prints one tagged line per notable event — every
+line is framed by its wall-clock time and its reason kind, for instance
+`[hh:mm:ss Event]`, `[hh:mm:ss Error]`, `[hh:mm:ss Telegram]`,
+`[hh:mm:ss Info]` or `[hh:mm:ss Warning]` (the stamp reads `--:--:--` until
+the clock is synchronised) — (ring
+file synchronisations, MQTT connects, incoming MQTT messages and tariff
+schedule updates, settings updates through the API) together with the error
+lines (refused schedules and settings updates, broker connection errors), 2
+adds the telegram-related lines (telegrams published to the broker) and 3
+also adds the chatty info lines (csv downloads). Without an argument the
+command shows the usage with the level currently set, and `help` shows it on
+the command line itself (`verbose 2 {0,1,2,3}`). The level is device-wide:
+whoever owns the telnet slot reads the events, and an event line never
+interleaves into a command answer.
+
+`sync` asks the store task to commit the three ring files immediately
+instead of waiting for the configured rfs synchronisation interval (the
+interval timer restarts from that moment). `restart` always synchronises the
+rings first — the `sync` commit of all three ring files, waited for — so no
+staged records are lost by the reboot. It reboots the device and
+only does so after a typed `y` (or `yes`); an empty line or anything else
+cancels.
 
 ### SMB network share
 
@@ -876,22 +906,29 @@ logger> showring hours
 ### Exporting a ring (`ring2csv`)
 
 The console command `ring2csv {hours|days|months}` writes one meter ring
-back to the LittleFS volume as a semicolon separated csv file named
-`RING<ring>.csv` at the volume root: the header
+back to the LittleFS volume as a semicolon separated csv file at the volume
+root; it first asks for the file name — an empty answer keeps the default
+`YYMMDDhhmm-<ring>.csv` (the wall-clock stamp of the export moment plus the
+ring selector, so exports never overwrite each other), a plain name gets a
+`.csv` suffix, and a name that tries
+to leave the volume root is refused. The header
 `YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255;ti;te;tg;nc`
-followed by one line per retained record, oldest period first, the key as
+is followed by one line per retained record, newest period first, the key as
 eight `YYMMDDHH` digits, the five counters at three decimals and the three
 tariff amounts and the network costs at two. Every field the ring file holds
 is exported, so the
-file is re-importable through `populate` unchanged, and the read-only
+file is re-importable through `populate` unchanged (the import reads the key
+from every line, so the row order is free), and the read-only
 `DSMRLOGGER` SMB share exposes it for inspection or editing on any machine.
 
 ```
 logger> ring2csv hours
-wrote 49 record(s) to RINGhours.csv on the volume
+exporting the hours ring.
+new csv file name (empty = YYMMDDhhmm-hours.csv):
+wrote 49 record(s) to 2611240735-hours.csv on the volume (newest first)
 logger> populate hours overwrite
 importing into the hours ring (overwrite).
-input file on LittleFS (e.g. RINGmonths.csv, empty line cancels): RINGhours.csv
+input file on LittleFS (e.g. RINGmonths.csv, empty line cancels): 2611240735-hours.csv
 
 49 line(s) read, 49 edit(s) written, 0 line(s) rejected, 0 refused
 ```

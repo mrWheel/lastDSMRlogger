@@ -10,5 +10,5 @@
 idf_component_register(
   SRCS "logger_tariffs.c"
   INCLUDE_DIRS "include"
-  REQUIRES espressif__cjson logger_settings logger_store
+  REQUIRES espressif__cjson logger_settings logger_store logger_control
 )

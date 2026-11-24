@@ -41,6 +41,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "logger_control.h"
 
 static const char* tag = "loggerBoard";
 
@@ -698,8 +699,8 @@ esp_err_t loggerBoardInit(void)
   if (result != ESP_OK)
   {
     //-- No panel: the logger stays fully functional without debug lines.
-    ESP_LOGW(tag, "display init failed: %s, continuing without debug lines",
-             esp_err_to_name(result));
+    LOGGER_LOGW(tag, "display init failed: %s, continuing without debug lines",
+                esp_err_to_name(result));
     return result;
   }
 
@@ -723,15 +724,15 @@ esp_err_t loggerBoardInit(void)
     if (xTaskCreate(boardInputsTask, "boardInputs", 3072, NULL, 4, NULL) != pdPASS)
     {
       tft_ec11_inputs_stop();
-      ESP_LOGW(tag, "input task could not start, AUX button and encoder disabled");
+      LOGGER_LOGW(tag, "input task could not start, AUX button and encoder disabled");
     }
   }
   else
   {
-    ESP_LOGW(tag, "board inputs not started: %s", esp_err_to_name(inputs));
+    LOGGER_LOGW(tag, "board inputs not started: %s", esp_err_to_name(inputs));
   }
 
-  ESP_LOGI(tag, "debug lines ready on the board display");
+  LOGGER_LOGI(tag, "debug lines ready on the board display");
   return ESP_OK;
 }
 
@@ -751,7 +752,7 @@ void loggerBoardSetRotation(bool upsideDown)
   refreshAll();
   xSemaphoreGive(board.mutex);
 
-  ESP_LOGI(tag, "display orientation: %s", upsideDown ? "upside down" : "normal");
+  LOGGER_LOGI(tag, "display orientation: %s", upsideDown ? "upside down" : "normal");
 }
 
 void loggerBoardShowScreen(const char* screen)

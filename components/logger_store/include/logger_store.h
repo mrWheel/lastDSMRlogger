@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.h - hour, day and month smart meter ring file store
-//-- Date: 2026-11-23 · Build: 13
+//-- Date: 2026-11-24 · Build: 15
 //--
 //-- Three fixed-capacity ring files land on the LittleFS storage partition,
 //-- written through mrwheel's ring_file_store component: the hours ring
@@ -136,6 +136,21 @@ void loggerStoreSetTariffCalculator(loggerStoreTariffCalculator calculator);
 //-- problems are reported on the console by the task itself.
 esp_err_t loggerStoreInit(void);
 
+//-- Requests an immediate synchronisation of all three ring files (the
+//-- console's sync command): the store task is woken from its minute sleep,
+//-- takes one more snapshot and commits all rings at once, restarting the
+//-- configured rfs synchronisation interval from this moment. False when the
+//-- store task is not running (the volume or the rings are not open).
+bool loggerStoreRequestSync(void);
+
+//-- Requests an immediate synchronisation like loggerStoreRequestSync() and
+//-- waits (bounded by timeoutMs) until the store task has actually committed
+//-- all three ring files: true when the commit completed within the timeout,
+//-- false when the store task is not running or the wait timed out. The
+//-- console's restart uses this so the staged records reach storage before
+//-- the reboot tears the stack down.
+bool loggerStoreRequestSyncAndWait(uint32_t timeoutMs);
+
 //-- Visitor for the newest-first ring walk: called once per retained record,
 //-- newest period first, with the wall-clock period key without the
 //-- component's century digits (hours "YYMMDDhh", days "YYMMDD", months
@@ -199,7 +214,7 @@ typedef struct
 //-- average tariffs of the stored manual prices (the tariff 1 prices, the
 //-- way a meter that names no active tariff prices) and nc with the stored
 //-- network and transport month amount prorated to the ring's period. The mode picks how the ring's
-//current records are
+// current records are
 //-- treated: MERGE backfills the retained window through ringFileEdit()
 //-- (periods older than the ring capacity are refused and counted),
 //-- OVERWRITE clears the ring just before the first valid data line so the
@@ -222,23 +237,40 @@ esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePa
 
 //-- Writes one meter ring back to the LittleFS volume as a semicolon
 //-- separated csv file (the console's ring2csv command): the file lands at
-//-- the volume root as "RING<hours|days|months>.csv", carries the header
+//-- the volume root as "YYMMDDhhmm-<hours|days|months>.csv" (the export
+//-- moment's wall-clock stamp plus the ring selector), carries the header
 //-- "YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;
-//-- 0-1:24.1.0*255;ti;te;tg;nc" and one line per retained record, oldest
+//-- 0-1:24.1.0*255;ti;te;tg;nc" and one line per retained record, newest
 //-- period first, with the key as eight digits, the five counters at three
 //-- decimals, the three tariff amounts and the network costs at two.
-//-- The result re-imports through loggerStorePopulateRing() unchanged.
+//-- The result re-imports through loggerStorePopulateRing() unchanged
+//-- (the import reads the key from every line, so the order is free).
 //-- outRecords (optional) receives the number of records written. Returns
 //-- ESP_ERR_INVALID_ARG for an invalid ring, ESP_ERR_INVALID_STATE while the
 //-- store is not running, an I/O error when the file could not be written
 //-- and ESP_OK otherwise.
 esp_err_t loggerStoreRingToCsv(loggerMeterRing_t ring, uint32_t* outRecords);
 
-//-- Same csv content as the RING<hours|days|months>.csv export file, built
+//-- Same export with a caller-chosen file name (the console's ring2csv asks
+//-- for one): relativePath NULL keeps the default
+//-- "YYMMDDhhmm-<name>.csv", stamped with the wall clock at export time,
+//-- any other text names the file at the volume root. A missing ".csv" suffix
+//-- is appended, and a name that is empty, too long or tries to climb out of
+//-- the volume (a path separator or a "..") is refused with
+//-- ESP_ERR_INVALID_ARG before anything is written. outFileName (optional)
+//-- receives the final relative file name as written, so a caller can report
+//-- exactly what landed on the volume.
+esp_err_t loggerStoreRingToCsvNamed(loggerMeterRing_t ring, const char* relativePath,
+                                    uint32_t* outRecords, char* outFileName,
+                                    size_t outFileNameSize);
+
+//-- Same csv content as the "YYMMDDhhmm-<hours|days|months>.csv" export
+//-- file, built
 //-- in memory instead of written to the volume (the API's csv download of
 //-- one ring): header line first, one line per retained record, oldest
-//-- period first, formatted exactly like the file so the text re-imports
-//-- through loggerStorePopulateRing() unchanged. *outText receives a
+//-- period first (the ring2csv volume file prints newest first; the import
+//-- accepts either order), formatted otherwise exactly like the file so the
+//-- text re-imports through loggerStorePopulateRing() unchanged. *outText receives a
 //-- heap-allocated NUL-terminated buffer that the caller releases with
 //-- free(); it stays NULL on failure. outRecords (optional) receives the
 //-- number of records rendered. Returns ESP_ERR_INVALID_ARG for an invalid

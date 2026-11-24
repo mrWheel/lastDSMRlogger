@@ -1,12 +1,24 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_telnet.c - telnet console server on port 23
-//-- Date: 2026-11-23 · Build: 17
+//-- Date: 2026-11-24 · Build: 22
 //--
 //-- A plain BSD-socket console task: it listens on port 23, serves exactly
 //-- one session at a time and answers a command set from the receiver,
-//-- store and settings APIs (read-only except populate, which imports a
-//-- LittleFS csv file into one meter ring). The console slot is decided by the
+//-- store and settings APIs (read-only except populate (imports a LittleFS
+//-- csv file into one meter ring), ring2csv (writes one meter ring to the
+//-- volume), sync (commits all ring files at once) and restart (first
+//-- synchronises the ring files and then reboots the device, all after a
+//-- typed confirmation)). The verbose {0,1,2,3} command sets
+//-- the reporting level at which the background event lines the store, MQTT
+//-- and API paths send through the control arbiter reach the console (at
+//-- level 3 the arbiter additionally mirrors the serial console log into the
+//-- session), and help shows the level currently set; a bare [Enter] prints
+//-- the help list, and the prompt the session shows is registered with the
+//-- arbiter so event and mirror lines end on a re-printed prompt instead of
+//-- a blank line; every write of this task brackets the shared console
+//-- lock so an event line never interleaves into a command answer. The console slot is decided by
+//the
 //-- shared logger_control arbiter, which keeps one slot per channel: the
 //-- web page holds its own slot and is never displaced from here. Accepting
 //-- a telnet client claims the console slot, and when a newer telnet client
@@ -54,9 +66,10 @@
 #include "logger_store.h"
 #include "wifi_provisioner.h"
 
-//-- The program version string is defined by the application entry
-//-- (main/app_main.c) and shown by the version and status commands.
-extern const char* PROG_VERSION;
+//-- The program version string is defined (static) by the application entry
+//-- (main/app_main.c) and read through its getter; the version and status
+//-- commands show it.
+extern const char* getAppVersion(void);
 
 static const char* tag = "loggerTelnet";
 
@@ -70,6 +83,11 @@ static const char* tag = "loggerTelnet";
 //-- Mount point plus a full d_name (NAME_MAX) plus separator and terminator.
 #define TELNET_PATH_BYTES 320
 #define TELNET_PROMPT "logger> "
+
+//-- Upper bound for the ring synchronisation the restart command performs
+//-- before the reboot: a store task that cannot deliver (for instance a
+//-- wall clock that never synchronised) only costs the console this wait.
+#define TELNET_RESTART_SYNC_TIMEOUT_MS 10000u
 
 //-- Question the populate command asks for its input file; the next line
 //-- typed is taken as the file name (relative to the LittleFS mount point).
@@ -93,17 +111,24 @@ static volatile bool taskRunning = false;
 
 //-- Pending populate input: while awaiting the file name the next line is
 //-- taken as the answer instead of as a command. One session at a time, so
-//-- plain file-scope variables are enough; a fresh client resets them.
+//-- plain file-scope variables are enough; a fresh client resets them. The
+//-- ring2csv export awaits its csv file name the same way (empty keeps the
+//-- default YYMMDDhhmm-<name>.csv), the restart command awaits a typed
+//-- y/yes.
 static bool populateAwaitingFile = false;
 static loggerMeterRing_t populateRing = LOGGER_RING_HOURS;
 static loggerPopulateMode_t populateMode = LOGGER_POPULATE_MERGE;
+static bool exportAwaitingName = false;
+static loggerMeterRing_t exportRing = LOGGER_RING_HOURS;
+static bool restartAwaitingConfirm = false;
 
 //-- Every command word the console knows. Synonyms stay separate entries
 //-- (raw for the raw telegram dump, ringfile and exit as older spellings)
 //-- so a shortened word can name them too.
 static const char* const telnetCommands[] = {
-    "help",     "status",   "version", "telegrams", "telegram", "raw",  "power",
-    "showring", "ringfile", "store",   "populate",  "quit",     "exit", "ring2csv",
+    "help",  "status",   "version",  "telegrams", "telegram", "raw",
+    "power", "showring", "ringfile", "store",     "populate", "quit",
+    "exit",  "ring2csv", "sync",     "verbose",   "restart",
 };
 
 //-- The printf-style session writer is defined further down, the device
@@ -177,6 +202,11 @@ static bool telnetIsOwner(int fd)
 
 static bool telnetSend(int fd, const void* data, size_t length)
 {
+  //-- Console writes bracket the shared console lock: the verbose event
+  //-- lines of the store, MQTT and API paths write to this very socket from
+  //-- their own tasks, and a command answer must never interleave with one.
+  loggerControlConsoleLock();
+  bool delivered = true;
   const uint8_t* cursor = (const uint8_t*)data;
 
   while (length > 0u)
@@ -188,15 +218,17 @@ static bool telnetSend(int fd, const void* data, size_t length)
       //-- A lost write is normally harmless (the client is gone), but the
       //-- farewell of an evicted session depends on it: log it for the
       //-- field, it is the only way a missed takeover line explains itself.
-      ESP_LOGW(tag, "send to client %d failed: errno %d", fd, errno);
-      return false;
+      LOGGER_LOGW(tag, "send to client %d failed: errno %d", fd, errno);
+      delivered = false;
+      break;
     }
 
     cursor += (size_t)written;
     length -= (size_t)written;
   }
 
-  return true;
+  loggerControlConsoleUnlock();
+  return delivered;
 }
 
 static bool telnetSendText(int fd, const char* text)
@@ -218,6 +250,17 @@ static bool telnetPrintf(int fd, const char* format, ...)
   }
 
   return false;
+}
+
+//-- Sends the prompt and registers it with the arbiter: background event
+//-- and mirror lines re-print it after themselves, so the console keeps
+//-- reading prompt-first and never leaves a blank line behind. A command
+//-- question clears the registration (the question itself sends
+//-- loggerControlConsoleSetPrompt(NULL) when it takes the prompt's place).
+static bool telnetShowPrompt(int fd)
+{
+  loggerControlConsoleSetPrompt(TELNET_PROMPT);
+  return telnetSendText(fd, TELNET_PROMPT);
 }
 
 //-- --------------------------------------------------------------------------
@@ -298,14 +341,26 @@ static void printHelp(int fd)
           "  showring {month|days|hours}\r\n"
           "                     the stored records of one meter ring (default hours)\r\n"
           "  ring2csv {month|days|hours}\r\n"
-          "                     write one meter ring to the volume as RING<name>.csv\r\n"
+          "                     write one meter ring to the volume (asks the csv file\r\n"
+          "                     name; empty = YYMMDDhhmm-<name>.csv, newest period first)\r\n"
           "  populate {hours|days|months} [overwrite|update]\r\n"
           "                     import a LittleFS csv file into one meter ring: merge\r\n"
           "                     (default) fills free slots, overwrite clears the ring\r\n"
           "                     first, update only revises stored periods\r\n"
           "  store              LittleFS volume: files with sizes, capacity and free space\r\n"
-          "  quit               close this session\r\n"
-          "\r\ncommands may be shortened to a unique leading part (show == showring)\r\n");
+          "  sync               write all ring files to storage now (resets the interval)\r\n");
+
+  //-- The verbose line carries the reporting level currently set, so the
+  //-- command list doubles as the current setting ("verbose 2 {0,1,2,3}").
+  telnetPrintf(fd, "  verbose %d {0,1,2,3}\r\n", (int)loggerControlVerboseLevel());
+  telnetSendText(fd, "                     0 no debug lines, 1 events + errors,\r\n"
+                     "                     2 + telegram related, 3 + info + warnings\r\n"
+                     "                     (3 also mirrors the serial console log)\r\n"
+                     "  restart            synchronise the ring files and reboot the device\r\n"
+                     "                     (asks for confirmation)\r\n"
+                     "  quit               close this session\r\n"
+                     "\r\ncommands may be shortened to a unique leading part (show == showring)\r\n"
+                     "an empty line shows this command list too\r\n");
 }
 
 static void printStatus(int fd)
@@ -397,7 +452,7 @@ static void printStatus(int fd)
 
 static void printVersion(int fd)
 {
-  telnetPrintf(fd, "\r\nfirmware %s, parserDSMR %s\r\n", PROG_VERSION, dsmrParserVersion());
+  telnetPrintf(fd, "\r\nfirmware %s, parserDSMR %s\r\n", getAppVersion(), dsmrParserVersion());
 
   printComponentVersions(fd);
 }
@@ -505,7 +560,7 @@ bool loggerTelnetGetDeviceInfo(loggerTelnetDeviceInfo* out)
     }
   }
 
-  snprintf(out->firmwareVersion, sizeof out->firmwareVersion, "%s", PROG_VERSION);
+  snprintf(out->firmwareVersion, sizeof out->firmwareVersion, "%s", getAppVersion());
   formatCompileDate(out->compileDate, sizeof out->compileDate);
   snprintf(out->compileStamp, sizeof out->compileStamp, "%s %s", __DATE__, __TIME__);
   snprintf(out->idfVersion, sizeof out->idfVersion, "%s", esp_get_idf_version());
@@ -1117,13 +1172,82 @@ static bool handleLine(int fd, char* line)
       runPopulate(fd, line);
     }
 
-    telnetSendText(fd, TELNET_PROMPT);
+    telnetShowPrompt(fd);
     return true;
   }
 
+  //-- The ring2csv export awaits its csv file name the same way; an empty
+  //-- line is not a cancel but the default name (RING<ring>.csv).
+  if (exportAwaitingName)
+  {
+    exportAwaitingName = false;
+
+    uint32_t records = 0u;
+    char finalName[TELNET_PATH_BYTES];
+    finalName[0] = '\0';
+
+    esp_err_t outcome = loggerStoreRingToCsvNamed(exportRing, (*line != '\0') ? line : NULL,
+                                                  &records, finalName, sizeof finalName);
+
+    if (outcome != ESP_OK)
+    {
+      telnetPrintf(fd, "ring2csv failed: %s\r\n", esp_err_to_name(outcome));
+    }
+    else
+    {
+      telnetPrintf(fd, "wrote %" PRIu32 " record(s) to %s on the volume (newest first)\r\n",
+                   records, finalName);
+    }
+
+    telnetShowPrompt(fd);
+    return true;
+  }
+
+  //-- The restart command awaits a typed yes; the question defaults to no,
+  //-- so anything but y/yes (an empty line included) cancels.
+  if (restartAwaitingConfirm)
+  {
+    restartAwaitingConfirm = false;
+
+    if ((strcasecmp(line, "y") == 0) || (strcasecmp(line, "yes") == 0))
+    {
+      telnetPrintf(fd, "\r\nrestarting lastDSMRlogger ...\r\n");
+
+      //-- A restart always synchronises first: the staged ring records must
+      //-- have reached storage before the reboot tears the stack down. The
+      //-- store task commits all three rings (the sync command's behaviour,
+      //-- interval timer restarted) and the console waits, bounded, for the
+      //-- commit to complete.
+      telnetSendText(fd, "synchronising the ring files ...\r\n");
+
+      if (loggerStoreRequestSyncAndWait(TELNET_RESTART_SYNC_TIMEOUT_MS))
+      {
+        telnetSendText(fd, "ring files synchronized\r\n");
+      }
+      else
+      {
+        telnetSendText(fd, "ring synchronisation did not confirm in time "
+                           "(is the meter store running?)\r\n");
+      }
+
+      //-- A short grace period so the farewell really leaves the socket
+      //-- before the reboot takes the stack down.
+      vTaskDelay(pdMS_TO_TICKS(500));
+      esp_restart();
+    }
+
+    telnetPrintf(fd, "restart cancelled\r\n");
+    telnetShowPrompt(fd);
+    return true;
+  }
+
+  //-- A bare [Enter] answers the help list: the console never sits silent on
+  //-- an empty line (while a question is open the empty line was already
+  //-- taken as the answer above).
   if (*line == '\0')
   {
-    telnetSendText(fd, TELNET_PROMPT);
+    printHelp(fd);
+    telnetShowPrompt(fd);
     return true;
   }
 
@@ -1140,7 +1264,7 @@ static bool handleLine(int fd, char* line)
 
   if (command == NULL)
   {
-    telnetSendText(fd, TELNET_PROMPT);
+    telnetShowPrompt(fd);
     return true;
   }
 
@@ -1212,8 +1336,8 @@ static bool handleLine(int fd, char* line)
   else if (strcmp(command, "ring2csv") == 0)
   {
     //-- The selector picks the ring (no default: exporting is a write); the
-    //-- file lands at the volume root as RING<name>.csv, ready for the SMB
-    //-- share and for a populate re-import.
+    //-- file lands at the volume root as YYMMDDhhmm-<name>.csv, ready for
+    //-- the SMB share and for a populate re-import.
     loggerMeterRing_t ring = LOGGER_RING_HOURS;
 
     if ((arguments == NULL) || (arguments[0] == '\0'))
@@ -1226,19 +1350,85 @@ static bool handleLine(int fd, char* line)
     }
     else
     {
-      uint32_t records = 0u;
-      esp_err_t outcome = loggerStoreRingToCsv(ring, &records);
+      //-- The selector names the ring, the next line names the csv file
+      //-- (empty keeps the default YYMMDDhhmm-<name>.csv, stamped with the
+      //-- wall clock at export time, a plain name gets the .csv suffix);
+      //-- the export then lands at the volume root newest
+      //-- period first, ready for the SMB share and a populate re-import.
+      exportRing = ring;
+      exportAwaitingName = true;
 
-      if (outcome != ESP_OK)
+      //-- The question replaces the prompt: an event line landing while the
+      //-- question waits must not re-print a prompt below the answer.
+      loggerControlConsoleSetPrompt(NULL);
+      telnetPrintf(fd,
+                   "\r\nexporting the %s ring.\r\nnew csv file name (empty = YYMMDDhhmm-%s.csv): ",
+                   loggerStoreRingName(ring), loggerStoreRingName(ring));
+      return true; //-- the file name replaces the next prompt
+    }
+  }
+  else if (strcmp(command, "sync") == 0)
+  {
+    //-- Force the ring files to storage at once and restart the interval
+    //-- timer from this moment; the store task confirms on the console log.
+    if (loggerStoreRequestSync())
+    {
+      telnetPrintf(fd, "\r\nring synchronisation requested: the ring files are written now "
+                       "and the synchronisation interval restarts\r\n");
+    }
+    else
+    {
+      telnetPrintf(fd, "\r\nthe meter store is not running\r\n");
+    }
+  }
+  else if (strcmp(command, "verbose") == 0)
+  {
+    if (arguments != NULL)
+    {
+      while (isspace((unsigned char)*arguments))
       {
-        telnetPrintf(fd, "ring2csv failed: %s\r\n", esp_err_to_name(outcome));
+        arguments++;
+      }
+    }
+
+    if ((arguments == NULL) || (arguments[0] == '\0'))
+    {
+      //-- No level typed: show the usage together with the level currently
+      //-- set, so "verbose" alone answers the same question help does.
+      loggerVerboseLevel_t current = loggerControlVerboseLevel();
+      telnetPrintf(fd,
+                   "\r\nusage: verbose {0,1,2,3} (currently %d: %s)\r\n"
+                   "  0  no debug lines\r\n"
+                   "  1  events and errors\r\n"
+                   "  2  events, telegram related and errors\r\n"
+                   "  3  events, info, warnings and errors, plus a copy of\r\n"
+                   "     every serial console log line the monitor shows\r\n",
+                   (int)current, loggerControlVerboseName(current));
+    }
+    else
+    {
+      char* end = NULL;
+      long value = strtol(arguments, &end, 10);
+
+      if ((end == arguments) || ((*end != '\0') && !isspace((unsigned char)*end)) || (value < 0) ||
+          (value >= (long)LOGGER_VERBOSE_LEVEL_COUNT))
+      {
+        telnetPrintf(fd, "unknown verbose level '%s' - use 0, 1, 2 or 3\r\n", arguments);
       }
       else
       {
-        telnetPrintf(fd, "wrote %" PRIu32 " record(s) to RING%s.csv on the volume\r\n", records,
-                     loggerStoreRingName(ring));
+        loggerVerboseLevel_t level = loggerControlVerboseSet((loggerVerboseLevel_t)value);
+        telnetPrintf(fd, "\r\nconsole event reporting: %d (%s)\r\n", (int)level,
+                     loggerControlVerboseName(level));
       }
     }
+  }
+  else if (strcmp(command, "restart") == 0)
+  {
+    restartAwaitingConfirm = true;
+    loggerControlConsoleSetPrompt(NULL);
+    telnetPrintf(fd, "\r\nrestart the device now? are you sure (N/y)? ");
+    return true; //-- the answer replaces the next prompt
   }
   else if (strcmp(command, "store") == 0)
   {
@@ -1296,6 +1486,7 @@ static bool handleLine(int fd, char* line)
       populateRing = ring;
       populateMode = mode;
       populateAwaitingFile = true;
+      loggerControlConsoleSetPrompt(NULL);
       telnetPrintf(fd, "\r\nimporting into the %s ring%s.\r\n%s", loggerStoreRingName(ring),
                    populateModeLabel(mode), TELNET_POPULATE_QUESTION);
       return true; //-- the file name replaces the next prompt
@@ -1307,7 +1498,7 @@ static bool handleLine(int fd, char* line)
     return false;
   }
 
-  telnetSendText(fd, TELNET_PROMPT);
+  telnetShowPrompt(fd);
   return true;
 }
 
@@ -1340,9 +1531,10 @@ static void telnetEvictCallback(loggerControlClient evicted, int evictedFd)
 //-- screen redraw, so telnet activity is reported on the console only.
 static void telnetCloseClient(int fd)
 {
+  loggerControlConsoleSetPrompt(NULL);
   loggerControlRelease(LOGGER_CONTROL_TELNET, fd);
   close(fd);
-  ESP_LOGI(tag, "telnet client %d disconnected", fd);
+  LOGGER_LOGI(tag, "telnet client %d disconnected", fd);
 }
 
 //-- Creates, binds and listens on the console port. Returns the socket or -1.
@@ -1352,7 +1544,7 @@ static int telnetOpenListen(void)
 
   if (listenFd < 0)
   {
-    ESP_LOGE(tag, "could not create the listen socket: errno %d", errno);
+    LOGGER_LOGE(tag, "could not create the listen socket: errno %d", errno);
     return -1;
   }
 
@@ -1368,12 +1560,12 @@ static int telnetOpenListen(void)
   if ((bind(listenFd, (struct sockaddr*)&address, sizeof address) != 0) ||
       (listen(listenFd, 1) != 0))
   {
-    ESP_LOGE(tag, "could not listen on port %d: errno %d", TELNET_PORT, errno);
+    LOGGER_LOGE(tag, "could not listen on port %d: errno %d", TELNET_PORT, errno);
     close(listenFd);
     return -1;
   }
 
-  ESP_LOGI(tag, "telnet console listening on port %d", TELNET_PORT);
+  LOGGER_LOGI(tag, "telnet console listening on port %d", TELNET_PORT);
   return listenFd;
 }
 
@@ -1431,7 +1623,7 @@ static void telnetTaskLoop(void* argument)
         continue;
       }
 
-      ESP_LOGW(tag, "select failed: errno %d, reopening the console", errno);
+      LOGGER_LOGW(tag, "select failed: errno %d, reopening the console", errno);
 
       if (clientFd >= 0)
       {
@@ -1510,9 +1702,10 @@ static void telnetTaskLoop(void* argument)
 
             pendingCr = (byte == '\r');
 
-            //-- An empty line normally does nothing; while a populate
-            //-- awaits its file name it is the cancel answer.
-            if ((linePos > 0u) || populateAwaitingFile)
+            //-- Every finished line goes to the command handler: an empty
+            //-- line prints the help list there, and while a question is
+            //-- open (populate file, ring2csv name, restart confirmation)
+            //-- the empty line is the answer.
             {
               line[linePos] = '\0';
               telnetSendText(clientFd, "\r\n");
@@ -1580,21 +1773,23 @@ static void telnetTaskLoop(void* argument)
         pendingCr = false;
         populateAwaitingFile = false;
         populateMode = LOGGER_POPULATE_MERGE;
+        exportAwaitingName = false;
+        restartAwaitingConfirm = false;
 
         const uint8_t willEcho[3] = {TELNET_IAC, TELNET_WILL, TELNET_OPT_ECHO};
         const uint8_t willSga[3] = {TELNET_IAC, TELNET_WILL, TELNET_OPT_SGA};
         bool greeted = telnetSend(clientFd, willEcho, sizeof willEcho);
         greeted = telnetSend(clientFd, willSga, sizeof willSga) && greeted;
         greeted = telnetPrintf(clientFd, "\r\nlastDSMRlogger %s - telnet console (%s)\r\n",
-                               PROG_VERSION, peerIp) &&
+                               getAppVersion(), peerIp) &&
                   greeted;
         greeted =
             telnetSendText(clientFd,
                            "This session takes the telnet console slot: the previous telnet\r\n"
                            "session, if any, is closed. An open web page keeps its own control.\r\n"
-                           "Type help for the command list.\r\n") &&
+                           "Type help for the command list, an empty line shows it too.\r\n") &&
             greeted;
-        greeted = telnetSendText(clientFd, TELNET_PROMPT) && greeted;
+        greeted = telnetShowPrompt(clientFd) && greeted;
 
         if (!greeted)
         {
@@ -1612,7 +1807,7 @@ static void telnetTaskLoop(void* argument)
 
         //-- Console-only reporting: never draw on the TFT board task from
         //-- here, the board mutex can be held for a long repaint window.
-        ESP_LOGI(tag, "telnet client %d from %s took control", newFd, peerIp);
+        LOGGER_LOGI(tag, "telnet client %d from %s took control", newFd, peerIp);
       }
     }
   }
@@ -1653,7 +1848,7 @@ esp_err_t loggerTelnetStart(void)
   if (created != pdPASS)
   {
     taskRunning = false;
-    ESP_LOGE(tag, "could not create the telnet console task");
+    LOGGER_LOGE(tag, "could not create the telnet console task");
     return ESP_ERR_NO_MEM;
   }
 

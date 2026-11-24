@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_mqtt.c - MQTT telegram publication and tariff ingestion
-//-- Date: 2026-11-22 · Build: 7
+//-- Date: 2026-11-24 · Build: 9
 //--
 //-- One background task owns the esp_mqtt client and the broadcast cadence.
 //-- It keeps a copy of the relevant settings behind a mutex; the settings
@@ -37,6 +37,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "logger_control.h"
 #include "logger_receiver.h"
 #include "logger_tariffs.h"
 #include "mqtt_client.h"
@@ -161,8 +162,8 @@ static void handleTariffMessageData(esp_mqtt_event_t* event)
 
     if (tariffRxTotal > LOGGER_TARIFF_JSON_MAX_BYTES)
     {
-      ESP_LOGW(tag, "tariff message of %u bytes exceeds the document bound, dropped",
-               (unsigned)tariffRxTotal);
+      LOGGER_LOGW(tag, "tariff message of %u bytes exceeds the document bound, dropped",
+                  (unsigned)tariffRxTotal);
       tariffRxActive = true;
       return;
     }
@@ -185,7 +186,7 @@ static void handleTariffMessageData(esp_mqtt_event_t* event)
       }
       else
       {
-        ESP_LOGW(tag, "out of memory for the tariff receive buffer, message dropped");
+        LOGGER_LOGW(tag, "out of memory for the tariff receive buffer, message dropped");
         tariffRxActive = true;
       }
     }
@@ -208,7 +209,7 @@ static void handleTariffMessageData(esp_mqtt_event_t* event)
 
   if ((receivedSoFar > tariffRxTotal) || (tariffRxReceived > (size_t)event->current_data_offset))
   {
-    ESP_LOGW(tag, "tariff message overran its declared size, dropped");
+    LOGGER_LOGW(tag, "tariff message overran its declared size, dropped");
     tariffRxActive = false;
     tariffRxIgnore = true;
     return;
@@ -226,19 +227,25 @@ static void handleTariffMessageData(esp_mqtt_event_t* event)
 
     if (tariffPendingBuffer == NULL)
     {
-      ESP_LOGW(tag, "out of memory for the tariff pending buffer, message dropped");
+      LOGGER_LOGW(tag, "out of memory for the tariff pending buffer, message dropped");
     }
     else
     {
       if (tariffPendingReady)
       {
-        ESP_LOGW(tag, "replacing a tariff message the task has not ingested yet");
+        LOGGER_LOGW(tag, "replacing a tariff message the task has not ingested yet");
       }
 
       memcpy(tariffPendingBuffer, tariffRxBuffer, tariffRxTotal);
       tariffPendingBuffer[tariffRxTotal] = '\0';
       tariffPendingLength = tariffRxTotal;
       tariffPendingReady = true;
+
+      //-- An incoming MQTT message is worth a line on the verbose console:
+      //-- this is the moment the whole tariff document has landed.
+      loggerControlConsoleEvent(LOGGER_VERBOSE_EVENTS, LOGGER_CONSOLE_EVENT,
+                                "mqtt: incoming tariff message (%lu bytes)",
+                                (unsigned long)tariffRxTotal);
     }
 
     tariffRxActive = false;
@@ -279,12 +286,12 @@ static void ensureTariffSubscription(void)
     tariffSubscribed = true;
     tariffSubscribePending = false;
     tariffSubscribeRetryMs = 0u;
-    ESP_LOGI(tag, "subscribed to the tariff topic %s (qos 1)", wanted);
+    LOGGER_LOGI(tag, "subscribed to the tariff topic %s (qos 1)", wanted);
   }
   else
   {
     tariffSubscribeRetryMs = 10000u;
-    ESP_LOGW(tag, "could not subscribe to the tariff topic %s (retrying in 10 s)", wanted);
+    LOGGER_LOGW(tag, "could not subscribe to the tariff topic %s (retrying in 10 s)", wanted);
   }
 }
 
@@ -299,7 +306,9 @@ static void mqttEventHandler(void* argument, esp_event_base_t eventBase, int32_t
 
   if (eventId == MQTT_EVENT_CONNECTED)
   {
-    ESP_LOGI(tag, "connected to the broker");
+    LOGGER_LOGI(tag, "connected to the broker");
+    loggerControlConsoleEvent(LOGGER_VERBOSE_EVENTS, LOGGER_CONSOLE_EVENT,
+                              "mqtt: connected to the broker");
 
     //-- A fresh connection broadcasts at once: a subscriber that just
     //-- appeared sees the latest telegram without waiting a whole interval.
@@ -313,11 +322,15 @@ static void mqttEventHandler(void* argument, esp_event_base_t eventBase, int32_t
   }
   else if (eventId == MQTT_EVENT_DISCONNECTED)
   {
-    ESP_LOGW(tag, "disconnected from the broker (retrying on its own)");
+    LOGGER_LOGW(tag, "disconnected from the broker (retrying on its own)");
+    loggerControlConsoleEvent(LOGGER_VERBOSE_EVENTS, LOGGER_CONSOLE_EVENT,
+                              "mqtt: disconnected from the broker");
   }
   else if (eventId == MQTT_EVENT_ERROR)
   {
-    ESP_LOGW(tag, "broker connection error");
+    LOGGER_LOGW(tag, "broker connection error");
+    loggerControlConsoleEvent(LOGGER_VERBOSE_EVENTS, LOGGER_CONSOLE_ERROR,
+                              "mqtt: broker connection error");
   }
   else if (eventId == MQTT_EVENT_DATA)
   {
@@ -360,7 +373,7 @@ static esp_err_t startClient(const MqttSettings* source)
 
   if (created == NULL)
   {
-    ESP_LOGE(tag, "could not create the MQTT client");
+    LOGGER_LOGE(tag, "could not create the MQTT client");
     return ESP_ERR_NO_MEM;
   }
 
@@ -369,13 +382,13 @@ static esp_err_t startClient(const MqttSettings* source)
 
   if (started != ESP_OK)
   {
-    ESP_LOGE(tag, "MQTT client could not start: %s", esp_err_to_name(started));
+    LOGGER_LOGE(tag, "MQTT client could not start: %s", esp_err_to_name(started));
     esp_mqtt_client_destroy(created);
     return started;
   }
 
   client = created;
-  ESP_LOGI(tag, "MQTT client started for %s", uri);
+  LOGGER_LOGI(tag, "MQTT client started for %s", uri);
   return ESP_OK;
 }
 
@@ -647,7 +660,7 @@ static bool publishLatestTelegram(const MqttSettings* source)
 
   if (json == NULL)
   {
-    ESP_LOGW(tag, "out of memory for the MQTT telegram document");
+    LOGGER_LOGW(tag, "out of memory for the MQTT telegram document");
     return false;
   }
 
@@ -668,11 +681,14 @@ static bool publishLatestTelegram(const MqttSettings* source)
 
     if (published)
     {
-      ESP_LOGI(tag, "published telegram #%" PRIu32 " to %s", meta.sequence, topic);
+      LOGGER_LOGI(tag, "published telegram #%" PRIu32 " to %s", meta.sequence, topic);
+      loggerControlConsoleEvent(LOGGER_VERBOSE_TELEGRAMS, LOGGER_CONSOLE_TELEGRAM,
+                                "mqtt: published telegram #%" PRIu32 " to %s", meta.sequence,
+                                topic);
     }
     else
     {
-      ESP_LOGW(tag, "could not publish telegram #%" PRIu32 " to %s", meta.sequence, topic);
+      LOGGER_LOGW(tag, "could not publish telegram #%" PRIu32 " to %s", meta.sequence, topic);
     }
   }
 
@@ -747,7 +763,7 @@ static void mqttTask(void* argument)
       }
       else
       {
-        ESP_LOGW(tag, "tariff message via MQTT rejected: %s", reason);
+        LOGGER_LOGW(tag, "tariff message via MQTT rejected: %s", reason);
       }
     }
 
@@ -835,7 +851,7 @@ esp_err_t loggerMqttApplyConfig(const loggerSettingsConfig* config)
 
     if (created != pdPASS)
     {
-      ESP_LOGE(tag, "could not create the MQTT task");
+      LOGGER_LOGE(tag, "could not create the MQTT task");
       result = ESP_ERR_NO_MEM;
     }
     else

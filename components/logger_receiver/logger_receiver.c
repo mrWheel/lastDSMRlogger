@@ -43,6 +43,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "logger_board.h"
+#include "logger_control.h"
 #include "logger_testdata.h"
 #include "nvs.h"
 
@@ -808,12 +809,12 @@ static void onParserEvent(const dsmrParser* parser, const dsmrParserEvent* event
       //-- A correct frame that arrives inside the interval is a skip, not a
       //-- processing: the log line carries the word skip where the accepted
       //-- line shows the telegram number.
-      ESP_LOGI(tag, "correct telegram skip: meter %s, %u bytes, %s, profile %s",
-               (stagingRecord->meta.meterTimeText[0] != '\0') ? stagingRecord->meta.meterTimeText
-                                                              : "--:--:--",
-               (unsigned)stagingRecord->meta.rawLength,
-               stagingRecord->meta.crcVerified ? "crc ok" : "no crc",
-               stagingRecord->meta.profileId);
+      LOGGER_LOGI(tag, "correct telegram skip: meter %s, %u bytes, %s, profile %s",
+                  (stagingRecord->meta.meterTimeText[0] != '\0') ? stagingRecord->meta.meterTimeText
+                                                                 : "--:--:--",
+                  (unsigned)stagingRecord->meta.rawLength,
+                  stagingRecord->meta.crcVerified ? "crc ok" : "no crc",
+                  stagingRecord->meta.profileId);
 
       //-- Read-only frames are forwarded too, so the wire keeps the meter
       //-- cadence: the newest scheduled frame takes the dedicated copy.
@@ -987,12 +988,13 @@ static void onParserEvent(const dsmrParser* parser, const dsmrParserEvent* event
 
     //-- One console line per accepted telegram: sequence, meter time from
     //-- OBIS 0-0:1.0.0, size, CRC verdict and active profile.
-    ESP_LOGI(tag, "accepted telegram #%" PRIu32 ": meter %s, %u bytes, %s, profile %s",
-             stagingRecord->meta.sequence,
-             (stagingRecord->meta.meterTimeText[0] != '\0') ? stagingRecord->meta.meterTimeText
-                                                            : "--:--:--",
-             (unsigned)stagingRecord->meta.rawLength,
-             stagingRecord->meta.crcVerified ? "crc ok" : "no crc", stagingRecord->meta.profileId);
+    LOGGER_LOGI(tag, "accepted telegram #%" PRIu32 ": meter %s, %u bytes, %s, profile %s",
+                stagingRecord->meta.sequence,
+                (stagingRecord->meta.meterTimeText[0] != '\0') ? stagingRecord->meta.meterTimeText
+                                                               : "--:--:--",
+                (unsigned)stagingRecord->meta.rawLength,
+                stagingRecord->meta.crcVerified ? "crc ok" : "no crc",
+                stagingRecord->meta.profileId);
   }
   else if (event->type == DSMR_EVENT_DIAGNOSTIC)
   {
@@ -1060,7 +1062,7 @@ static void onParserEvent(const dsmrParser* parser, const dsmrParserEvent* event
     {
       copyBounded(self->loggedDiagText, sizeof self->loggedDiagText, diagText);
       self->loggedDiagValid = true;
-      ESP_LOGW(tag, "diagnostic: %s", diagText);
+      LOGGER_LOGW(tag, "diagnostic: %s", diagText);
     }
 
     xSemaphoreGive(self->mutex);
@@ -1242,8 +1244,8 @@ static esp_err_t startTestGenerator(LoggerReceiver* self, const loggerSettingsCo
   }
 
   testArgumentsActive = arguments;
-  ESP_LOGI(tag, "test data generator started: profile %s, one telegram per %" PRIu32 " s",
-           config->profileId, config->intervalSeconds);
+  LOGGER_LOGI(tag, "test data generator started: profile %s, one telegram per %" PRIu32 " s",
+              config->profileId, config->intervalSeconds);
   return ESP_OK;
 }
 
@@ -1252,7 +1254,7 @@ static void stopTestGenerator(void)
   if (testArgumentsActive != NULL)
   {
     testArgumentsActive->running = false;
-    ESP_LOGI(tag, "test data generator stopping");
+    LOGGER_LOGI(tag, "test data generator stopping");
   }
 
   uint32_t waitedMs = 0u;
@@ -1315,7 +1317,8 @@ static void applyForwardMask(LoggerReceiver* self, uint32_t mask)
 
   if (result != ESP_OK)
   {
-    ESP_LOGW(tag, "UART0 line inversion 0x%02" PRIX32 " failed: %s", mask, esp_err_to_name(result));
+    LOGGER_LOGW(tag, "UART0 line inversion 0x%02" PRIX32 " failed: %s", mask,
+                esp_err_to_name(result));
     return;
   }
 
@@ -1372,8 +1375,8 @@ static void ensureForwardTxDriver(LoggerReceiver* self, bool rxInverted, uint16_
     self->appliedInverseMask = -1;
     xSemaphoreGive(self->mutex);
 
-    ESP_LOGW(tag, "UART0 TX driver could not be installed: %s (burst skipped)",
-             esp_err_to_name(result));
+    LOGGER_LOGW(tag, "UART0 TX driver could not be installed: %s (burst skipped)",
+                esp_err_to_name(result));
 
     if (uart_is_driver_installed(LOGGER_P1_UART_PORT))
     {
@@ -1436,8 +1439,9 @@ static esp_err_t startLiveAdapter(LoggerReceiver* self, const loggerSettingsConf
   //-- interface boards that invert before the ESP32-S3.
   uartConfig.invertRx = config->rxInverted;
 
-  ESP_LOGI(tag, "P1 RX on UART0 gpio %d, polarity %s, tx idles at %s", config->rxGpio,
-           config->rxInverted ? "inverted" : "normal", config->rxInverted ? "inverted" : "normal");
+  LOGGER_LOGI(tag, "P1 RX on UART0 gpio %d, polarity %s, tx idles at %s", config->rxGpio,
+              config->rxInverted ? "inverted" : "normal",
+              config->rxInverted ? "inverted" : "normal");
 
   esp_err_t result = dsmrUartStart(&self->uart, &self->parser, &uartConfig, onParserEvent, self);
 
@@ -1498,7 +1502,7 @@ static bool forwardCopy(LoggerReceiver* self, const uint8_t* payload, uint16_t l
 
   if (written != (int)length)
   {
-    ESP_LOGW(tag, "UART0 TX copy incomplete: %d of %u bytes", written, (unsigned)length);
+    LOGGER_LOGW(tag, "UART0 TX copy incomplete: %d of %u bytes", written, (unsigned)length);
     return false;
   }
 
@@ -1507,8 +1511,8 @@ static bool forwardCopy(LoggerReceiver* self, const uint8_t* payload, uint16_t l
 
   if (result != ESP_OK)
   {
-    ESP_LOGW(tag, "UART0 TX copy did not finish on the wire within %d ms: %s",
-             LOGGER_FORWARD_TX_WAIT_MS, esp_err_to_name(result));
+    LOGGER_LOGW(tag, "UART0 TX copy did not finish on the wire within %d ms: %s",
+                LOGGER_FORWARD_TX_WAIT_MS, esp_err_to_name(result));
     return false;
   }
 
@@ -1624,15 +1628,15 @@ static void forwardTaskLoop(void* argument)
                  "receiver could not resume after forwarding: %s", esp_err_to_name(resumed));
         self->receiverRunning = false;
         xSemaphoreGive(self->mutex);
-        ESP_LOGE(tag, "%s", self->lastError);
+        LOGGER_LOGE(tag, "%s", self->lastError);
       }
     }
 
     //-- The free heap after the burst lets memory pressure be read from the
     //-- console: web detail and raw requests malloc alongside the burst.
-    ESP_LOGI(tag, "forwarded %u bytes on UART0 TX, tx polarity %s, %s in %u ms, free heap %u",
-             (unsigned)length, txInverted ? "inverted" : "normal", ok ? "sent" : "aborted",
-             (unsigned)(uptimeMs() - startMs), (unsigned)esp_get_free_heap_size());
+    LOGGER_LOGI(tag, "forwarded %u bytes on UART0 TX, tx polarity %s, %s in %u ms, free heap %u",
+                (unsigned)length, txInverted ? "inverted" : "normal", ok ? "sent" : "aborted",
+                (unsigned)(uptimeMs() - startMs), (unsigned)esp_get_free_heap_size());
 
     xSemaphoreTake(self->mutex, portMAX_DELAY);
     self->forwarding = false;
@@ -1668,7 +1672,7 @@ static void persistCounters(LoggerReceiver* self, uint32_t* lastPersistedAccepte
 
   if (result != ESP_OK)
   {
-    ESP_LOGE(tag, "opening the counter namespace failed: %s", esp_err_to_name(result));
+    LOGGER_LOGE(tag, "opening the counter namespace failed: %s", esp_err_to_name(result));
     return;
   }
 
@@ -1688,14 +1692,14 @@ static void persistCounters(LoggerReceiver* self, uint32_t* lastPersistedAccepte
 
   if (result != ESP_OK)
   {
-    ESP_LOGE(tag, "persisting the telegram counters failed: %s", esp_err_to_name(result));
+    LOGGER_LOGE(tag, "persisting the telegram counters failed: %s", esp_err_to_name(result));
     return;
   }
 
   *lastPersistedAccepted = accepted;
   *lastPersistedRejected = rejected;
-  ESP_LOGI(tag, "telegram counters persisted: %" PRIu32 " accepted, %" PRIu32 " rejected", accepted,
-           rejected);
+  LOGGER_LOGI(tag, "telegram counters persisted: %" PRIu32 " accepted, %" PRIu32 " rejected",
+              accepted, rejected);
 }
 
 //-- Blocks until the receive task signals a new block of accepted telegrams
@@ -1744,7 +1748,7 @@ static esp_err_t startLocked(LoggerReceiver* self, const loggerSettingsConfig* c
     xSemaphoreTake(self->mutex, portMAX_DELAY);
     snprintf(self->lastError, sizeof self->lastError, "parser init failed: %s",
              dsmrStatusToString(status));
-    ESP_LOGE(tag, "%s", self->lastError);
+    LOGGER_LOGE(tag, "%s", self->lastError);
     xSemaphoreGive(self->mutex);
     return ESP_FAIL;
   }
@@ -1794,7 +1798,7 @@ static esp_err_t startLocked(LoggerReceiver* self, const loggerSettingsConfig* c
 
   if (result != ESP_OK)
   {
-    ESP_LOGE(tag, "%s", self->lastError);
+    LOGGER_LOGE(tag, "%s", self->lastError);
     return result;
   }
 
@@ -1867,7 +1871,7 @@ esp_err_t loggerReceiverInit(void)
   if ((stagingRecord == NULL) || (self->records == NULL) || (forwardFrameBuffer == NULL) ||
       (forwardBurstBuffer == NULL))
   {
-    ESP_LOGE(tag, "telegram buffers could not be allocated");
+    LOGGER_LOGE(tag, "telegram buffers could not be allocated");
     return ESP_ERR_NO_MEM;
   }
 
@@ -1889,11 +1893,12 @@ esp_err_t loggerReceiverInit(void)
 
   if (self->powerHistory == NULL)
   {
-    ESP_LOGE(tag, "power history table could not be allocated");
+    LOGGER_LOGE(tag, "power history table could not be allocated");
     return ESP_ERR_NO_MEM;
   }
 
-  ESP_LOGI(tag, "power history table: %" PRIu16 " measurement slots", self->powerHistoryCapacity);
+  LOGGER_LOGI(tag, "power history table: %" PRIu16 " measurement slots",
+              self->powerHistoryCapacity);
 
   //-- The accepted and rejected telegram totals continue across a reset or
   //-- power cycle: the values the counter task last persisted are the
@@ -1918,16 +1923,18 @@ esp_err_t loggerReceiverInit(void)
     }
 
     nvs_close(handle);
-    ESP_LOGI(tag, "telegram counters restored from NVS: %" PRIu32 " accepted, %" PRIu32 " rejected",
-             self->acceptedCount, self->rejectedCount);
+    LOGGER_LOGI(tag,
+                "telegram counters restored from NVS: %" PRIu32 " accepted, %" PRIu32 " rejected",
+                self->acceptedCount, self->rejectedCount);
   }
   else if (nvsResult == ESP_ERR_NVS_NOT_FOUND)
   {
-    ESP_LOGI(tag, "no stored telegram counters yet, starting at zero");
+    LOGGER_LOGI(tag, "no stored telegram counters yet, starting at zero");
   }
   else
   {
-    ESP_LOGW(tag, "telegram counters could not be read from NVS: %s", esp_err_to_name(nvsResult));
+    LOGGER_LOGW(tag, "telegram counters could not be read from NVS: %s",
+                esp_err_to_name(nvsResult));
   }
 
   //-- One-time rebase of the persisted rejected total: earlier firmware
@@ -1964,7 +1971,7 @@ esp_err_t loggerReceiverInit(void)
     }
 
     self->rejectedCount = 0u;
-    ESP_LOGI(tag, "rejected counter rebased: earlier totals also counted parser timeouts");
+    LOGGER_LOGI(tag, "rejected counter rebased: earlier totals also counted parser timeouts");
   }
 
   //-- The console line, the telegram list and the panel number accepted
@@ -1978,13 +1985,13 @@ esp_err_t loggerReceiverInit(void)
   if (xTaskCreate(forwardTaskLoop, "p1Forward", LOGGER_FORWARD_TASK_STACK_BYTES, self,
                   LOGGER_FORWARD_TASK_PRIORITY, NULL) != pdPASS)
   {
-    ESP_LOGW(tag, "forwarding task could not be created: TX forwarding disabled");
+    LOGGER_LOGW(tag, "forwarding task could not be created: TX forwarding disabled");
   }
   else
   {
-    ESP_LOGI(tag, "UART0 TX forwarding ready: every read telegram schedules a burst, each burst "
-                  "sends the frame once at the configured TX polarity with reception suspended, "
-                  "bursts queue behind each other");
+    LOGGER_LOGI(tag, "UART0 TX forwarding ready: every read telegram schedules a burst, each burst "
+                     "sends the frame once at the configured TX polarity with reception suspended, "
+                     "bursts queue behind each other");
   }
 
   //-- The counter task persists both running totals whenever either counter
@@ -1994,7 +2001,7 @@ esp_err_t loggerReceiverInit(void)
                   self, LOGGER_TELEGRAM_COUNTER_TASK_PRIORITY, &counterTaskHandle) != pdPASS)
   {
     counterTaskHandle = NULL;
-    ESP_LOGW(tag, "telegram counter task could not be created: counter persistence disabled");
+    LOGGER_LOGW(tag, "telegram counter task could not be created: counter persistence disabled");
   }
 
   dsmrParserConfig probe;
@@ -2005,8 +2012,8 @@ esp_err_t loggerReceiverInit(void)
 
   if (self->workspaceSize > DSMR_DEFAULT_WORKSPACE_BYTES)
   {
-    ESP_LOGE(tag, "workspace too small: need %u have %u", (unsigned)self->workspaceSize,
-             (unsigned)DSMR_DEFAULT_WORKSPACE_BYTES);
+    LOGGER_LOGE(tag, "workspace too small: need %u have %u", (unsigned)self->workspaceSize,
+                (unsigned)DSMR_DEFAULT_WORKSPACE_BYTES);
     return ESP_ERR_INVALID_SIZE;
   }
 
@@ -2014,7 +2021,7 @@ esp_err_t loggerReceiverInit(void)
 
   if (parserWorkspace == NULL)
   {
-    ESP_LOGE(tag, "parser workspace could not be allocated");
+    LOGGER_LOGE(tag, "parser workspace could not be allocated");
     return ESP_ERR_NO_MEM;
   }
 
@@ -2090,7 +2097,7 @@ esp_err_t loggerReceiverApplyConfig(const loggerSettingsConfig* config)
         xSemaphoreTake(self->mutex, portMAX_DELAY);
         snprintf(self->lastError, sizeof self->lastError,
                  "restore of previous configuration failed: %s", esp_err_to_name(restore));
-        ESP_LOGE(tag, "%s", self->lastError);
+        LOGGER_LOGE(tag, "%s", self->lastError);
         xSemaphoreGive(self->mutex);
       }
     }

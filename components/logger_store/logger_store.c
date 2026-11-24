@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.c - hour, day and month smart meter ring file store
-//-- Date: 2026-11-23 · Build: 15
+//-- Date: 2026-11-24 · Build: 18
 //--
 //-- The store task owns all ring_file_store work: it mounts the LittleFS
 //-- storage partition, removes the ring file of the retired minute store,
@@ -58,6 +58,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "logger_control.h"
 #include "logger_receiver.h"
 #include "logger_settings.h"
 #include "ring_file_store.h"
@@ -125,6 +126,18 @@ static const char* tag = "meterStore";
 //-- Calculator filling the tariff amounts of every snapshot record; set
 //-- once at boot (see loggerStoreSetTariffCalculator).
 static loggerStoreTariffCalculator tariffCalculator = NULL;
+
+//-- Manual synchronisation request (the console's sync command): the flag
+//-- forces the next snapshot to commit all rings regardless of the interval,
+//-- the semaphore wakes the store task from its minute sleep so the commit
+//-- lands at once instead of on the next minute boundary.
+static SemaphoreHandle_t storeWakeSem;
+static volatile bool syncRequested = false;
+
+//-- Completion token of a synchronisation (the console's restart waits on
+//-- it): the store task gives it after every commit of all three rings, so
+//-- a waiter learns the staged records have really reached storage.
+static SemaphoreHandle_t syncDoneSem;
 
 void loggerStoreSetTariffCalculator(loggerStoreTariffCalculator calculator)
 {
@@ -394,7 +407,7 @@ static bool openMeterRing(MeterRing* ring)
   //-- a run that never reached ringFileClose() is stale and must go.
   if (ringFileBreakStaleLock(ring->path) == ESP_OK)
   {
-    ESP_LOGI(tag, "removed a stale %s ring lock from an interrupted run", ring->name);
+    LOGGER_LOGI(tag, "removed a stale %s ring lock from an interrupted run", ring->name);
   }
 
   ringFileConfig_t config;
@@ -428,10 +441,10 @@ static bool openMeterRing(MeterRing* ring)
   //-- fills it again.
   if (result == RING_FILE_STORE_ERR_SCHEMA_MISMATCH)
   {
-    ESP_LOGW(tag,
-             "ring file %s was written with another record layout: rebuilding it empty "
-             "(re-run populate to fill it)",
-             ring->path);
+    LOGGER_LOGW(tag,
+                "ring file %s was written with another record layout: rebuilding it empty "
+                "(re-run populate to fill it)",
+                ring->path);
     (void)unlink(ring->path);
     (void)ringFileBreakStaleLock(ring->path);
     handle = NULL;
@@ -441,7 +454,7 @@ static bool openMeterRing(MeterRing* ring)
 
   if (result != ESP_OK)
   {
-    ESP_LOGE(tag, "could not open ring file %s: %s", ring->path, esp_err_to_name(result));
+    LOGGER_LOGE(tag, "could not open ring file %s: %s", ring->path, esp_err_to_name(result));
     return false;
   }
 
@@ -450,8 +463,9 @@ static bool openMeterRing(MeterRing* ring)
 
   if (ringFileGetInfo(handle, &info) == ESP_OK)
   {
-    ESP_LOGI(tag, "ring file %s ready: file type '%s', %" PRIu32 " of %" PRIu32 " records retained",
-             ring->path, info.schemaId, info.count, info.capacity);
+    LOGGER_LOGI(tag,
+                "ring file %s ready: file type '%s', %" PRIu32 " of %" PRIu32 " records retained",
+                ring->path, info.schemaId, info.count, info.capacity);
   }
 
   //-- A ring file keeps the capacity it was created with in its header, so
@@ -460,10 +474,10 @@ static bool openMeterRing(MeterRing* ring)
   //-- fills it again) instead of ignoring the new capacity.
   if ((info.capacity != 0u) && (info.capacity != ring->maxRecords))
   {
-    ESP_LOGW(tag,
-             "ring file %s was built for %" PRIu32 " records but the ring now retains %" PRIu32
-             ": rebuilding it empty (re-run populate to fill it)",
-             ring->path, info.capacity, ring->maxRecords);
+    LOGGER_LOGW(tag,
+                "ring file %s was built for %" PRIu32 " records but the ring now retains %" PRIu32
+                ": rebuilding it empty (re-run populate to fill it)",
+                ring->path, info.capacity, ring->maxRecords);
     ringFileClose(handle);
     (void)unlink(ring->path);
     (void)ringFileBreakStaleLock(ring->path);
@@ -473,15 +487,15 @@ static bool openMeterRing(MeterRing* ring)
 
     if (result != ESP_OK)
     {
-      ESP_LOGE(tag, "could not rebuild ring file %s: %s", ring->path, esp_err_to_name(result));
+      LOGGER_LOGE(tag, "could not rebuild ring file %s: %s", ring->path, esp_err_to_name(result));
       return false;
     }
 
     if (ringFileGetInfo(handle, &info) == ESP_OK)
     {
-      ESP_LOGI(tag,
-               "ring file %s rebuilt: file type '%s', %" PRIu32 " of %" PRIu32 " records retained",
-               ring->path, info.schemaId, info.count, info.capacity);
+      LOGGER_LOGI(
+          tag, "ring file %s rebuilt: file type '%s', %" PRIu32 " of %" PRIu32 " records retained",
+          ring->path, info.schemaId, info.count, info.capacity);
     }
   }
 
@@ -514,10 +528,10 @@ static void ensureRingRecordLayout(void)
     return;
   }
 
-  ESP_LOGW(tag,
-           "ring files carry record layout %u, this firmware stores layout %u: rebuilding the "
-           "rings empty (re-run populate to fill them)",
-           (unsigned)storedVersion, (unsigned)STORE_RECORD_LAYOUT_VERSION);
+  LOGGER_LOGW(tag,
+              "ring files carry record layout %u, this firmware stores layout %u: rebuilding the "
+              "rings empty (re-run populate to fill them)",
+              (unsigned)storedVersion, (unsigned)STORE_RECORD_LAYOUT_VERSION);
 
   for (loggerMeterRing_t ring = LOGGER_RING_HOURS; ring < LOGGER_RING_COUNT; ring++)
   {
@@ -535,7 +549,7 @@ static void ensureRingRecordLayout(void)
   }
   else
   {
-    ESP_LOGW(tag, "could not write the ring layout marker: the rings rebuild again next boot");
+    LOGGER_LOGW(tag, "could not write the ring layout marker: the rings rebuild again next boot");
   }
 }
 
@@ -554,12 +568,13 @@ static bool openMeterRings(void)
 
   if (result != ESP_OK)
   {
-    ESP_LOGE(tag, "could not mount LittleFS partition '%s' at %s: %s", STORE_PARTITION_LABEL,
-             STORE_MOUNT_POINT, esp_err_to_name(result));
+    LOGGER_LOGE(tag, "could not mount LittleFS partition '%s' at %s: %s", STORE_PARTITION_LABEL,
+                STORE_MOUNT_POINT, esp_err_to_name(result));
     return false;
   }
 
-  ESP_LOGI(tag, "mounted LittleFS partition '%s' at %s", STORE_PARTITION_LABEL, STORE_MOUNT_POINT);
+  LOGGER_LOGI(tag, "mounted LittleFS partition '%s' at %s", STORE_PARTITION_LABEL,
+              STORE_MOUNT_POINT);
 
   //-- The temporary per-minute store is retired: its ring file and a lock
   //-- it may have left behind no longer belong on the volume.
@@ -567,7 +582,7 @@ static bool openMeterRings(void)
 
   if (unlink(STORE_LEGACY_RING_PATH) == 0)
   {
-    ESP_LOGI(tag, "removed the retired minute ring file %s", STORE_LEGACY_RING_PATH);
+    LOGGER_LOGI(tag, "removed the retired minute ring file %s", STORE_LEGACY_RING_PATH);
   }
 
   ensureRingRecordLayout();
@@ -651,7 +666,8 @@ esp_err_t loggerStoreListRecords(loggerMeterRing_t ring, loggerStoreRecordVisito
     if (emitted > (active->maxRecords * 2u))
     {
       //-- Safety net against a pathological invalidate/re-begin cycle.
-      ESP_LOGW(tag, "%s ring list walk abandoned after %" PRIu32 " entries", active->name, emitted);
+      LOGGER_LOGW(tag, "%s ring list walk abandoned after %" PRIu32 " entries", active->name,
+                  emitted);
       return ESP_FAIL;
     }
 
@@ -671,8 +687,8 @@ esp_err_t loggerStoreListRecords(loggerMeterRing_t ring, loggerStoreRecordVisito
 
   if ((result != RING_FILE_STORE_ERR_ITER_END) && (result != RING_FILE_STORE_ERR_RING_EMPTY))
   {
-    ESP_LOGW(tag, "%s ring list walk stopped after %" PRIu32 " records: %s", active->name, emitted,
-             esp_err_to_name(result));
+    LOGGER_LOGW(tag, "%s ring list walk stopped after %" PRIu32 " records: %s", active->name,
+                emitted, esp_err_to_name(result));
     return result;
   }
 
@@ -935,7 +951,7 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
 
   if (file == NULL)
   {
-    ESP_LOGW(tag, "populate could not open %s: errno %d", path, errno);
+    LOGGER_LOGW(tag, "populate could not open %s: errno %d", path, errno);
     snprintf(result->firstError, sizeof result->firstError, "cannot open '%.60s' (errno %d)",
              relativePath, errno);
     return ESP_ERR_NOT_FOUND;
@@ -1029,10 +1045,10 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
       //-- instead of letting a ring silently fill with zeros.
       if (mappedColumns == 0u)
       {
-        ESP_LOGW(tag,
-                 "populate %s ring from %s: no value column of the header is known, every "
-                 "counter imports as 0.0 (ti, te, tg and nc are computed from the settings)",
-                 rings[ring].name, path);
+        LOGGER_LOGW(tag,
+                    "populate %s ring from %s: no value column of the header is known, every "
+                    "counter imports as 0.0 (ti, te, tg and nc are computed from the settings)",
+                    rings[ring].name, path);
 
         if (result->firstError[0] == '\0')
         {
@@ -1226,7 +1242,7 @@ static esp_err_t importRingFile(loggerMeterRing_t ring, const char* relativePath
     snprintf(result->firstError, sizeof result->firstError, "file has no header line");
   }
 
-  ESP_LOGI(
+  LOGGER_LOGI(
       tag,
       "populate %s ring from %s (%s): %lu line(s) read, %lu written, %lu rejected, %lu refused",
       rings[ring].name, path, populateModeName(mode), (unsigned long)result->rowsRead,
@@ -1295,7 +1311,7 @@ esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePa
                   STORE_IMPORT_TASK_PRIORITY, NULL) != pdPASS)
   {
     vSemaphoreDelete(done);
-    ESP_LOGE(tag, "could not create the ring import task");
+    LOGGER_LOGE(tag, "could not create the ring import task");
     return ESP_ERR_NO_MEM;
   }
 
@@ -1330,14 +1346,37 @@ esp_err_t loggerStorePopulateRing(loggerMeterRing_t ring, const char* relativePa
   "YYMMDDHH;1-0:1.8.1*255;1-0:1.8.2*255;1-0:2.8.1*255;1-0:2.8.2*255;0-1:24.1.0*255;ti;te;tg;"      \
   "nc\r\n"
 
+//-- Default csv name of a ring2csv export: the wall-clock stamp YYMMDDhhmm
+//-- of the export moment plus the ring selector ("2611240730-hours.csv"),
+//-- so consecutive exports of one ring never overwrite each other on the
+//-- volume. A wall clock that never synchronised stamps all digits zero.
+static void exportDefaultName(loggerMeterRing_t ring, char* outName, size_t outSize)
+{
+  char stamp[16] = "0000000000";
+  time_t now = time(NULL);
+  struct tm brokenTime;
+
+  if ((now >= (time_t)STORE_CLOCK_SYNCED_EPOCH) && (localtime_r(&now, &brokenTime) != NULL))
+  {
+    strftime(stamp, sizeof stamp, "%y%m%d%H%M", &brokenTime);
+  }
+
+  snprintf(outName, outSize, "%s-%s.csv", stamp, loggerStoreRingName(ring));
+}
+
 //-- Walks the ring newest first into a buffer (deduplicating a cursor that
-//-- is invalidated by a concurrent snapshot), then writes the file oldest
-//-- first: key as eight YYMMDDHH digits, the five counters at three decimals
-//-- and the three tariff amounts and the network costs at two. An empty ring still produces the
+//-- is invalidated by a concurrent snapshot), then writes the rows: key as
+//-- eight YYMMDDHH digits, the five counters at three decimals and the three
+//-- tariff amounts and the network costs at two. An empty ring still produces the
 //-- header line. The caller may hand an already open stream (the in-memory
-//-- csv text of the API); with file NULL the RING<name>.csv volume file is
-//-- opened and closed here like the console's ring2csv always did.
-static esp_err_t exportRingFile(loggerMeterRing_t ring, FILE* file, uint32_t* outRecords)
+//-- csv text of the API); with file NULL the volume file is opened and
+//-- closed here like the console's ring2csv always did: relativeName names
+//-- it at the volume root (already validated by the caller; NULL keeps the
+//-- default YYMMDDhhmm-<name>.csv) and newestFirst picks newest period
+//-- first, the
+//-- spelling ring2csv writes, while the API download keeps oldest first.
+static esp_err_t exportRingFile(loggerMeterRing_t ring, FILE* file, const char* relativeName,
+                                bool newestFirst, uint32_t* outRecords)
 {
   MeterRing* active = &rings[ring];
   ringFileHandle_t* handle = active->handle;
@@ -1374,7 +1413,8 @@ static esp_err_t exportRingFile(loggerMeterRing_t ring, FILE* file, uint32_t* ou
 
     if (steps > (active->maxRecords * 3u))
     {
-      ESP_LOGW(tag, "%s ring export walk abandoned after %" PRIu32 " steps", active->name, steps);
+      LOGGER_LOGW(tag, "%s ring export walk abandoned after %" PRIu32 " steps", active->name,
+                  steps);
       return ESP_FAIL;
     }
 
@@ -1397,8 +1437,8 @@ static esp_err_t exportRingFile(loggerMeterRing_t ring, FILE* file, uint32_t* ou
 
   if ((result != RING_FILE_STORE_ERR_ITER_END) && (result != RING_FILE_STORE_ERR_RING_EMPTY))
   {
-    ESP_LOGW(tag, "%s ring export walk stopped after %" PRIu32 " records: %s", active->name,
-             collected, esp_err_to_name(result));
+    LOGGER_LOGW(tag, "%s ring export walk stopped after %" PRIu32 " records: %s", active->name,
+                collected, esp_err_to_name(result));
     return result;
   }
 
@@ -1408,23 +1448,37 @@ static esp_err_t exportRingFile(loggerMeterRing_t ring, FILE* file, uint32_t* ou
 
   if (ownFile)
   {
-    snprintf(path, sizeof path, STORE_MOUNT_POINT "/RING%s.csv", active->name);
+    if (relativeName != NULL)
+    {
+      snprintf(path, sizeof path, STORE_MOUNT_POINT "/%s", relativeName);
+    }
+    else
+    {
+      //-- The generated name is at most stamp + '-' + selector + ".csv";
+      //-- the modest buffer keeps the mount-point concatenation provably
+      //-- safe against the path size.
+      char defaultName[64];
+      exportDefaultName(ring, defaultName, sizeof defaultName);
+      snprintf(path, sizeof path, STORE_MOUNT_POINT "/%s", defaultName);
+    }
+
     file = fopen(path, "w");
 
     if (file == NULL)
     {
-      ESP_LOGW(tag, "ring2csv could not open %s: errno %d", path, errno);
+      LOGGER_LOGW(tag, "ring2csv could not open %s: errno %d", path, errno);
       return ESP_FAIL;
     }
   }
 
   fprintf(file, STORE_EXPORT_HEADER);
 
-  //-- Newest first in the buffer, oldest first on storage.
-  for (uint32_t index = collected; index > 0u;)
+  //-- The buffer holds the records newest first (the walk began at the
+  //-- newest): ring2csv writes them as they came, the API download walks the
+  //-- buffer backwards so its file stays oldest first.
+  for (uint32_t index = 0u; index < collected; index++)
   {
-    index--;
-    const MeterRingEntry* record = &entries[index];
+    const MeterRingEntry* record = &entries[newestFirst ? index : (collected - 1u - index)];
 
     //-- Eight plain YYMMDDHH digits: strip the component's minute/second
     //-- digits and the century from the full timestamp.
@@ -1450,8 +1504,8 @@ static esp_err_t exportRingFile(loggerMeterRing_t ring, FILE* file, uint32_t* ou
 
   if (ownFile)
   {
-    ESP_LOGI(tag, "ring2csv wrote %" PRIu32 " record(s) of the %s ring to %s", collected,
-             active->name, path);
+    LOGGER_LOGI(tag, "ring2csv wrote %" PRIu32 " record(s) of the %s ring to %s", collected,
+                active->name, path);
   }
 
   return ESP_OK;
@@ -1461,6 +1515,8 @@ typedef struct
 {
   loggerMeterRing_t ring;
   FILE* file;
+  const char* relativeName;
+  bool newestFirst;
   uint32_t* outRecords;
   SemaphoreHandle_t done;
   esp_err_t outcome;
@@ -1470,7 +1526,8 @@ static void exportRingTask(void* argument)
 {
   ExportJob* job = (ExportJob*)argument;
 
-  job->outcome = exportRingFile(job->ring, job->file, job->outRecords);
+  job->outcome =
+      exportRingFile(job->ring, job->file, job->relativeName, job->newestFirst, job->outRecords);
   xSemaphoreGive(job->done);
   vTaskDelete(NULL);
 }
@@ -1478,7 +1535,8 @@ static void exportRingTask(void* argument)
 //-- Shared task dance of both exports: the walk runs on its own task (the
 //-- component asks for a generous stack for any task driving the ring
 //-- cursor) while the calling task waits on the semaphore.
-static esp_err_t runExportJob(loggerMeterRing_t ring, FILE* file, uint32_t* outRecords)
+static esp_err_t runExportJob(loggerMeterRing_t ring, FILE* file, const char* relativeName,
+                              bool newestFirst, uint32_t* outRecords)
 {
   SemaphoreHandle_t done = xSemaphoreCreateBinary();
 
@@ -1490,6 +1548,8 @@ static esp_err_t runExportJob(loggerMeterRing_t ring, FILE* file, uint32_t* outR
   ExportJob job;
   job.ring = ring;
   job.file = file;
+  job.relativeName = relativeName;
+  job.newestFirst = newestFirst;
   job.outRecords = outRecords;
   job.done = done;
   job.outcome = ESP_FAIL;
@@ -1498,7 +1558,7 @@ static esp_err_t runExportJob(loggerMeterRing_t ring, FILE* file, uint32_t* outR
                   STORE_EXPORT_TASK_PRIORITY, NULL) != pdPASS)
   {
     vSemaphoreDelete(done);
-    ESP_LOGE(tag, "could not create the ring export task");
+    LOGGER_LOGE(tag, "could not create the ring export task");
     return ESP_ERR_NO_MEM;
   }
 
@@ -1508,11 +1568,59 @@ static esp_err_t runExportJob(loggerMeterRing_t ring, FILE* file, uint32_t* outR
   return job.outcome;
 }
 
+//-- Accepted volume name of a ring2csv export: a plain file name at the
+//-- volume root, never empty, never hidden, never climbing out of the
+//-- volume. A missing ".csv" suffix is appended so every export stays a csv
+//-- the populate command will accept. The final name lands in outName.
+static bool exportNameUsable(const char* requested, char* outName, size_t outSize)
+{
+  if ((requested == NULL) || (outName == NULL) || (outSize == 0u) || (requested[0] == '\0') ||
+      (requested[0] == '.') || (strchr(requested, '/') != NULL) ||
+      (strchr(requested, '\\') != NULL) || (strstr(requested, "..") != NULL))
+  {
+    return false;
+  }
+
+  size_t length = strlen(requested);
+
+  if ((length >= 4u) && (strcasecmp(requested + length - 4u, ".csv") == 0))
+  {
+    if (length >= outSize)
+    {
+      return false;
+    }
+
+    snprintf(outName, outSize, "%s", requested);
+  }
+  else
+  {
+    if ((length + 4u) >= outSize)
+    {
+      return false;
+    }
+
+    snprintf(outName, outSize, "%s.csv", requested);
+  }
+
+  return true;
+}
+
 esp_err_t loggerStoreRingToCsv(loggerMeterRing_t ring, uint32_t* outRecords)
+{
+  return loggerStoreRingToCsvNamed(ring, NULL, outRecords, NULL, 0u);
+}
+
+esp_err_t loggerStoreRingToCsvNamed(loggerMeterRing_t ring, const char* relativePath,
+                                    uint32_t* outRecords, char* outFileName, size_t outFileNameSize)
 {
   if ((ring < LOGGER_RING_HOURS) || (ring >= LOGGER_RING_COUNT))
   {
     return ESP_ERR_INVALID_ARG;
+  }
+
+  if (outFileName != NULL)
+  {
+    outFileName[0] = '\0';
   }
 
   if (outRecords != NULL)
@@ -1525,7 +1633,30 @@ esp_err_t loggerStoreRingToCsv(loggerMeterRing_t ring, uint32_t* outRecords)
     return ESP_ERR_INVALID_STATE;
   }
 
-  return runExportJob(ring, NULL, outRecords);
+  char name[STORE_IMPORT_PATH_BYTES];
+
+  if ((relativePath != NULL) && (relativePath[0] != '\0'))
+  {
+    if (!exportNameUsable(relativePath, name, sizeof name))
+    {
+      return ESP_ERR_INVALID_ARG;
+    }
+  }
+  else
+  {
+    //-- Default export name: the wall-clock stamp plus the ring selector,
+    //-- so exports land side by side instead of overwriting one file.
+    exportDefaultName(ring, name, sizeof name);
+  }
+
+  if ((outFileName != NULL) && (outFileNameSize > 0u))
+  {
+    snprintf(outFileName, outFileNameSize, "%s", name);
+  }
+
+  //-- The volume file is written newest period first (the console's ring2csv
+  //-- spelling); the import accepts either order.
+  return runExportJob(ring, NULL, name, true, outRecords);
 }
 
 esp_err_t loggerStoreRingToCsvText(loggerMeterRing_t ring, char** outText, uint32_t* outRecords)
@@ -1558,7 +1689,9 @@ esp_err_t loggerStoreRingToCsvText(loggerMeterRing_t ring, char** outText, uint3
     return ESP_ERR_NO_MEM;
   }
 
-  esp_err_t outcome = runExportJob(ring, stream, outRecords);
+  //-- The download keeps its historic oldest-first row order (the volume
+  //-- export prints newest first).
+  esp_err_t outcome = runExportJob(ring, stream, NULL, false, outRecords);
   bool writeFailed = (ferror(stream) != 0);
   fclose(stream);
 
@@ -1586,7 +1719,7 @@ static bool storeSnapshot(uint64_t* outTimeStamp)
 
   if (!currentTimeStamp(&timeStamp))
   {
-    ESP_LOGI(tag, "wall clock not synchronised yet, ring snapshot postponed");
+    LOGGER_LOGI(tag, "wall clock not synchronised yet, ring snapshot postponed");
     return false;
   }
 
@@ -1643,8 +1776,8 @@ static bool storeSnapshot(uint64_t* outTimeStamp)
 
     if (result != ESP_OK)
     {
-      ESP_LOGW(tag, "%s ring record for key %" PRIu64 " refused: %s", rings[ring].name, ringKey,
-               esp_err_to_name(result));
+      LOGGER_LOGW(tag, "%s ring record for key %" PRIu64 " refused: %s", rings[ring].name, ringKey,
+                  esp_err_to_name(result));
     }
 
     if (ring == LOGGER_RING_HOURS)
@@ -1658,14 +1791,14 @@ static bool storeSnapshot(uint64_t* outTimeStamp)
   //-- (import, export and gas), nc is the hour ring's share of the network
   //-- and transport month amount and the tariff is the indicator the meter
   //-- published (0 when it named none).
-  ESP_LOGI(tag,
-           "stored h=%08" PRIu64 " edT1=%8.3f edT2=%8.3f erT1=%8.3f erT2=%8.3f "
-           "gas=%8.3f ti=%5.2f te=%5.2f tg=%5.2f nc=%6.3f tariff=%u%s",
-           hourKey, record.energyDeliveredTariff1Kwh, record.energyDeliveredTariff2Kwh,
-           record.energyReturnedTariff1Kwh, record.energyReturnedTariff2Kwh, record.gasDeliveredM3,
-           logged.tariffAmountImportEuro, logged.tariffAmountExportEuro, logged.tariffAmountGasEuro,
-           logged.networkCostsEuro, (unsigned)tariffIndicator,
-           telegramSeen ? "" : " (no telegram yet)");
+  LOGGER_LOGI(tag,
+              "stored h=%08" PRIu64 " edT1=%8.3f edT2=%8.3f erT1=%8.3f erT2=%8.3f "
+              "gas=%8.3f ti=%5.2f te=%5.2f tg=%5.2f nc=%6.3f tariff=%u%s",
+              hourKey, record.energyDeliveredTariff1Kwh, record.energyDeliveredTariff2Kwh,
+              record.energyReturnedTariff1Kwh, record.energyReturnedTariff2Kwh,
+              record.gasDeliveredM3, logged.tariffAmountImportEuro, logged.tariffAmountExportEuro,
+              logged.tariffAmountGasEuro, logged.networkCostsEuro, (unsigned)tariffIndicator,
+              telegramSeen ? "" : " (no telegram yet)");
 
   *outTimeStamp = timeStamp;
   return true;
@@ -1681,12 +1814,16 @@ static void syncRings(uint64_t hourKey)
 
     if (result != ESP_OK)
     {
-      ESP_LOGW(tag, "could not synchronize the %s ring: %s", rings[ring].name,
-               esp_err_to_name(result));
+      LOGGER_LOGW(tag, "could not synchronize the %s ring: %s", rings[ring].name,
+                  esp_err_to_name(result));
     }
   }
 
-  ESP_LOGI(tag, "hour %08" PRIu64 ": all ring files synchronized", hourKey);
+  LOGGER_LOGI(tag, "hour %08" PRIu64 ": all ring files synchronized", hourKey);
+
+  //-- The verbose console hears the same news the serial log gets.
+  loggerControlConsoleEvent(LOGGER_VERBOSE_EVENTS, LOGGER_CONSOLE_EVENT,
+                            "store: all ring files synchronized (hour %08" PRIu64 ")", hourKey);
 }
 
 static void storeTask(void* argument)
@@ -1695,7 +1832,7 @@ static void storeTask(void* argument)
 
   if (!openMeterRings())
   {
-    ESP_LOGE(tag, "meter store stays disabled");
+    LOGGER_LOGE(tag, "meter store stays disabled");
     vTaskDelete(NULL);
     return;
   }
@@ -1709,7 +1846,17 @@ static void storeTask(void* argument)
 
   for (;;)
   {
-    vTaskDelay(pdMS_TO_TICKS(STORE_RECORD_INTERVAL_MS));
+    //-- The minute tick is a semaphore timeout so the console's sync command
+    //-- can wake the task early: a give makes the very next iteration run
+    //-- (which, with the request flag set, also commits the rings).
+    if (storeWakeSem != NULL)
+    {
+      xSemaphoreTake(storeWakeSem, pdMS_TO_TICKS(STORE_RECORD_INTERVAL_MS));
+    }
+    else
+    {
+      vTaskDelay(pdMS_TO_TICKS(STORE_RECORD_INTERVAL_MS));
+    }
 
     uint64_t timeStamp = 0u;
 
@@ -1745,7 +1892,12 @@ static void storeTask(void* argument)
     uint64_t nowMs = (uint64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
     uint64_t syncPeriodMs = (uint64_t)settings.rfsSyncIntervalMinutes * 60000u;
 
-    if (syncedOnce && ((nowMs - lastSyncMs) < syncPeriodMs))
+    //-- A console sync overrides the interval timer; the commit below then
+    //-- restarts the interval from this moment (lastSyncMs is re-stamped).
+    bool forcedSync = syncRequested;
+    syncRequested = false;
+
+    if (syncedOnce && !forcedSync && ((nowMs - lastSyncMs) < syncPeriodMs))
     {
       continue;
     }
@@ -1753,6 +1905,13 @@ static void storeTask(void* argument)
     syncRings(hourKey);
     lastSyncMs = nowMs;
     syncedOnce = true;
+
+    //-- The staged records have reached storage: release a waiter of the
+    //-- console's restart (loggerStoreRequestSyncAndWait).
+    if (syncDoneSem != NULL)
+    {
+      xSemaphoreGive(syncDoneSem);
+    }
   }
 }
 
@@ -1829,7 +1988,7 @@ esp_err_t loggerStoreListFiles(loggerStoreFileVisitor visitor, void* userData)
 
   if (directory == NULL)
   {
-    ESP_LOGW(tag, "could not open the volume directory: errno %d", errno);
+    LOGGER_LOGW(tag, "could not open the volume directory: errno %d", errno);
     return ESP_FAIL;
   }
 
@@ -1872,14 +2031,76 @@ esp_err_t loggerStoreListFiles(loggerStoreFileVisitor visitor, void* userData)
 
 esp_err_t loggerStoreInit(void)
 {
+  //-- The wake source of the manual sync (created once, kept for life): a
+  //-- give pulls the store task out of its minute sleep right away.
+  if (storeWakeSem == NULL)
+  {
+    storeWakeSem = xSemaphoreCreateBinary();
+
+    if (storeWakeSem == NULL)
+    {
+      LOGGER_LOGE(tag, "could not create the store wake semaphore");
+      return ESP_ERR_NO_MEM;
+    }
+  }
+
+  if (syncDoneSem == NULL)
+  {
+    syncDoneSem = xSemaphoreCreateBinary();
+
+    if (syncDoneSem == NULL)
+    {
+      LOGGER_LOGE(tag, "could not create the store sync-done semaphore");
+      return ESP_ERR_NO_MEM;
+    }
+  }
+
   BaseType_t created =
       xTaskCreate(storeTask, "meterStore", STORE_TASK_STACK_BYTES, NULL, STORE_TASK_PRIORITY, NULL);
 
   if (created != pdPASS)
   {
-    ESP_LOGE(tag, "could not create the meter store task");
+    LOGGER_LOGE(tag, "could not create the meter store task");
     return ESP_ERR_NO_MEM;
   }
 
   return ESP_OK;
+}
+
+bool loggerStoreRequestSync(void)
+{
+  //-- The store task must be up with its rings open for a commit to happen.
+  if ((storeWakeSem == NULL) || (rings[LOGGER_RING_HOURS].handle == NULL))
+  {
+    return false;
+  }
+
+  syncRequested = true;
+  xSemaphoreGive(storeWakeSem);
+  return true;
+}
+
+bool loggerStoreRequestSyncAndWait(uint32_t timeoutMs)
+{
+  //-- Same entry conditions as the plain request; the completion token must
+  //-- exist too (the store task gives it after every commit).
+  if ((storeWakeSem == NULL) || (syncDoneSem == NULL) || (rings[LOGGER_RING_HOURS].handle == NULL))
+  {
+    return false;
+  }
+
+  //-- Drop a token an earlier commit may have left behind: only a commit
+  //-- completing from this moment on may release the wait below.
+  xSemaphoreTake(syncDoneSem, 0);
+
+  if (!loggerStoreRequestSync())
+  {
+    return false;
+  }
+
+  //-- The store task wakes, takes one more snapshot and commits all three
+  //-- rings; the token arrives when that commit has completed. A store task
+  //-- that cannot deliver (wall clock not synchronised yet) only costs the
+  //-- caller the timeout.
+  return (xSemaphoreTake(syncDoneSem, pdMS_TO_TICKS(timeoutMs)) == pdTRUE);
 }

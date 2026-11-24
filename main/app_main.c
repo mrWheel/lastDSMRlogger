@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: app_main.c - application entry
-//-- Date: 2026-11-23 · Build: 18
+//-- Date: 2026-11-23 · Build: 19
 //--
 //-- Boot order: the board debug lines come up first, then NVS, then the P1
 //-- receiver. Reception starts as soon as a valid configuration is stored and
@@ -14,7 +14,7 @@
 
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
-const char* PROG_VERSION = "v0.5.18";
+static const char* PROG_VERSION = "v0.5.19";
 
 #include <stdio.h>
 #include <string.h>
@@ -97,8 +97,8 @@ static void announceMdns(const char* hostname)
 
     if (result != ESP_OK)
     {
-      ESP_LOGW(tag, "mDNS could not start yet: %s (retrying at the next application)",
-               esp_err_to_name(result));
+      LOGGER_LOGW(tag, "mDNS could not start yet: %s (retrying at the next application)",
+                  esp_err_to_name(result));
       return;
     }
 
@@ -117,7 +117,8 @@ static void announceMdns(const char* hostname)
 
   if (serviceResult != ESP_OK)
   {
-    ESP_LOGW(tag, "mDNS _http._tcp service could not be added: %s", esp_err_to_name(serviceResult));
+    LOGGER_LOGW(tag, "mDNS _http._tcp service could not be added: %s",
+                esp_err_to_name(serviceResult));
   }
 }
 
@@ -147,7 +148,7 @@ static void applyNetworkIdentity(const loggerSettingsConfig* config, bool connec
 
   if (hostnameChanged && (esp_netif_set_hostname(station, wanted) != ESP_OK))
   {
-    ESP_LOGW(tag, "hostname '%s' could not be set", wanted);
+    LOGGER_LOGW(tag, "hostname '%s' could not be set", wanted);
   }
 
   //-- The very same name travels over mDNS (see announceMdns): the lease
@@ -184,11 +185,11 @@ static void applyNetworkIdentity(const loggerSettingsConfig* config, bool connec
       if (esp_netif_set_ip_info(station, &ipInfo) == ESP_OK)
       {
         fixedIpApplied = true;
-        ESP_LOGI(tag, "station fixed to " IPSTR " (DHCP released)", IP2STR(&ipInfo.ip));
+        LOGGER_LOGI(tag, "station fixed to " IPSTR " (DHCP released)", IP2STR(&ipInfo.ip));
       }
       else
       {
-        ESP_LOGW(tag, "fixed IP could not be set, staying on DHCP");
+        LOGGER_LOGW(tag, "fixed IP could not be set, staying on DHCP");
         esp_netif_dhcpc_start(station);
         fixedIpApplied = false;
       }
@@ -208,7 +209,7 @@ static void applyNetworkIdentity(const loggerSettingsConfig* config, bool connec
 
     esp_netif_dhcpc_start(station);
     fixedIpApplied = false;
-    ESP_LOGI(tag, "fixed IP withdrawn, the station is on DHCP again");
+    LOGGER_LOGI(tag, "fixed IP withdrawn, the station is on DHCP again");
   }
   else if (hostnameChanged)
   {
@@ -248,7 +249,7 @@ static volatile bool sntpStarted = false;
 static void onSntpSynced(struct timeval* tv)
 {
   (void)tv;
-  ESP_LOGI(tag, "clock synchronised via %s", SNTP_SERVER);
+  LOGGER_LOGI(tag, "clock synchronised via %s", SNTP_SERVER);
 }
 
 //-- The SMB share exposes the meter store's mounted LittleFS volume to the
@@ -271,7 +272,7 @@ static void startSmbShare(void)
 
   if (mountPoint == NULL)
   {
-    ESP_LOGW(tag, "storage volume not mounted, the SMB share stays off");
+    LOGGER_LOGW(tag, "storage volume not mounted, the SMB share stays off");
     return;
   }
 
@@ -284,12 +285,12 @@ static void startSmbShare(void)
 
   if (result != ESP_OK)
   {
-    ESP_LOGE(tag, "SMB share could not start: %s", esp_err_to_name(result));
+    LOGGER_LOGE(tag, "SMB share could not start: %s", esp_err_to_name(result));
     return;
   }
 
-  ESP_LOGI(tag, "SMB share '%s' open on port %u (read/write, guest access)", config.share_name,
-           (unsigned)config.port);
+  LOGGER_LOGI(tag, "SMB share '%s' open on port %u (read/write, guest access)", config.share_name,
+              (unsigned)config.port);
 }
 
 static void onWifiConnected(void)
@@ -309,7 +310,7 @@ static void onWifiConnected(void)
 
     if (esp_netif_sntp_init(&sntpConfig) != ESP_OK)
     {
-      ESP_LOGW(tag, "SNTP could not start: the header clock stays unavailable");
+      LOGGER_LOGW(tag, "SNTP could not start: the header clock stays unavailable");
     }
   }
 
@@ -331,7 +332,7 @@ static void onWifiConnected(void)
   }
 
   loggerBoardWifiConnected(ssid, ip);
-  ESP_LOGI(tag, "station joined '%s' with IP %s, SPA reachable there", ssid, ip);
+  LOGGER_LOGI(tag, "station joined '%s' with IP %s, SPA reachable there", ssid, ip);
 
   //-- The station now has a lease: announce the stored hostname and, when a
   //-- fixed last octet is configured, pin the address on top of the lease.
@@ -352,11 +353,11 @@ static void onWifiConnected(void)
 
   if (telnetStarted != ESP_OK)
   {
-    ESP_LOGE(tag, "telnet console could not start: %s", esp_err_to_name(telnetStarted));
+    LOGGER_LOGE(tag, "telnet console could not start: %s", esp_err_to_name(telnetStarted));
   }
   else
   {
-    ESP_LOGI(tag, "telnet console open on port 23");
+    LOGGER_LOGI(tag, "telnet console open on port 23");
   }
 
   startSmbShare();
@@ -365,7 +366,7 @@ static void onWifiConnected(void)
 static void onWifiPortalStart(void)
 {
   loggerBoardWifiPortal("http://192.168.4.1/");
-  ESP_LOGI(tag, "captive portal open: connect to the setup AP and visit http://192.168.4.1/");
+  LOGGER_LOGI(tag, "captive portal open: connect to the setup AP and visit http://192.168.4.1/");
 }
 
 static void wifiTask(void* argument)
@@ -381,7 +382,7 @@ static void wifiTask(void* argument)
 
   if (result != ESP_OK)
   {
-    ESP_LOGE(tag, "provisioner start failed: %s", esp_err_to_name(result));
+    LOGGER_LOGE(tag, "provisioner start failed: %s", esp_err_to_name(result));
   }
 
   //-- Keep the link up: the provisioner unregisters its retry handler after
@@ -394,7 +395,7 @@ static void wifiTask(void* argument)
 
     if (wifiEverConnected && !wifi_prov_is_connected())
     {
-      ESP_LOGW(tag, "station disconnected, requesting a reconnect");
+      LOGGER_LOGW(tag, "station disconnected, requesting a reconnect");
 
       //-- Publication goes down with the link: without a station there is
       //-- no route to the broker. onWifiConnected releases it again.
@@ -424,7 +425,7 @@ static void wifiTask(void* argument)
 
           if (station != NULL)
           {
-            ESP_LOGI(tag, "re-announcing the hostname to DHCP");
+            LOGGER_LOGI(tag, "re-announcing the hostname to DHCP");
             esp_netif_dhcpc_stop(station);
             esp_netif_dhcpc_start(station);
           }
@@ -440,12 +441,21 @@ static void initialiseNvs(void)
 
   if ((result == ESP_ERR_NVS_NO_FREE_PAGES) || (result == ESP_ERR_NVS_NEW_VERSION_FOUND))
   {
-    ESP_LOGW(tag, "NVS unusable, erasing and reinitialising");
+    LOGGER_LOGW(tag, "NVS unusable, erasing and reinitialising");
     ESP_ERROR_CHECK(nvs_flash_erase());
     result = nvs_flash_init();
   }
 
   ESP_ERROR_CHECK(result);
+}
+
+//-- Read-only accessor for the firmware version. The components read the
+//-- version through this getter instead of extern-ing the global PROG_VERSION,
+//-- which keeps the application string static and free of any name clash with
+//-- a component that defines a PROG_VERSION of its own.
+const char* getAppVersion(void)
+{
+  return PROG_VERSION;
 }
 
 void app_main(void)
@@ -458,8 +468,8 @@ void app_main(void)
   esp_log_level_set("loggerTariffs", ESP_LOG_INFO);
   esp_log_level_set("loggerTelnet", ESP_LOG_INFO);
 
-  ESP_LOGI(tag, "lastDSMRlogger %s starting", PROG_VERSION);
-  ESP_LOGI(tag, "parserDSMR library version %s", dsmrParserVersion());
+  LOGGER_LOGI(tag, "lastDSMRlogger %s starting", PROG_VERSION);
+  LOGGER_LOGI(tag, "parserDSMR library version %s", dsmrParserVersion());
 
   loggerBoardInit();
   loggerBoardShowScreen("boot");
@@ -490,7 +500,8 @@ void app_main(void)
 
     if (started != ESP_OK)
     {
-      ESP_LOGE(tag, "receiver could not start with stored settings: %s", esp_err_to_name(started));
+      LOGGER_LOGE(tag, "receiver could not start with stored settings: %s",
+                  esp_err_to_name(started));
     }
 
     //-- The network identity takes the stored hostname (the fixed IP waits
@@ -503,7 +514,7 @@ void app_main(void)
   }
   else
   {
-    ESP_LOGI(tag, "no valid stored settings, awaiting configuration");
+    LOGGER_LOGI(tag, "no valid stored settings, awaiting configuration");
   }
 
   //-- The settings view notifies this application after a complete save so
@@ -517,7 +528,7 @@ void app_main(void)
 
   if (storeStarted != ESP_OK)
   {
-    ESP_LOGE(tag, "meter store could not start: %s", esp_err_to_name(storeStarted));
+    LOGGER_LOGE(tag, "meter store could not start: %s", esp_err_to_name(storeStarted));
   }
 
   //-- The dynamic electricity tariffs: shared ingestion for the MQTT
@@ -527,7 +538,7 @@ void app_main(void)
 
   if (tariffsStarted != ESP_OK)
   {
-    ESP_LOGE(tag, "tariffs could not start: %s", esp_err_to_name(tariffsStarted));
+    LOGGER_LOGE(tag, "tariffs could not start: %s", esp_err_to_name(tariffsStarted));
   }
   else
   {
@@ -541,7 +552,7 @@ void app_main(void)
 
   if (created != pdPASS)
   {
-    ESP_LOGE(tag, "could not create the Wi-Fi provisioner task");
+    LOGGER_LOGE(tag, "could not create the Wi-Fi provisioner task");
   }
 
   loggerBoardShowScreen("ready");

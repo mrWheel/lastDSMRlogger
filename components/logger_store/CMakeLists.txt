@@ -4,5 +4,5 @@
 idf_component_register(
   SRCS "logger_store.c"
   INCLUDE_DIRS "include"
-  REQUIRES ring_file_store littlefs logger_receiver logger_settings
+  REQUIRES ring_file_store littlefs logger_receiver logger_settings logger_control
 )

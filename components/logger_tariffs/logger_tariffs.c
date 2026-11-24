@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_tariffs.c - dynamic electricity tariff schedules
-//-- Date: 2026-11-23 · Build: 3
+//-- Date: 2026-11-24 · Build: 6
 //--
 //-- One sorted interval array in PSRAM is the live schedule; the same
 //-- content lands in a binary file on the meter store's LittleFS volume so
@@ -47,6 +47,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "logger_control.h"
 #include "logger_settings.h"
 #include "logger_store.h"
 
@@ -488,7 +489,7 @@ static bool persistSchedule(const loggerTariffInterval* intervals, size_t count)
 {
   if (loggerStoreMountPoint() == NULL)
   {
-    ESP_LOGW(tag, "storage volume is not mounted, the schedule stays in RAM only");
+    LOGGER_LOGW(tag, "storage volume is not mounted, the schedule stays in RAM only");
     return false;
   }
 
@@ -497,7 +498,7 @@ static bool persistSchedule(const loggerTariffInterval* intervals, size_t count)
 
   if (payload == NULL)
   {
-    ESP_LOGE(tag, "could not serialise the tariff schedule");
+    LOGGER_LOGE(tag, "could not serialise the tariff schedule");
     return false;
   }
 
@@ -523,7 +524,7 @@ static bool persistSchedule(const loggerTariffInterval* intervals, size_t count)
 
   if (!stored)
   {
-    ESP_LOGE(tag, "could not write %s", temporaryPath);
+    LOGGER_LOGE(tag, "could not write %s", temporaryPath);
     remove(temporaryPath);
     return false;
   }
@@ -532,7 +533,7 @@ static bool persistSchedule(const loggerTariffInterval* intervals, size_t count)
   //-- schedule stays readable until the rename lands.
   if (rename(temporaryPath, finalPath) != 0)
   {
-    ESP_LOGE(tag, "could not rename the tariff schedule into place");
+    LOGGER_LOGE(tag, "could not rename the tariff schedule into place");
     remove(temporaryPath);
     return false;
   }
@@ -581,7 +582,7 @@ static void ensureLoaded(void)
 
   if ((fileSize < 0) || ((size_t)fileSize > capacity))
   {
-    ESP_LOGW(tag, "tariff schedule file has an implausible size, starting empty");
+    LOGGER_LOGW(tag, "tariff schedule file has an implausible size, starting empty");
     fclose(file);
     storeCount = 0u;
     return;
@@ -591,7 +592,7 @@ static void ensureLoaded(void)
 
   if (payload == NULL)
   {
-    ESP_LOGE(tag, "out of memory reading the tariff schedule");
+    LOGGER_LOGE(tag, "out of memory reading the tariff schedule");
     fclose(file);
     return;
   }
@@ -612,7 +613,7 @@ static void ensureLoaded(void)
   //-- are imported-price intervals) and a different presence byte shape.
   if (!headerOk || ((fileVersion != 1u) && (fileVersion != (uint16_t)TARIFF_FILE_VERSION)))
   {
-    ESP_LOGW(tag, "tariff schedule file is not readable, starting empty");
+    LOGGER_LOGW(tag, "tariff schedule file is not readable, starting empty");
     free(payload);
     storeCount = 0u;
     return;
@@ -714,7 +715,7 @@ static void ensureLoaded(void)
 
   if (!valid || (position != (size_t)fileSize))
   {
-    ESP_LOGW(tag, "tariff schedule file failed validation, starting empty");
+    LOGGER_LOGW(tag, "tariff schedule file failed validation, starting empty");
     free(payload);
     storeCount = 0u;
     return;
@@ -725,7 +726,7 @@ static void ensureLoaded(void)
   storeCurrency(storedCurrency);
   free(payload);
 
-  ESP_LOGI(tag, "loaded %u tariff interval(s) from %s", (unsigned)loadedCount, path);
+  LOGGER_LOGI(tag, "loaded %u tariff interval(s) from %s", (unsigned)loadedCount, path);
 }
 
 //-- --------------------------------------------------------------------------
@@ -1198,8 +1199,8 @@ loggerTariffIngestResult_t loggerTariffsIngestJson(const char* json, size_t leng
     storeCount = candidateCount;
     storeCurrency(newCurrency);
 
-    ESP_LOGI(tag, "accepted %u interval(s) via %s, %u stored, currency %s", (unsigned)count,
-             (source != NULL ? source : "unknown"), (unsigned)storeCount, currency);
+    LOGGER_LOGI(tag, "accepted %u interval(s) via %s, %u stored, currency %s", (unsigned)count,
+                (source != NULL ? source : "unknown"), (unsigned)storeCount, currency);
   }
 
   xSemaphoreGive(tariffsMutex);
@@ -1207,6 +1208,21 @@ loggerTariffIngestResult_t loggerTariffsIngestJson(const char* json, size_t leng
   if (result != LOGGER_TARIFF_OK)
   {
     snprintf(reasonOut, reasonSize, "%s", reason);
+  }
+
+  //-- The verbose console hears every schedule update, accepted or refused,
+  //-- with the source that delivered it (MQTT or the HTTP API).
+  if (result == LOGGER_TARIFF_OK)
+  {
+    loggerControlConsoleEvent(LOGGER_VERBOSE_EVENTS, LOGGER_CONSOLE_EVENT,
+                              "tariffs: schedule accepted via %s (%u interval(s))",
+                              (source != NULL) ? source : "unknown", (unsigned)count);
+  }
+  else
+  {
+    loggerControlConsoleEvent(LOGGER_VERBOSE_EVENTS, LOGGER_CONSOLE_ERROR,
+                              "tariffs: schedule refused via %s - %s",
+                              (source != NULL) ? source : "unknown", reason);
   }
 
   return result;
@@ -1913,8 +1929,8 @@ esp_err_t loggerTariffsInit(void)
     hooksInstalled = true;
   }
 
-  ESP_LOGI(tag, "dynamic tariffs ready (batch %u, stored %u, document %u bytes)",
-           (unsigned)LOGGER_TARIFF_BATCH_MAX, (unsigned)LOGGER_TARIFF_STORED_MAX,
-           (unsigned)LOGGER_TARIFF_JSON_MAX_BYTES);
+  LOGGER_LOGI(tag, "dynamic tariffs ready (batch %u, stored %u, document %u bytes)",
+              (unsigned)LOGGER_TARIFF_BATCH_MAX, (unsigned)LOGGER_TARIFF_STORED_MAX,
+              (unsigned)LOGGER_TARIFF_JSON_MAX_BYTES);
   return ESP_OK;
 }
