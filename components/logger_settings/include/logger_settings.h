@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.h - versioned settings service
-//-- Date: 2026-11-24 · Build: 11
+//-- Date: 2026-11-24 · Build: 14
 //--
 //-- The settings service stores the complete versioned configuration in
 //-- ESP-IDF NVS, validates it against the parserDSMR built-in profiles and
@@ -91,6 +91,15 @@ typedef enum
 //-- import tariff prices gained their import/export names (identical layout,
 //-- names only). Blobs of any earlier size migrate on load: the appended
 //-- prices get their default, so no save is required after updating.
+//-- Version 5 (extended a sixth time): the TFT display time-out in minutes
+//-- was appended at the end of the struct. Blobs of any earlier size
+//-- migrate on load: the appended field gets its default, so no save is
+//-- required after updating.
+//-- Version 5 (extended a seventh time): the board display mode was
+//-- appended at the end of the struct (true drives the piggyback board,
+//-- false selects "No Display"). Blobs of any earlier size migrate on
+//-- load: the appended field gets its default (the piggyback board), so no
+//-- save is required after updating.
 #define LOGGER_SETTINGS_VERSION 5u
 #define LOGGER_SETTINGS_PROFILE_ID_MAX 32
 #define LOGGER_SETTINGS_COUNTRY_MAX 3
@@ -116,6 +125,15 @@ typedef enum
 #define LOGGER_SETTINGS_RFS_SYNC_MIN_MINUTES 1u
 #define LOGGER_SETTINGS_RFS_SYNC_MAX_MINUTES 60u
 #define LOGGER_SETTINGS_RFS_SYNC_DEFAULT_MINUTES 10u
+
+//-- TFT display time-out in minutes: the panel backlight goes off this many
+//-- minutes after the last physical button action on the board (an encoder
+//-- turn or a button press). The AUX button lights the panel again and
+//-- restarts the timer. The setting lives in the Display group of the
+//-- settings view.
+#define LOGGER_SETTINGS_DISPLAY_TIMEOUT_MIN_MINUTES 1u
+#define LOGGER_SETTINGS_DISPLAY_TIMEOUT_MAX_MINUTES 60u
+#define LOGGER_SETTINGS_DISPLAY_TIMEOUT_DEFAULT_MINUTES 10u
 
 //-- Bounds of the manual tariff prices in EUR per kWh (the import and the
 //-- export price of both energy tariffs) and EUR per m³ (gas). Negative
@@ -268,6 +286,33 @@ typedef struct
   //-- applies; the dynamic table's export price overrides both when present.
   float tariff1ExportPricePerKwh;
   float tariff2ExportPricePerKwh;
+
+  //-- ------------------------------------------------------------------------
+  //-- TFT display time-out (appended with the sixth version 5 extension;
+  //-- older blobs leave this at its default)
+  //-- ------------------------------------------------------------------------
+
+  //-- Minutes of physical inactivity before the panel backlight goes off
+  //-- (LOGGER_SETTINGS_DISPLAY_TIMEOUT_MIN_MINUTES through
+  //-- LOGGER_SETTINGS_DISPLAY_TIMEOUT_MAX_MINUTES). Any board button action
+  //-- restarts the timer; an AUX press wakes the panel again.
+  uint16_t displayTimeoutMinutes;
+
+  //-- ------------------------------------------------------------------------
+  //-- Board display mode (appended with the seventh version 5 extension;
+  //-- older blobs leave this at its default)
+  //-- ------------------------------------------------------------------------
+
+  //-- True drives the piggyback board ("Piggyback board"): the panel shows
+  //-- the debug lines and the power screens and the encoder and buttons are
+  //-- handled. False selects "No Display": the panel is never initialised,
+  //-- the backlight stays off and the board inputs are not started.
+  bool displayEnabled;
+
+  //-- Explicit filler so the blob size grows with the mode flag: without it
+  //-- the flag hides in the padding the uint16_t time-out already left behind
+  //-- and an up-to-date blob would look exactly like a pre-mode blob.
+  uint8_t displayModePadding[3];
 } loggerSettingsConfig;
 
 //-- Loads the stored configuration and validates it. Returns ESP_ERR_NOT_FOUND
@@ -291,7 +336,8 @@ esp_err_t loggerSettingsSave(const loggerSettingsConfig* config);
 //-- at the given absolute path: one "[section]" header per group of the
 //-- settings view, then one "key = value" line per settings field (text
 //-- quoted, numbers plain). The fields: [p1port] dataSource, P1RXPolarity,
-//-- P1TXPolarity, interval, country and profile; [display] orientation;
+//-- P1TXPolarity, interval, country and profile; [display] board
+//-- (piggyback or none), orientation and timeoutMinutes;
 //-- [mbus] channel1 through channel4 (auto, disabled or a device type);
 //-- [mqtt] brokerUrl, brokerPort, user, password, topTopic, clientId,
 //-- subTopic and broadcastInterval; [network] hostname and fixedIpLastOctet;

@@ -1,10 +1,14 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: app_main.c - application entry
-//-- Date: 2026-11-23 · Build: 19
+//-- Date: 2026-11-25 · Build: 23
 //--
-//-- Boot order: the board debug lines come up first, then NVS, then the P1
-//-- receiver. Reception starts as soon as a valid configuration is stored and
+//-- Boot order: NVS comes up first and the stored settings are read, because
+//-- the stored display mode decides whether the board stays up ("No Display"
+//-- is brought up for a reliable boot and torn down once the station has
+//-- joined); then the
+//-- board debug lines (when enabled), then the P1 receiver. Reception
+//-- starts as soon as a valid configuration is stored and
 //-- continues while Wi-Fi is disconnected. The Wi-Fi provisioner runs in its
 //-- own task because its start path blocks while it retries saved credentials;
 //-- the SPA server, the telnet console and the SMB share start after the
@@ -14,7 +18,7 @@
 
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
-static const char* PROG_VERSION = "v0.6.0";
+static const char* PROG_VERSION = "v0.6.1";
 
 #include <stdio.h>
 #include <string.h>
@@ -52,6 +56,11 @@ static const char* tag = "appMain";
 #define WIFI_RECONNECT_POLL_MS 2000
 
 static volatile bool wifiEverConnected = false;
+
+//-- Set when the stored display mode is "No Display": the panel comes up
+//-- for a reliable boot and the tear-down follows the first join (see
+//-- wifiTask and app_main).
+static volatile bool pendingDisplayOff = false;
 
 //-- --------------------------------------------------------------------------
 //-- Network identity and MQTT (settings fields outside the receive path)
@@ -232,6 +241,14 @@ static void onSettingsSaved(const loggerSettingsConfig* config)
 {
   activeNetworkConfig = *config;
 
+  //-- A save that re-enables the display cancels a still-pending deferred
+  //-- "No Display" boot tear-down: the operator explicitly wants the panel
+  //-- up now, so the Wi-Fi task must not switch it off again afterwards.
+  if (config->displayEnabled)
+  {
+    pendingDisplayOff = false;
+  }
+
   //-- The lease work is deferred to the Wi-Fi task: it would abort this
   //-- very save's own reply along with every other open connection.
   applyNetworkIdentity(&activeNetworkConfig, wifi_prov_is_connected(), true);
@@ -393,6 +410,15 @@ static void wifiTask(void* argument)
   {
     vTaskDelay(pdMS_TO_TICKS(WIFI_RECONNECT_POLL_MS));
 
+    //-- "No Display" boot: now that the station has joined, remove the
+    //-- panel and the board inputs again (a tear-down while the network
+    //-- stack is still coming up crashes the logger, so this waits).
+    if (pendingDisplayOff && wifiEverConnected)
+    {
+      pendingDisplayOff = false;
+      loggerBoardSetEnabled(false);
+    }
+
     if (wifiEverConnected && !wifi_prov_is_connected())
     {
       LOGGER_LOGW(tag, "station disconnected, requesting a reconnect");
@@ -471,14 +497,35 @@ void app_main(void)
   LOGGER_LOGI(tag, "lastDSMRlogger %s starting", PROG_VERSION);
   LOGGER_LOGI(tag, "parserDSMR library version %s", dsmrParserVersion());
 
-  loggerBoardInit();
+  initialiseNvs();
+
+  //-- The board is brought up from the stored settings: the display mode
+  //-- decides whether the panel and the board inputs are driven ("No
+  //-- Display" leaves them off). Without stored settings the piggyback
+  //-- board is the default, the boot debug lines being part of the product;
+  //-- a later save can switch the mode without a restart.
+  //--
+  //-- The panel is always brought up while the logger starts: a boot that
+  //-- never drives the panel crashes before the network comes up, so the
+  //-- tear-down of the "No Display" mode waits until the station has
+  //-- joined, when a tear-down is known to be safe (the settings view
+  //-- toggles it the same way at runtime).
+  loggerSettingsConfig settings;
+  bool haveSettings = (loggerSettingsLoad(&settings) == ESP_OK);
+  bool displayEnabled = haveSettings ? settings.displayEnabled : true;
+
+  loggerBoardSetEnabled(true);
+
+  if (!displayEnabled)
+  {
+    pendingDisplayOff = true;
+  }
+
   loggerBoardShowScreen("boot");
 
   //-- The parser library version rides along on the boot debug lines so the
   //-- panel shows which parser build is decoding the telegrams.
   loggerBoardShowParserVersion(dsmrParserVersion());
-
-  initialiseNvs();
 
   //-- The single-operator arbiter for the web and telnet control channels:
   //-- ready before any server can claim control.
@@ -488,13 +535,13 @@ void app_main(void)
 
   //-- On first boot, or when saved settings cannot be loaded, reception
   //-- awaits a valid configuration from the settings view.
-  loggerSettingsConfig settings;
-
-  if (loggerSettingsLoad(&settings) == ESP_OK)
+  if (haveSettings)
   {
-    //-- The panel orientation is part of the stored configuration: apply it
-    //-- before reception takes the screen over.
+    //-- The panel orientation and the idle display time-out are part of the
+    //-- stored configuration: apply them before reception takes the screen
+    //-- over.
     loggerBoardSetRotation(settings.displayFlipped);
+    loggerBoardSetDisplayTimeoutMinutes(settings.displayTimeoutMinutes);
 
     esp_err_t started = loggerReceiverStart(&settings);
 

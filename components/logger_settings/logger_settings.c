@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_settings.c - versioned settings service
-//-- Date: 2026-11-24 · Build: 12
+//-- Date: 2026-11-24 · Build: 14
 //--
 //-- The complete configuration is stored as one versioned blob so a save is
 //-- atomic. A stored blob that fails validation is treated as absent: the
@@ -173,6 +173,79 @@ typedef struct
   char mqttSubTopic[LOGGER_MQTT_TOPIC_MAX];
   float networkCostsPerMonthEuro;
 } loggerSettingsConfigPreExportTariffs;
+
+//-- Layout of the stored blob before the TFT display time-out was appended.
+//-- A stored blob of exactly this size migrates like the five above: its
+//-- fields land in the identical prefix of the current struct and the
+//-- appended time-out gets its default.
+typedef struct
+{
+  uint32_t structVersion;
+  int rxGpio;
+  bool rxInverted;
+  bool txInverted;
+  uint32_t intervalSeconds;
+  char countryCode[LOGGER_SETTINGS_COUNTRY_MAX];
+  char profileId[LOGGER_SETTINGS_PROFILE_ID_MAX];
+  loggerMbusMode mbusMode[DSMR_MBUS_CHANNEL_MAX + 1];
+  dsmrMbusDeviceType mbusType[DSMR_MBUS_CHANNEL_MAX + 1];
+  bool displayFlipped;
+  char mqttBroker[LOGGER_MQTT_BROKER_MAX];
+  uint16_t mqttPort;
+  char mqttUser[LOGGER_MQTT_USER_MAX];
+  char mqttPassword[LOGGER_MQTT_PASSWORD_MAX];
+  char mqttTopTopic[LOGGER_MQTT_TOPIC_MAX];
+  uint32_t mqttIntervalSeconds;
+  char hostname[LOGGER_HOSTNAME_MAX];
+  uint8_t fixedIpLastOctet;
+  uint16_t rfsSyncIntervalMinutes;
+  float tariff1PricePerKwh;
+  float tariff2PricePerKwh;
+  float tariffGasPricePerM3;
+  bool dynamicTariffsEnabled;
+  char mqttClientId[LOGGER_MQTT_CLIENTID_MAX];
+  char mqttSubTopic[LOGGER_MQTT_TOPIC_MAX];
+  float networkCostsPerMonthEuro;
+  float tariff1ExportPricePerKwh;
+  float tariff2ExportPricePerKwh;
+} loggerSettingsConfigPreDisplayTimeout;
+
+//-- Layout of the stored blob before the board display mode was appended.
+//-- A stored blob of exactly this size migrates like the six above: its
+//-- fields land in the identical prefix of the current struct and the
+//-- appended mode gets its default (the piggyback board).
+typedef struct
+{
+  uint32_t structVersion;
+  int rxGpio;
+  bool rxInverted;
+  bool txInverted;
+  uint32_t intervalSeconds;
+  char countryCode[LOGGER_SETTINGS_COUNTRY_MAX];
+  char profileId[LOGGER_SETTINGS_PROFILE_ID_MAX];
+  loggerMbusMode mbusMode[DSMR_MBUS_CHANNEL_MAX + 1];
+  dsmrMbusDeviceType mbusType[DSMR_MBUS_CHANNEL_MAX + 1];
+  bool displayFlipped;
+  char mqttBroker[LOGGER_MQTT_BROKER_MAX];
+  uint16_t mqttPort;
+  char mqttUser[LOGGER_MQTT_USER_MAX];
+  char mqttPassword[LOGGER_MQTT_PASSWORD_MAX];
+  char mqttTopTopic[LOGGER_MQTT_TOPIC_MAX];
+  uint32_t mqttIntervalSeconds;
+  char hostname[LOGGER_HOSTNAME_MAX];
+  uint8_t fixedIpLastOctet;
+  uint16_t rfsSyncIntervalMinutes;
+  float tariff1PricePerKwh;
+  float tariff2PricePerKwh;
+  float tariffGasPricePerM3;
+  bool dynamicTariffsEnabled;
+  char mqttClientId[LOGGER_MQTT_CLIENTID_MAX];
+  char mqttSubTopic[LOGGER_MQTT_TOPIC_MAX];
+  float networkCostsPerMonthEuro;
+  float tariff1ExportPricePerKwh;
+  float tariff2ExportPricePerKwh;
+  uint16_t displayTimeoutMinutes;
+} loggerSettingsConfigPreDisplayMode;
 
 //-- Human readable protocol version labels for the built-in profiles. The
 //-- stable profile identifier is what gets persisted.
@@ -451,6 +524,18 @@ bool loggerSettingsValidate(const loggerSettingsConfig* config)
     return false;
   }
 
+  //-- The TFT display time-out is a whole number of minutes within the
+  //-- documented bounds.
+  if ((config->displayTimeoutMinutes < LOGGER_SETTINGS_DISPLAY_TIMEOUT_MIN_MINUTES) ||
+      (config->displayTimeoutMinutes > LOGGER_SETTINGS_DISPLAY_TIMEOUT_MAX_MINUTES))
+  {
+    LOGGER_LOGW(tag, "rejecting display time-out %u min: outside %u..%u min",
+                (unsigned)config->displayTimeoutMinutes,
+                (unsigned)LOGGER_SETTINGS_DISPLAY_TIMEOUT_MIN_MINUTES,
+                (unsigned)LOGGER_SETTINGS_DISPLAY_TIMEOUT_MAX_MINUTES);
+    return false;
+  }
+
   //-- The five manual tariff prices (the import and export price of both
   //-- energy tariffs and the gas price) must be finite and within the sanity
   //-- bounds; negative prices are valid (negative spot prices occur).
@@ -521,10 +606,12 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
   bool migratedTopic = (blobSize == sizeof(loggerSettingsConfigPreTopic));
   bool migratedCosts = (blobSize == sizeof(loggerSettingsConfigPreNetworkCosts));
   bool migratedExport = (blobSize == sizeof(loggerSettingsConfigPreExportTariffs));
+  bool migratedTimeout = (blobSize == sizeof(loggerSettingsConfigPreDisplayTimeout));
+  bool migratedDisplayMode = (blobSize == sizeof(loggerSettingsConfigPreDisplayMode));
 
-  if ((result != ESP_OK) ||
-      ((blobSize != sizeof(loggerSettingsConfig)) && !migrated && !migratedTariff &&
-       !migratedTopic && !migratedCosts && !migratedExport))
+  if ((result != ESP_OK) || ((blobSize != sizeof(loggerSettingsConfig)) && !migrated &&
+                             !migratedTariff && !migratedTopic && !migratedCosts &&
+                             !migratedExport && !migratedTimeout && !migratedDisplayMode))
   {
     nvs_close(handle);
 
@@ -576,6 +663,20 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
     config->tariff2ExportPricePerKwh = 0.0f;
     LOGGER_LOGI(tag, "stored settings migrated: the export tariff prices take their default");
   }
+  else if (migratedTimeout && (result == ESP_OK))
+  {
+    //-- The stored blob stopped before the display time-out: the documented
+    //-- default keeps the panel on for a sensible while after the last push.
+    config->displayTimeoutMinutes = LOGGER_SETTINGS_DISPLAY_TIMEOUT_DEFAULT_MINUTES;
+    LOGGER_LOGI(tag, "stored settings migrated: the display time-out takes its default");
+  }
+  else if (migratedDisplayMode && (result == ESP_OK))
+  {
+    //-- The stored blob stopped before the board display mode: the default
+    //-- keeps today's behaviour, the piggyback board driving the panel.
+    config->displayEnabled = true;
+    LOGGER_LOGI(tag, "stored settings migrated: the board display mode takes its default");
+  }
 
   if (result != ESP_OK)
   {
@@ -590,10 +691,12 @@ esp_err_t loggerSettingsLoad(loggerSettingsConfig* config)
   }
 
   LOGGER_LOGI(tag,
-              "loaded settings: gpio %d, profile %s, rx polarity %s, tx polarity %s, display %s",
+              "loaded settings: gpio %d, profile %s, rx polarity %s, tx polarity %s, display %s, "
+              "board %s",
               config->rxGpio, config->profileId, config->rxInverted ? "inverted" : "normal",
               config->txInverted ? "inverted" : "normal",
-              config->displayFlipped ? "upside down" : "normal");
+              config->displayFlipped ? "upside down" : "normal",
+              config->displayEnabled ? "piggyback" : "none");
   return ESP_OK;
 }
 
@@ -628,10 +731,12 @@ esp_err_t loggerSettingsSave(const loggerSettingsConfig* config)
   }
 
   LOGGER_LOGI(tag,
-              "stored settings: gpio %d, profile %s, rx polarity %s, tx polarity %s, display %s",
+              "stored settings: gpio %d, profile %s, rx polarity %s, tx polarity %s, display %s, "
+              "board %s",
               config->rxGpio, config->profileId, config->rxInverted ? "inverted" : "normal",
               config->txInverted ? "inverted" : "normal",
-              config->displayFlipped ? "upside down" : "normal");
+              config->displayFlipped ? "upside down" : "normal",
+              config->displayEnabled ? "piggyback" : "none");
   return ESP_OK;
 }
 
@@ -752,7 +857,7 @@ static char* trimText(char* text)
 
 //-- Two-state word token: the file carries words instead of 0/1 (the
 //-- polarities read "normal" or "inverted", the orientation "normal" or
-//-- "upsideDown").
+//-- "upsideDown", the board display mode "none" or "piggyback").
 static bool iniParseWord(const char* text, const char* falseWord, const char* trueWord,
                          bool* outValue)
 {
@@ -967,7 +1072,9 @@ esp_err_t loggerSettingsExportToFile(const char* absolutePath, uint32_t* outFiel
   iniWriteText(&writer, "profile", config.profileId);
 
   iniWriteSection(&writer, "display");
+  iniWriteText(&writer, "board", config.displayEnabled ? "piggyback" : "none");
   iniWriteText(&writer, "orientation", config.displayFlipped ? "upsideDown" : "normal");
+  iniWriteNumber(&writer, "timeoutMinutes", (unsigned long)config.displayTimeoutMinutes);
 
   iniWriteSection(&writer, "mbus");
 
@@ -1102,11 +1209,35 @@ static esp_err_t iniApplyValue(loggerSettingsConfig* config, const char* section
 
   if (strcmp(section, "display") == 0)
   {
+    //-- The board display mode: "piggyback" drives the panel, encoder and
+    //-- buttons; "none" selects "No Display" (the board stays untouched).
+    if (strcasecmp(key, "board") == 0)
+    {
+      return iniParseWord(value, "none", "piggyback", &config->displayEnabled)
+                 ? ESP_OK
+                 : ESP_ERR_INVALID_SIZE;
+    }
+
     if (strcasecmp(key, "orientation") == 0)
     {
       return iniParseWord(value, "normal", "upsideDown", &config->displayFlipped)
                  ? ESP_OK
                  : ESP_ERR_INVALID_SIZE;
+    }
+
+    //-- The display time-out in minutes; the complete candidate is
+    //-- validated against the documented bounds before anything is stored.
+    if (strcasecmp(key, "timeoutMinutes") == 0)
+    {
+      unsigned long long number = 0u;
+
+      if (!iniParseUnsigned(value, UINT16_MAX, &number))
+      {
+        return ESP_ERR_INVALID_SIZE;
+      }
+
+      config->displayTimeoutMinutes = (uint16_t)number;
+      return ESP_OK;
     }
 
     return ESP_ERR_NOT_FOUND;

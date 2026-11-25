@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-23 · Build: 35
+// Date: 2026-11-24 · Build: 37
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -133,7 +133,9 @@ function bindElements()
                "srcToggle", "srcLiveLabel", "srcTestLabel",
                "rxPolarityToggle", "polNormalLabel", "polInvertedLabel",
                "txPolarityToggle", "txPolNormalLabel", "txPolInvertedLabel", "inpInterval",
+               "displayBoardToggle", "boardPiggybackLabel", "boardNoneLabel",
                "displayRotationToggle", "rotNormalLabel", "rotUpsideDownLabel",
+               "inpDisplayTimeout",
                "selCountry", "selProfile", "selMbus1", "selMbus2", "selMbus3", "selMbus4",
                "inpMqttBroker", "inpMqttPort", "inpMqttUser", "inpMqttPassword", "inpMqttTopic",
                "inpMqttClientId", "inpMqttSubTopic",
@@ -629,6 +631,16 @@ function updateRotationLabels()
   el.rotUpsideDownLabel.classList.toggle("active", isFlipped);
 }
 
+//-- Highlights the board mode end matching the board display switch:
+//-- unchecked drives the piggyback board (panel, encoder and buttons),
+//-- checked selects "No Display" (the board is left untouched).
+function updateBoardModeLabels()
+{
+  const isNone = el.displayBoardToggle.checked;
+  el.boardPiggybackLabel.classList.toggle("active", !isNone);
+  el.boardNoneLabel.classList.toggle("active", isNone);
+}
+
 //-- Shows only the fields of one settings section: the radio bar on top of
 //-- the settings screen picks which .settingsGroup div of index.html stays
 //-- on screen (p1port, display, mbus, mqtt, network, store or tariffs — the
@@ -653,6 +665,40 @@ function rfsSyncBounds()
     min: Number.isFinite(choices.rfsSyncMin) ? choices.rfsSyncMin : 1,
     max: Number.isFinite(choices.rfsSyncMax) ? choices.rfsSyncMax : 60
   };
+}
+
+// The bounds of the TFT display timeout in minutes, taken from the
+// published choices with the documented fallback when the frame carries
+// none.
+function displayTimeoutBounds()
+{
+  const choices = (state.config && state.config.choices) ? state.config.choices : {};
+
+  return {
+    min: Number.isFinite(choices.displayTimeoutMin) ? choices.displayTimeoutMin : 1,
+    max: Number.isFinite(choices.displayTimeoutMax) ? choices.displayTimeoutMax : 60
+  };
+}
+
+// Clamps the entered display timeout to the published bounds and writes the
+// accepted value back into the field.
+function clampDisplayTimeout()
+{
+  const bounds = displayTimeoutBounds();
+  let minutes = parseInt(el.inpDisplayTimeout.value, 10);
+
+  if (!Number.isFinite(minutes) || (minutes < bounds.min))
+  {
+    minutes = bounds.min;
+  }
+
+  if (minutes > bounds.max)
+  {
+    minutes = bounds.max;
+  }
+
+  el.inpDisplayTimeout.value = String(minutes);
+  return minutes;
 }
 
 // Clamps the entered rfs sync interval to the published bounds, writes the
@@ -800,10 +846,23 @@ function renderSettings(message)
   el.txPolarityToggle.checked = !!(settings && settings.txInverted);
   updateTxPolarityLabels();
 
+  // The board display switch maps to the stored displayEnabled flag:
+  // unchecked drives the piggyback board (panel, encoder and buttons),
+  // checked selects "No Display" (the board is left untouched). A settings
+  // frame without the flag (older device) keeps the piggyback board.
+  el.displayBoardToggle.checked = !!(settings && (settings.displayEnabled === false));
+  updateBoardModeLabels();
+
   // The display rotation switch maps to the stored displayFlipped flag:
   // normal is the assembled landscape, upside down turns it 180 degrees.
   el.displayRotationToggle.checked = !!(settings && settings.displayFlipped);
   updateRotationLabels();
+
+  // The display timeout field holds the stored idle minutes before the
+  // panel backlight goes off; any physical button action restarts the
+  // timer and the AUX button lights a dark panel again.
+  el.inpDisplayTimeout.value =
+      (settings && settings.displayTimeoutMinutes) ? String(settings.displayTimeoutMinutes) : "10";
 
   el.inpInterval.value = (settings && settings.intervalSeconds) ? String(settings.intervalSeconds) : "10";
 
@@ -914,8 +973,13 @@ function saveSettings(event)
   // governs both copies of every UART0 forwarding burst.
   const txInverted = el.txPolarityToggle.checked ? "1" : "0";
 
-  // The rotation switch position maps to the stored displayFlipped flag.
+  // The board display switch position maps to the stored displayEnabled
+  // flag (1 drives the piggyback board, 0 selects "No Display"); the
+  // rotation switch position maps to the stored displayFlipped flag; the
+  // timeout field is clamped to the published bounds.
+  const displayEnabled = el.displayBoardToggle.checked ? "0" : "1";
   const displayFlipped = el.displayRotationToggle.checked ? "1" : "0";
+  const displayTimeoutMinutes = clampDisplayTimeout();
 
   // The broker port is clamped like the interval: an unusable value becomes
   // the default 1883 whenever a broker is named at all.
@@ -982,7 +1046,9 @@ function saveSettings(event)
                "&rxGpio=" + encodeURIComponent(rxGpio) +
                "&rxInverted=" + rxInverted +
                "&txInverted=" + txInverted +
+               "&displayEnabled=" + displayEnabled +
                "&displayFlipped=" + displayFlipped +
+               "&displayTimeoutMinutes=" + encodeURIComponent(displayTimeoutMinutes) +
                "&interval=" + encodeURIComponent(interval) +
                "&country=" + encodeURIComponent(el.selCountry.value) +
                "&profileId=" + encodeURIComponent(el.selProfile.value) +
@@ -3972,6 +4038,7 @@ function boot()
   el.srcToggle.addEventListener("change", updateSourceLabels);
   el.rxPolarityToggle.addEventListener("change", updatePolarityLabels);
   el.txPolarityToggle.addEventListener("change", updateTxPolarityLabels);
+  el.displayBoardToggle.addEventListener("change", updateBoardModeLabels);
   el.displayRotationToggle.addEventListener("change", updateRotationLabels);
   el.inpRfsSync.addEventListener("input", updateRfsWearEstimate);
 

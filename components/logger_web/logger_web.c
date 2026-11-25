@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-24 · Build: 31
+//-- Date: 2026-11-24 · Build: 33
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -644,10 +644,19 @@ static void appendSettingsJson(stringBuilder* sb, const loggerSettingsConfig* co
   sbAppend(sb, ",\"txInverted\":");
   sbAppend(sb, config->txInverted ? "true" : "false");
 
+  //-- Board display mode: true drives the piggyback board (panel, encoder
+  //-- and buttons), false selects "No Display" (the board stays untouched).
+  sbAppend(sb, ",\"displayEnabled\":");
+  sbAppend(sb, config->displayEnabled ? "true" : "false");
+
   //-- TFT display orientation: false is the assembled landscape, true turns
   //-- the panel 180 degrees.
   sbAppend(sb, ",\"displayFlipped\":");
   sbAppend(sb, config->displayFlipped ? "true" : "false");
+
+  //-- TFT display time-out in minutes: the panel backlight goes off this
+  //-- many minutes after the last physical button action.
+  sbAppendFmt(sb, ",\"displayTimeoutMinutes\":%u", (unsigned)config->displayTimeoutMinutes);
 
   //-- MQTT publication and network identity, prefilled into the settings
   //-- view. The password rides along so the field can show what is stored.
@@ -854,6 +863,13 @@ static void appendConfigJson(stringBuilder* sb)
   sbAppendFmt(sb, ",\"rfsSyncMin\":%u", (unsigned)LOGGER_SETTINGS_RFS_SYNC_MIN_MINUTES);
   sbAppendFmt(sb, ",\"rfsSyncMax\":%u", (unsigned)LOGGER_SETTINGS_RFS_SYNC_MAX_MINUTES);
 
+  //-- Bounds of the TFT display time-out in minutes for the Display group
+  //-- of the settings view.
+  sbAppendFmt(sb, ",\"displayTimeoutMin\":%u",
+              (unsigned)LOGGER_SETTINGS_DISPLAY_TIMEOUT_MIN_MINUTES);
+  sbAppendFmt(sb, ",\"displayTimeoutMax\":%u",
+              (unsigned)LOGGER_SETTINGS_DISPLAY_TIMEOUT_MAX_MINUTES);
+
   uint32_t totalBlocks = 0u;
   uint32_t blockWritesPerSync = 0u;
   uint32_t flashWriteCycles = 0u;
@@ -952,6 +968,10 @@ static const char* applySettingsFromForm(const char* body)
   memset(&candidate, 0, sizeof candidate);
   candidate.structVersion = LOGGER_SETTINGS_VERSION;
 
+  //-- The board display mode defaults to the piggyback board (today's
+  //-- behaviour): an absent displayEnabled field keeps the panel on.
+  candidate.displayEnabled = true;
+
   if (!formGet(body, "rxGpio", text, sizeof text))
   {
     return "missing rxGpio";
@@ -996,12 +1016,37 @@ static const char* applySettingsFromForm(const char* body)
     candidate.txInverted = (text[0] == '1');
   }
 
+  //-- Board display mode toggle: 1 drives the piggyback board, 0 selects
+  //-- "No Display" (panel and board inputs untouched); an absent field
+  //-- keeps the piggyback board.
+  if (formGet(body, "displayEnabled", text, sizeof text))
+  {
+    candidate.displayEnabled = (text[0] == '1');
+  }
+
   //-- Display orientation toggle: 1 turns the panel 180 degrees, 0 or an
   //-- absent field keeps the assembled landscape orientation.
   if (formGet(body, "displayFlipped", text, sizeof text))
   {
     candidate.displayFlipped = (text[0] == '1');
   }
+
+  //-- The display time-out is clamped like the rfs sync interval: an
+  //-- unusable value becomes the documented default.
+  int displayTimeoutMinutes = (int)LOGGER_SETTINGS_DISPLAY_TIMEOUT_DEFAULT_MINUTES;
+
+  if (formGet(body, "displayTimeoutMinutes", text, sizeof text))
+  {
+    displayTimeoutMinutes = atoi(text);
+  }
+
+  if ((displayTimeoutMinutes < (int)LOGGER_SETTINGS_DISPLAY_TIMEOUT_MIN_MINUTES) ||
+      (displayTimeoutMinutes > (int)LOGGER_SETTINGS_DISPLAY_TIMEOUT_MAX_MINUTES))
+  {
+    displayTimeoutMinutes = (int)LOGGER_SETTINGS_DISPLAY_TIMEOUT_DEFAULT_MINUTES;
+  }
+
+  candidate.displayTimeoutMinutes = (uint16_t)displayTimeoutMinutes;
 
   //-- MQTT publication fields. Absent fields leave the candidate zeroed,
   //-- which keeps publication disabled; blanks around the values are cut.
@@ -1223,9 +1268,15 @@ static const char* applySettingsFromForm(const char* body)
     return "persistence failed";
   }
 
-  //-- The persisted configuration owns the panel orientation too: apply it
-  //-- only now, after activation and persistence both succeeded.
+  //-- The persisted configuration owns the board display mode, the panel
+  //-- orientation and the idle display time-out too: apply them only now,
+  //-- after activation and persistence both succeeded. The mode goes first:
+  //-- a save that re-enables the display brings the panel up before the
+  //-- orientation and time-out are laid over it; a save that selects
+  //-- "No Display" tears the board down (both calls then no-op).
+  loggerBoardSetEnabled(candidate.displayEnabled);
   loggerBoardSetRotation(candidate.displayFlipped);
+  loggerBoardSetDisplayTimeoutMinutes(candidate.displayTimeoutMinutes);
 
   //-- Services outside the receive path (network identity, MQTT) adopt the
   //-- stored values through the application's notification callback.
@@ -1238,10 +1289,11 @@ static const char* applySettingsFromForm(const char* body)
   LOGGER_LOGI(
       tag,
       "configuration applied and stored: gpio %d, profile %s, rx polarity %s, tx polarity %s, "
-      "display %s, mqtt password %s",
+      "display %s, board %s, mqtt password %s",
       candidate.rxGpio, candidate.profileId, candidate.rxInverted ? "inverted" : "normal",
       candidate.txInverted ? "inverted" : "normal",
-      candidate.displayFlipped ? "upside down" : "normal", mqttPasswordOutcome);
+      candidate.displayFlipped ? "upside down" : "normal",
+      candidate.displayEnabled ? "piggyback" : "none", mqttPasswordOutcome);
   return NULL;
 }
 

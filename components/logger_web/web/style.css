@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-22 · Build: 28 */
+   Date: 2026-11-25 · Build: 29 */
 
 :root
 {
@@ -272,9 +272,11 @@ select:hover
   border-color: var(--hairline);
 }
 
-/* iOS flavoured switches: data source (Live data / Test data), the P1 RX
-   polarity (Normal / Inverted) and the P1 Tx polarity for forwarded data
-   (Normal / Inverted). The native checkbox behind every switch is hidden. */
+/* iOS flavoured switches: every checkbox that lives inside a .toggleRow is
+   presented as a switch (data source, the P1 polarities, the board display
+   mode and the display orientation). The styling is keyed on the row and the
+   element type, not on ids, so a new switch is styled and hidden the moment
+   it is added: only the switch is ever visible, never the native checkbox. */
 .toggleRow
 {
   display: flex;
@@ -296,10 +298,7 @@ select:hover
   font-weight: 600;
 }
 
-#srcToggle,
-#rxPolarityToggle,
-#txPolarityToggle,
-#displayRotationToggle
+.toggleRow input[type="checkbox"]
 {
   position: absolute;
   opacity: 0;
@@ -334,26 +333,17 @@ select:hover
   transition: transform 0.2s ease;
 }
 
-#srcToggle:checked + .switch,
-#rxPolarityToggle:checked + .switch,
-#txPolarityToggle:checked + .switch,
-#displayRotationToggle:checked + .switch
+.toggleRow input[type="checkbox"]:checked + .switch
 {
   background: var(--accent);
 }
 
-#srcToggle:checked + .switch .switchKnob,
-#rxPolarityToggle:checked + .switch .switchKnob,
-#txPolarityToggle:checked + .switch .switchKnob,
-#displayRotationToggle:checked + .switch .switchKnob
+.toggleRow input[type="checkbox"]:checked + .switch .switchKnob
 {
   transform: translateX(20px);
 }
 
-#srcToggle:focus-visible + .switch,
-#rxPolarityToggle:focus-visible + .switch,
-#txPolarityToggle:focus-visible + .switch,
-#displayRotationToggle:focus-visible + .switch
+.toggleRow input[type="checkbox"]:focus-visible + .switch
 {
   outline: 2px solid var(--accent);
   outline-offset: 2px;

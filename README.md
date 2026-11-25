@@ -1,6 +1,6 @@
 # lastDSMRlogger
 <!--
-fileVersion: [59] - 24-11-2026 - 16:13
+fileVersion: [61] - 24-11-2026 - 20:37
 -->
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -360,44 +360,58 @@ Phase Load view is the default screen at every start and reload of the page.
 
 On-device TFT debug lines show the active browser screen, the last accepted
 telegram, and the Wi-Fi portal/connected state. With the first accepted
-telegram the screen is cleared and fully taken over by the **power panel**
-(no debug lines remain). Every screen opens with a white **name bar** at
-the top with its name left aligned in black text — `TELEGRAM nnn`,
-`PER FASE` or `SYSTEMINFO` — and a sub band below it with optional right
-aligned text (on the [TELEGRAM] screen the meter date and time of OBIS
-`0-0:1.0.0`, `DD-MM-YYYY HH:MM` without seconds; on the [PER FASE] screen
-the selected `Fase n` or `Totaal`). All panel text is rendered by the
-logger itself: it stretches the component's 5×7 font into a per-text cell
-size, so sizes like 9×14 or 7×11 are possible instead of only the two
-integer font scales of the component. The [TELEGRAM] screen shows one row
-per phase plus **Totaal**. Each row has a header band (phase current left
-and phase voltage right larger than the centred phase label; the total row
-shows the summed current and the average voltage) and a centre-zero watt
-bar carrying its integer scale labels (`-3800`, `0`, `3800`) inside the
-bar, followed by the watt value. Like the DSMRlogger32
-power bars, the net power is *returned minus delivered*: consumption reads
-negative and is drawn **red** to the left of centre, feed-in reads positive
-and is drawn **green** to the right. The bar scale adapts to the size of
-the largest absolute watt of the frame: the smallest step of
+telegram the screen is cleared and fully taken over by the **power screens**
+(no debug lines remain). Every screen opens with a light blue **heading
+row** carrying the screen name left aligned in black text — `PHASE LOAD`,
+`PHASE POWER` or `SYSTEM INFO` — and the screen function right aligned, and
+closes with a light blue **status row** carrying the reception note with the
+meter date and time of OBIS `0-0:1.0.0` (`DD-MM-YYYY HH:MM` without
+seconds) on the left and the `AUX: back` hint right aligned; the body of
+every screen stays white and all texts are English with no line wrapping.
+All panel text is rendered by the logger itself: it stretches the
+component's 5×7 font into a per-text cell size, so sizes like 9×14 or 7×11
+are possible instead of only the two integer font scales of the component.
+The [PHASE LOAD] screen shows one row per phase plus **Total**. Each row
+has a header band (phase current left and phase voltage right larger than
+the centred phase label; the total row shows the summed current and the
+average voltage) and a centre-zero watt bar carrying its integer scale
+labels (`-3800`, `0`, `3800`) inside the bar, with the whole bar track a
+few pixels away from both panel edges, followed by the watt value. Like the
+DSMRlogger32 power bars, the net power is *returned minus delivered*:
+consumption reads negative and is drawn **red** to the left of centre,
+feed-in reads positive and is drawn **green** to the right. The bar scale
+adapts to the size of the largest absolute watt of the frame: the smallest
+step of
 3800 → 3100 → 2400 → 1700 → 1000 → 500 → 250 → 100 W that fits it (a frame above
-3800 W fills the bar at the 3800 W step). The panel layout adapts to the
-orientation reported by the board component (320×240 or 240×320).
+3800 W fills the bar at the 3800 W step). The [PHASE POWER] screen lists
+the consumption of `Phase 1`, `Phase 2`, `Phase 3` and `Total` as four
+labelled signed watt values. The [SYSTEM INFO] screen groups the device
+facts in the sections `TELEGRAMS` (accepted and rejected counts), `P1
+INPUT` (country/protocol, RX polarity and meter time), `NETWORK` (SSID and
+IP) and `DEVICE` (uptime and firmware version). The panel layout adapts to
+the orientation reported by the board component (320×240 or 240×320).
+
+The *Board display* switch of the Display section of the Settings view
+picks the display mode: **Piggyback board** drives the panel, the encoder
+and the buttons as described below; **No Display** leaves the board
+untouched — the panel is never initialised, the backlight stays off and
+the board inputs are never started, and every panel view and button
+handling is simply off. The mode applies immediately on Save in both
+directions (no restart needed) and is stored with the other settings; the
+telnet settings ini carries it as `board = piggyback|none` in the
+`[display]` section.
 
 The board inputs are driven through the component's event queue (AUX button
-and encoder). A **short AUX press** from the power panel opens the
-per-phase screen: the net watts of the selected object as a large centred
-number with a smaller `W` unit next to it, the voltage left and the
-current right in smaller digits on one row below it, and a centre-zero
-watt bar on the same ladder step the graphics panel picked; the **encoder**
-cycles Fase 1 → Fase 2 → Fase 3 → Totaal (and back
-when turning the other way). A **medium-long AUX press** replaces the bars
-with a system information view: accepted and rejected telegram counts, IP
-address, SSID, uptime, country/protocol and the P1 RX polarity (normal or
-inverted). Both AUX screens carry a white bottom bar with `AUX: Terug` on
-the left. A short AUX press returns to the graphics panel. New telegrams
-keep refreshing the graphics panel only; an open AUX view stays on screen
-until its own short press returns, and it shows the latest frame when
-opened or reselected with the encoder.
+and encoder). The **rotary encoder** walks through all screens one by one:
+`PHASE LOAD` → `PHASE POWER` → `SYSTEM INFO` and back. A **short AUX
+press** invokes **Back** on the screen that opened the current one; a
+**medium-long AUX press** jumps straight to `SYSTEM INFO`. After the idle
+display timeout — the *Display timeout (minutes)* field (1..60) of the
+Display section of the Settings view — with no physical button action the
+backlight goes off; every button action while the panel is on restarts the
+timer and any **AUX press** lights a dark panel again, restarting the timer
+from that moment. New telegrams refresh the screen currently on view; the
+others show the latest frame when the encoder or Back brings them forward.
 
 Console diagnostics are deduplicated: an identical diagnostic text (for
 example a repeating `M-Bus device type mismatch @ 0-1:24.1.0`) reaches the

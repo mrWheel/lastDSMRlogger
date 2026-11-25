@@ -88,8 +88,23 @@
           <select id="selProfile"></select>
         </div>
 
-        <!-- Display: the TFT orientation switch. -->
+        <!-- Display: the board display mode switch (Piggyback board drives
+             the panel, encoder and buttons; No Display leaves the board
+             untouched), the TFT orientation switch and the idle display
+             time-out in minutes (1..60); any physical button action on the
+             board restarts the timer and the AUX button lights a dark
+             panel again. The time-out is a settings input field and joins
+             the iOS list rows like every other field (the .iosGroup rules
+             in style.css). -->
         <div class="settingsGroup" data-group="display" hidden>
+          <label for="displayBoardToggle">Board display</label>
+          <div class="toggleRow">
+            <span id="boardPiggybackLabel" class="toggleEnd active">Piggyback board</span>
+            <input id="displayBoardToggle" type="checkbox" role="switch" aria-label="No display">
+            <label class="switch" for="displayBoardToggle" aria-hidden="true"><span class="switchKnob"></span></label>
+            <span id="boardNoneLabel" class="toggleEnd">No Display</span>
+          </div>
+
           <label for="displayRotationToggle">Display orientation</label>
           <div class="toggleRow">
             <span id="rotNormalLabel" class="toggleEnd active">Normal</span>
@@ -97,6 +112,14 @@
             <label class="switch" for="displayRotationToggle" aria-hidden="true"><span class="switchKnob"></span></label>
             <span id="rotUpsideDownLabel" class="toggleEnd">Upside down</span>
           </div>
+
+          <fieldset class="iosGroup">
+            <legend>Display</legend>
+            <div class="iosRow">
+              <label for="inpDisplayTimeout">Display timeout (minutes)</label>
+              <input id="inpDisplayTimeout" type="number" min="1" max="60" step="1" value="10" inputmode="numeric">
+            </div>
+          </fieldset>
         </div>
 
         <!-- M-Bus: the four channel selections of the P1 telegram. -->
