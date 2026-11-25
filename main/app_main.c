@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: app_main.c - application entry
-//-- Date: 2026-11-25 · Build: 23
+//-- Date: 2026-11-25 · Build: 25
 //--
 //-- Boot order: NVS comes up first and the stored settings are read, because
 //-- the stored display mode decides whether the board stays up ("No Display"
@@ -14,23 +14,36 @@
 //-- the SPA server, the telnet console and the SMB share start after the
 //-- first successful connection because the captive portal owns port 80
 //-- during provisioning.
+//--
+//-- The Wi-Fi task also owns runtime link recovery (recoveryWiFi.md): a
+//-- connection manager keeps the live association and IP picture, retries a
+//-- dropped station with backoff and jitter, watches separate association and
+//-- IP deadlines, escalates with a rate-limited adapter restart and brings
+//-- every network service back through the regular startup path when the
+//-- address is granted again. Keeping the link up is a first-class goal: the
+//-- station is the route to the SPA, the console, the SMB share and MQTT.
 //-- ==========================================================================
 
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
-static const char* PROG_VERSION = "v0.6.1";
+static const char* PROG_VERSION = "v0.6.2";
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
 
 #include "esp_err.h"
+#include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
+#include "esp_random.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "dsmr_parser.h"
 #include "logger_board.h"
@@ -53,7 +66,34 @@ static const char* tag = "appMain";
 //-- so it runs in a task of its own and never delays P1 reception.
 #define WIFI_TASK_STACK_BYTES 6144
 #define WIFI_TASK_PRIORITY 4
-#define WIFI_RECONNECT_POLL_MS 2000
+
+//-- The recovery manager wakes on queued link signals and on this tick:
+//-- short enough to keep the retry timing honest, long enough to idle.
+#define WIFI_MANAGER_TICK_MS 500
+
+//-- Association and IP assignment get separate deadlines so the log names
+//-- the phase in which an attempt stalled (recoveryWiFi.md section 6).
+#define WIFI_ASSOC_DEADLINE_MS 15000
+#define WIFI_IP_DEADLINE_MS 15000
+
+//-- Reconnect backoff: a short first delay, doubled after every failed
+//-- attempt up to the cap, plus jitter so several devices that lost the
+//-- same AP do not come back in lockstep. The policy resets as soon as the
+//-- station has a usable address again.
+#define WIFI_RETRY_BASE_MS 2000
+#define WIFI_RETRY_MAX_MS 60000
+#define WIFI_RETRY_JITTER_FRACTION 4
+
+//-- Escalation for attempts that keep failing while the retry policy itself
+//-- runs healthy: one adapter restart per throttle window, through the
+//-- manager, always logged (recoveryWiFi.md section 6).
+#define WIFI_ADAPTER_RESTART_AFTER_ATTEMPTS 8
+#define WIFI_ADAPTER_RESTART_THROTTLE_MS 600000
+
+//-- Safety net behind the events: every window the manager compares its
+//-- picture with the driver and netif, so a lost signal cannot stall
+//-- recovery for longer than this.
+#define WIFI_RECONCILE_MS 30000
 
 static volatile bool wifiEverConnected = false;
 
@@ -84,6 +124,12 @@ static bool fixedIpApplied = false;
 //-- reply (the browser would see a reset while the save did succeed).
 static volatile bool pendingFixedIp = false;
 static volatile bool pendingHostnameAnnounce = false;
+
+//-- Live link state from the recovery manager. The provisioner's
+//-- wifi_prov_is_connected() latches its very first success and cannot
+//-- report a runtime outage (recoveryWiFi.md section 2), so every "is the
+//-- station usable" question in this file answers from here instead.
+static volatile bool stationHasIp = false;
 
 //-- True once the mDNS responder is up (one init per boot; the retry path
 //-- lives in announceMdns).
@@ -251,7 +297,7 @@ static void onSettingsSaved(const loggerSettingsConfig* config)
 
   //-- The lease work is deferred to the Wi-Fi task: it would abort this
   //-- very save's own reply along with every other open connection.
-  applyNetworkIdentity(&activeNetworkConfig, wifi_prov_is_connected(), true);
+  applyNetworkIdentity(&activeNetworkConfig, stationHasIp, true);
   loggerMqttApplyConfig(config);
 }
 
@@ -310,9 +356,139 @@ static void startSmbShare(void)
               (unsigned)config.port);
 }
 
-static void onWifiConnected(void)
+//-- ==========================================================================
+//-- Wi-Fi recovery manager (recoveryWiFi.md)
+//--
+//-- One owner of the station's desired state: the Wi-Fi task. The persistent
+//-- event callbacks only copy signals into the queue; the task serialises
+//-- reconnects, deadlines, escalation and the (re)start of every dependent
+//-- service. The provisioner keeps its own retry handlers scoped to the
+//-- initial attempts: runtime recovery stays disabled until its on_connected
+//-- callback posts the handoff signal, and the manager takes the live link
+//-- picture over from there. Recovery reuses the regular service startup
+//-- path (handleStationUp), and every service keeps its own started guard,
+//-- so a duplicated signal can never build a second session or listener.
+//-- ==========================================================================
+
+typedef enum
 {
-  wifiEverConnected = true;
+  WIFI_MGR_HANDOFF,      //-- the provisioner finished: the manager takes over
+  WIFI_MGR_STATION_UP,   //-- WIFI_EVENT_STA_CONNECTED (associated, IP pending)
+  WIFI_MGR_STATION_DOWN, //-- WIFI_EVENT_STA_DISCONNECTED (reason copied)
+  WIFI_MGR_IP_GRANTED,   //-- IP_EVENT_STA_GOT_IP on the station interface
+  WIFI_MGR_IP_LOST       //-- IP_EVENT_STA_LOST_IP on the station interface
+} wifiManagerEventKind;
+
+typedef struct
+{
+  wifiManagerEventKind kind;
+  uint8_t reason; //-- 802.11 status code of a disconnect, 0 otherwise
+} wifiManagerEvent;
+
+#define WIFI_MANAGER_QUEUE_LEN 16
+
+static QueueHandle_t wifiManagerQueue = NULL;
+
+//-- The link picture, written by the Wi-Fi task only; stationHasIp also
+//-- answers the live-status questions of the other tasks.
+static bool managerActive = false;
+static bool stationAssociated = false;
+static bool servicesUp = false;
+
+//-- Attempt bookkeeping for the current outage, owned by the Wi-Fi task.
+static bool reconnectDue = false;
+static int64_t reconnectAtMs = 0;
+static uint32_t retryDelayMs = WIFI_RETRY_BASE_MS;
+static bool connectRequested = false;
+static int64_t connectRequestedAtMs = 0;
+static int64_t ipDeadlineMs = 0;
+static bool dhcpRetried = false;
+static uint32_t failedAttempts = 0;
+static int64_t lastAdapterRestartMs = 0;
+static int64_t lastReconcileMs = 0;
+static volatile bool managerResync = false;
+
+static int64_t managerNowMs(void)
+{
+  return esp_timer_get_time() / 1000;
+}
+
+static void postWifiManagerEvent(wifiManagerEventKind kind, uint8_t reason)
+{
+  if (wifiManagerQueue == NULL)
+  {
+    return;
+  }
+
+  wifiManagerEvent event;
+  event.kind = kind;
+  event.reason = reason;
+
+  if (xQueueSend(wifiManagerQueue, &event, 0) != pdTRUE)
+  {
+    //-- Never block the event task: a dropped signal is covered by the
+    //-- manager reconciling with the live driver state (section 5.1).
+    managerResync = true;
+  }
+}
+
+//-- Short callbacks: copy each signal with its reason and get out (section
+//-- 5.1). Every decision is taken later, in the manager task.
+static void wifiManagerEventHandler(void* arg, esp_event_base_t base, int32_t id, void* data)
+{
+  (void)arg;
+
+  if ((base == WIFI_EVENT) && (id == WIFI_EVENT_STA_DISCONNECTED))
+  {
+    wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*)data;
+    postWifiManagerEvent(WIFI_MGR_STATION_DOWN, (event != NULL) ? event->reason : 0);
+  }
+  else if ((base == WIFI_EVENT) && (id == WIFI_EVENT_STA_CONNECTED))
+  {
+    postWifiManagerEvent(WIFI_MGR_STATION_UP, 0);
+  }
+  else if ((base == IP_EVENT) && (id == IP_EVENT_STA_GOT_IP))
+  {
+    ip_event_got_ip_t* event = (ip_event_got_ip_t*)data;
+    esp_netif_t* station = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+
+    //-- Only the station interface drives this manager (section 4).
+    if ((event != NULL) && (station != NULL) && (event->esp_netif == station))
+    {
+      postWifiManagerEvent(WIFI_MGR_IP_GRANTED, 0);
+    }
+  }
+  else if ((base == IP_EVENT) && (id == IP_EVENT_STA_LOST_IP))
+  {
+    postWifiManagerEvent(WIFI_MGR_IP_LOST, 0);
+  }
+}
+
+static void wifiManagerResetPolicy(void)
+{
+  failedAttempts = 0;
+  retryDelayMs = WIFI_RETRY_BASE_MS;
+  reconnectDue = false;
+  connectRequested = false;
+  ipDeadlineMs = 0;
+  dhcpRetried = false;
+}
+
+//-- Arms every network-dependent service for the current session. The first
+//-- join and every recovery enter through this same regular startup path
+//-- (section 5.3) and the started guards inside SNTP, web, telnet, SMB and
+//-- the MQTT gate make repeated calls harmless (section 4: idempotent).
+static void handleStationUp(void)
+{
+  if (servicesUp)
+  {
+    //-- A duplicated address signal (re-granted lease, or the periodic
+    //-- reconciliation meeting the join event) must not stack a second
+    //-- anything: the first arm of this session stands.
+    return;
+  }
+
+  servicesUp = true;
 
   //-- One start per boot is enough: the SNTP service keeps refreshing the
   //-- system time on its own once it runs.
@@ -340,10 +516,13 @@ static void onWifiConnected(void)
     ssid = (const char*)stationConfig.sta.ssid;
   }
 
+  esp_netif_t* station = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
   esp_netif_ip_info_t ipInfo;
   char ip[16] = "?";
 
-  if (wifi_prov_get_ip_info(&ipInfo) == ESP_OK)
+  memset(&ipInfo, 0, sizeof ipInfo);
+
+  if ((station != NULL) && (esp_netif_get_ip_info(station, &ipInfo) == ESP_OK))
   {
     snprintf(ip, sizeof ip, IPSTR, IP2STR(&ipInfo.ip));
   }
@@ -351,14 +530,16 @@ static void onWifiConnected(void)
   loggerBoardWifiConnected(ssid, ip);
   LOGGER_LOGI(tag, "station joined '%s' with IP %s, SPA reachable there", ssid, ip);
 
-  //-- The station now has a lease: announce the stored hostname and, when a
-  //-- fixed last octet is configured, pin the address on top of the lease.
-  //-- Nothing is answered on these sockets yet, so the work runs at once.
+  //-- The station now has an address: announce the stored hostname and,
+  //-- when a fixed last octet is configured, pin the address on top of the
+  //-- lease. Nothing is answered on these sockets yet, so the work runs at
+  //-- once.
   applyNetworkIdentity(&activeNetworkConfig, true, false);
 
   //-- LWIP is up with the join: this is the moment the MQTT client may
   //-- resolve its broker, so publication is released here (it stays off
-  //-- while the station is down).
+  //-- while the station is down). On a recovery this is the re-arm the old
+  //-- code missed: publication must travel again after the outage.
   loggerMqttSetNetworkReady(true);
 
   //-- The captive portal released port 80 when it stopped: serve the SPA and
@@ -380,6 +561,339 @@ static void onWifiConnected(void)
   startSmbShare();
 }
 
+//-- One reconnect slot per outage: the next attempt gets a due time, the
+//-- backoff doubles for the failure after this one and the phase timers
+//-- start over (sections 4 and 6).
+static void wifiManagerScheduleReconnect(const char* cause)
+{
+  int64_t now = managerNowMs();
+  uint32_t jitterMs = 0;
+
+  if (retryDelayMs > 0)
+  {
+    jitterMs = (uint32_t)(esp_random() % (retryDelayMs / WIFI_RETRY_JITTER_FRACTION + 1));
+  }
+
+  reconnectAtMs = now + (int64_t)retryDelayMs + (int64_t)jitterMs;
+  reconnectDue = true;
+  connectRequested = false;
+  ipDeadlineMs = 0;
+  dhcpRetried = false;
+  failedAttempts++;
+
+  LOGGER_LOGW(tag,
+              "station down (%s): attempt %" PRIu32 " in %" PRId64 " ms (backoff %" PRIu32 " ms)",
+              cause, failedAttempts, (int64_t)retryDelayMs + (int64_t)jitterMs, retryDelayMs);
+
+  uint32_t grown = retryDelayMs * 2u;
+  retryDelayMs = (grown > WIFI_RETRY_MAX_MS) ? WIFI_RETRY_MAX_MS : grown;
+}
+
+//-- Compares the manager's picture with the driver and netif state, so a
+//-- lost event or an overflowed queue cannot stall recovery (sections 4 and
+//-- 5.1). Uses the documented live checks: association, interface and
+//-- address.
+static void wifiManagerResync(void)
+{
+  esp_netif_t* station = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  esp_netif_ip_info_t ipInfo;
+  bool hasIp = false;
+
+  memset(&ipInfo, 0, sizeof ipInfo);
+
+  if ((station != NULL) && (esp_netif_get_ip_info(station, &ipInfo) == ESP_OK))
+  {
+    hasIp = (ipInfo.ip.addr != 0);
+  }
+
+  wifi_ap_record_t apRecord;
+  bool associated = (esp_wifi_sta_get_ap_info(&apRecord) == ESP_OK);
+
+  if (hasIp)
+  {
+    stationAssociated = true;
+    stationHasIp = true;
+
+    //-- Arm on 'address present but services not armed', never on a
+    //-- perceived change: the very first GOT_IP may have arrived before
+    //-- the handoff (section 2.3), so by reconciliation time the picture
+    //-- can be right while nothing was ever started. The guard inside
+    //-- handleStationUp keeps repeated calls harmless.
+    if (managerActive && !servicesUp)
+    {
+      wifiManagerResetPolicy();
+      LOGGER_LOGI(tag, "station address confirmed: arming the network services");
+      handleStationUp();
+    }
+
+    return;
+  }
+
+  if (stationHasIp)
+  {
+    stationHasIp = false;
+
+    if (managerActive)
+    {
+      LOGGER_LOGW(tag, "address gone (seen by the link reconciliation)");
+      servicesUp = false;
+      loggerMqttSetNetworkReady(false);
+    }
+  }
+
+  if (!associated)
+  {
+    stationAssociated = false;
+  }
+
+  if (managerActive && !associated && !reconnectDue && !connectRequested)
+  {
+    wifiManagerScheduleReconnect("link reconciled down");
+  }
+}
+
+static void wifiManagerProcessEvent(const wifiManagerEvent* event)
+{
+  int64_t now = managerNowMs();
+
+  switch (event->kind)
+  {
+  case WIFI_MGR_HANDOFF:
+    if (managerActive)
+    {
+      break;
+    }
+
+    managerActive = true;
+    wifiManagerResetPolicy();
+    lastReconcileMs = now;
+
+    LOGGER_LOGI(tag, "provisioning done: the recovery manager owns the station link");
+
+    //-- The first GOT_IP may have arrived before the handoff and the link
+    //-- may even have dropped since: read the live picture and let it
+    //-- schedule recovery when the address is not there (section 2.3).
+    wifiManagerResync();
+    break;
+
+  case WIFI_MGR_STATION_UP:
+    //-- Associated, the address is next: start the IP deadline.
+    stationAssociated = true;
+    connectRequested = false;
+    ipDeadlineMs = now + WIFI_IP_DEADLINE_MS;
+    dhcpRetried = false;
+    break;
+
+  case WIFI_MGR_STATION_DOWN:
+  {
+    bool wasAssociated = stationAssociated;
+    bool hadIp = stationHasIp;
+
+    stationAssociated = false;
+    stationHasIp = false;
+    connectRequested = false;
+
+    if (!managerActive)
+    {
+      //-- The provisioner owns retries while it is setting the station up.
+      break;
+    }
+
+    LOGGER_LOGW(tag, "station dropped (reason %" PRIu8 ", was associated %s, had address %s)",
+                event->reason, wasAssociated ? "yes" : "no", hadIp ? "yes" : "no");
+
+    //-- Publication goes down with the link: without a station there is
+    //-- no route to the broker. handleStationUp releases it again.
+    servicesUp = false;
+    loggerMqttSetNetworkReady(false);
+
+    if (!reconnectDue)
+    {
+      wifiManagerScheduleReconnect("link lost");
+    }
+    break;
+  }
+
+  case WIFI_MGR_IP_GRANTED:
+    //-- The outage is over: reset the backoff, cancel every pending
+    //-- attempt and arm the sessions through the regular path.
+    wifiManagerResetPolicy();
+    stationAssociated = true;
+    stationHasIp = true;
+
+    if (managerActive)
+    {
+      handleStationUp();
+    }
+    break;
+
+  case WIFI_MGR_IP_LOST:
+    if (!stationHasIp)
+    {
+      break;
+    }
+
+    stationHasIp = false;
+
+    if (!managerActive)
+    {
+      break;
+    }
+
+    LOGGER_LOGW(tag, "station lost its address while still associated");
+    servicesUp = false;
+    loggerMqttSetNetworkReady(false);
+    ipDeadlineMs = now + WIFI_IP_DEADLINE_MS;
+    dhcpRetried = false;
+    break;
+  }
+}
+
+static void wifiManagerTick(void)
+{
+  int64_t now = managerNowMs();
+
+  if (managerResync)
+  {
+    managerResync = false;
+    wifiManagerResync();
+  }
+
+  //-- "No Display" boot: now that the station has joined, remove the panel
+  //-- and the board inputs again (a tear-down while the network stack is
+  //-- still coming up crashes the logger, so this waits).
+  if (pendingDisplayOff && wifiEverConnected)
+  {
+    pendingDisplayOff = false;
+    loggerBoardSetEnabled(false);
+  }
+
+  //-- Deferred lease work from a settings save (see applyNetworkIdentity):
+  //-- performed here, well after the save has answered its browser.
+  if (stationHasIp)
+  {
+    if (pendingFixedIp)
+    {
+      pendingFixedIp = false;
+      applyNetworkIdentity(&activeNetworkConfig, true, false);
+    }
+    else if (pendingHostnameAnnounce)
+    {
+      pendingHostnameAnnounce = false;
+
+      //-- Only meaningful while the station stays on DHCP; the fixed-IP
+      //-- branch above owns the address when one is configured.
+      if (activeNetworkConfig.fixedIpLastOctet == 0u)
+      {
+        esp_netif_t* station = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+
+        if (station != NULL)
+        {
+          LOGGER_LOGI(tag, "re-announcing the hostname to DHCP");
+          esp_netif_dhcpc_stop(station);
+          esp_netif_dhcpc_start(station);
+        }
+      }
+    }
+  }
+
+  if (!managerActive)
+  {
+    //-- Runtime reconnect actions stay disabled while the provisioner is
+    //-- setting up (section 2.1).
+    return;
+  }
+
+  if (!stationHasIp)
+  {
+    if (connectRequested)
+    {
+      if ((now - connectRequestedAtMs) >= WIFI_ASSOC_DEADLINE_MS)
+      {
+        LOGGER_LOGW(tag, "association deadline expired");
+        wifiManagerScheduleReconnect("association deadline");
+      }
+    }
+    else if (stationAssociated)
+    {
+      //-- Associated with no address: wait with a deadline, re-request DHCP
+      //-- once, then break the association and let the retry policy start a
+      //-- fresh attempt (section 4, second row).
+      if (now >= ipDeadlineMs)
+      {
+        if (!dhcpRetried)
+        {
+          dhcpRetried = true;
+          ipDeadlineMs = now + WIFI_IP_DEADLINE_MS;
+
+          LOGGER_LOGW(tag, "IP deadline expired: re-requesting the address from DHCP");
+
+          esp_netif_t* station = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+
+          if (station != NULL)
+          {
+            esp_netif_dhcpc_stop(station);
+            esp_netif_dhcpc_start(station);
+          }
+        }
+        else
+        {
+          LOGGER_LOGW(tag, "IP deadline expired again: restarting the association");
+          stationAssociated = false;
+          esp_wifi_disconnect();
+          wifiManagerScheduleReconnect("IP deadline");
+        }
+      }
+    }
+    else if (reconnectDue && (now >= reconnectAtMs))
+    {
+      if ((failedAttempts >= WIFI_ADAPTER_RESTART_AFTER_ATTEMPTS) &&
+          ((now - lastAdapterRestartMs) >= WIFI_ADAPTER_RESTART_THROTTLE_MS))
+      {
+        lastAdapterRestartMs = now;
+
+        LOGGER_LOGW(tag, "connection keeps failing: restarting the Wi-Fi adapter (escalation)");
+        esp_wifi_stop();
+        esp_wifi_start();
+      }
+
+      esp_err_t result = esp_wifi_connect();
+
+      if (result == ESP_OK)
+      {
+        connectRequested = true;
+        connectRequestedAtMs = now;
+        LOGGER_LOGI(tag, "reconnect attempt %" PRIu32 " requested", failedAttempts);
+      }
+      else
+      {
+        //-- Check the request result before waiting for its outcome
+        //-- (section 5.2).
+        LOGGER_LOGW(tag, "connect request rejected: %s", esp_err_to_name(result));
+        wifiManagerScheduleReconnect("connect request rejected");
+      }
+    }
+  }
+
+  if ((now - lastReconcileMs) >= WIFI_RECONCILE_MS)
+  {
+    lastReconcileMs = now;
+    wifiManagerResync();
+  }
+}
+
+static void onWifiConnected(void)
+{
+  wifiEverConnected = true;
+
+  //-- The provisioner only ever calls this after a successful join: stored
+  //-- credentials at boot or a completed portal setup. Hand the runtime link
+  //-- over to the recovery manager — the callback runs on the provisioner's
+  //-- context, so it only posts; the manager reads the live association and
+  //-- IP state itself when it handles the handoff (section 2.3).
+  postWifiManagerEvent(WIFI_MGR_HANDOFF, 0);
+}
+
 static void onWifiPortalStart(void)
 {
   loggerBoardWifiPortal("http://192.168.4.1/");
@@ -389,6 +903,45 @@ static void onWifiPortalStart(void)
 static void wifiTask(void* argument)
 {
   (void)argument;
+
+  wifiManagerQueue = xQueueCreate(WIFI_MANAGER_QUEUE_LEN, sizeof(wifiManagerEvent));
+
+  if (wifiManagerQueue == NULL)
+  {
+    LOGGER_LOGE(tag, "could not create the Wi-Fi recovery queue");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  //-- Bring up NVS, ESP-NETIF and the default event loop once before
+  //-- subscribing, coordinated with the application start (section 2.1);
+  //-- wifi_prov_start() reuses the very same initialised resources.
+  esp_err_t initialised = wifi_prov_init();
+
+  if (initialised != ESP_OK)
+  {
+    LOGGER_LOGE(tag, "Wi-Fi stack could not initialise: %s", esp_err_to_name(initialised));
+  }
+
+  //-- The persistent link handlers are registered before the provisioner
+  //-- starts connecting, so not even the very first signals are missed;
+  //-- until the handoff every signal only updates the picture and never
+  //-- triggers a reconnect, because the component owns retries during
+  //-- provisioning. The instances live for the whole boot.
+  esp_event_handler_instance_t stationDownHandler = NULL;
+  esp_event_handler_instance_t stationUpHandler = NULL;
+  esp_event_handler_instance_t ipGrantedHandler = NULL;
+  esp_event_handler_instance_t ipLostHandler = NULL;
+
+  ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+                                                      &wifiManagerEventHandler, NULL,
+                                                      &stationDownHandler));
+  ESP_ERROR_CHECK(esp_event_handler_instance_register(
+      WIFI_EVENT, WIFI_EVENT_STA_CONNECTED, &wifiManagerEventHandler, NULL, &stationUpHandler));
+  ESP_ERROR_CHECK(esp_event_handler_instance_register(
+      IP_EVENT, IP_EVENT_STA_GOT_IP, &wifiManagerEventHandler, NULL, &ipGrantedHandler));
+  ESP_ERROR_CHECK(esp_event_handler_instance_register(
+      IP_EVENT, IP_EVENT_STA_LOST_IP, &wifiManagerEventHandler, NULL, &ipLostHandler));
 
   wifi_prov_config_t provisionerConfig = WIFI_PROV_DEFAULT_CONFIG();
   provisionerConfig.ap_ssid = "lastDSMRlogger-Setup";
@@ -402,62 +955,20 @@ static void wifiTask(void* argument)
     LOGGER_LOGE(tag, "provisioner start failed: %s", esp_err_to_name(result));
   }
 
-  //-- Keep the link up: the provisioner unregisters its retry handler after
-  //-- the first successful join. Reconnect only after that first connection
-  //-- so the component owns retries during provisioning. P1 telegrams keep
-  //-- being processed while the station is disconnected.
+  //-- The manager loop: every queued signal is handled first, then the tick
+  //-- runs the timers (backoff, association and IP deadlines, the periodic
+  //-- reconciliation) and the deferred lease work. P1 telegrams keep being
+  //-- processed while the station is disconnected.
   for (;;)
   {
-    vTaskDelay(pdMS_TO_TICKS(WIFI_RECONNECT_POLL_MS));
+    wifiManagerEvent event;
 
-    //-- "No Display" boot: now that the station has joined, remove the
-    //-- panel and the board inputs again (a tear-down while the network
-    //-- stack is still coming up crashes the logger, so this waits).
-    if (pendingDisplayOff && wifiEverConnected)
+    if (xQueueReceive(wifiManagerQueue, &event, pdMS_TO_TICKS(WIFI_MANAGER_TICK_MS)) == pdTRUE)
     {
-      pendingDisplayOff = false;
-      loggerBoardSetEnabled(false);
+      wifiManagerProcessEvent(&event);
     }
 
-    if (wifiEverConnected && !wifi_prov_is_connected())
-    {
-      LOGGER_LOGW(tag, "station disconnected, requesting a reconnect");
-
-      //-- Publication goes down with the link: without a station there is
-      //-- no route to the broker. onWifiConnected releases it again.
-      loggerMqttSetNetworkReady(false);
-      esp_wifi_connect();
-      continue;
-    }
-
-    //-- Deferred lease work from a settings save (see applyNetworkIdentity):
-    //-- performed here, well after the save has answered its browser.
-    if (wifiEverConnected && wifi_prov_is_connected())
-    {
-      if (pendingFixedIp)
-      {
-        pendingFixedIp = false;
-        applyNetworkIdentity(&activeNetworkConfig, true, false);
-      }
-      else if (pendingHostnameAnnounce)
-      {
-        pendingHostnameAnnounce = false;
-
-        //-- Only meaningful while the station stays on DHCP; the fixed-IP
-        //-- branch above owns the address when one is configured.
-        if (activeNetworkConfig.fixedIpLastOctet == 0u)
-        {
-          esp_netif_t* station = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-
-          if (station != NULL)
-          {
-            LOGGER_LOGI(tag, "re-announcing the hostname to DHCP");
-            esp_netif_dhcpc_stop(station);
-            esp_netif_dhcpc_start(station);
-          }
-        }
-      }
-    }
+    wifiManagerTick();
   }
 }
 
@@ -482,6 +993,16 @@ static void initialiseNvs(void)
 const char* getAppVersion(void)
 {
   return PROG_VERSION;
+}
+
+//-- Read-only live link state for the status reporters. The provisioner's
+//-- wifi_prov_is_connected() latches its very first success and its IP
+//-- getter can keep reporting the last address over an outage, so the SPA
+//-- status and the telnet `status` answer the Wi-Fi questions from the
+//-- recovery manager's live picture instead (recoveryWiFi.md section 2).
+bool wifiManagerStationHasIp(void)
+{
+  return stationHasIp;
 }
 
 void app_main(void)

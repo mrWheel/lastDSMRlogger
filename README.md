@@ -1,6 +1,6 @@
 # lastDSMRlogger
 <!--
-fileVersion: [61] - 24-11-2026 - 20:37
+fileVersion: [62] - 25-11-2026 - 09:12
 -->
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -14,7 +14,7 @@ telegram history lives in RAM.
 
 |Path                              |Role                                                                                   |
 |----------------------------------|---------------------------------------------------------------------------------------|
-|`main/`                           |Application entry, NVS init, Wi-Fi provisioner task, P1 interface Kconfig              |
+|`main/`                           |Application entry, NVS init, Wi-Fi provisioner and recovery manager task, P1 interface Kconfig |
 |`components/logger_settings/`     |Versioned NVS settings service, validation against parser profiles, data source and interval rules |
 |`components/logger_receiver/`     |Receive task ownership of UART adapter + parser, diagnostics, RAM telegram history     |
 |`components/logger_web/`          |esp_http_server: SPA assets and JSON API                                               |
@@ -132,6 +132,28 @@ With stored credentials the device connects directly and never opens the
 portal. P1 reception keeps running while Wi-Fi is disconnected; after a
 reconnect the web interface is reachable again without a reboot. To
 re-provision, erase NVS: `idf.py -p PORT erase-flash` before flashing.
+
+### 5.1 Keeping the connection up
+
+A recovery manager in the Wi-Fi task owns the station link after the
+provisioner's first join (design in `recoveryWiFi.md`): persistent station
+and IP event handlers feed a queue that one task serialises. On a runtime
+drop the station reconnects with exponential backoff (2 s first delay,
+doubling to a 60 s cap, plus jitter); the backoff resets as soon as an
+address is in hand again. SNTP, the SPA server, the telnet console, the SMB
+share and MQTT publication are re-armed through the same idempotent startup
+path as the first join, so a duplicate signal can never start a second
+anything. Association and IP assignment have separate 15 s deadlines: a
+missing address is retried once through a DHCP re-request and then through a
+fresh connection attempt. When attempts keep failing, the manager escalates
+with a rate-limited adapter restart (at most one per 10 minutes, always
+logged). The transitions worth watching are logged — drop with 802.11
+reason, scheduled retry with attempt number and backoff, deadlines, the
+adapter restart and the re-join line (`station joined '<SSID>' with IP
+<ip>`). While the captive portal is up the provisioner owns the station and
+the manager keeps reconnecting disabled; a boot while the AP is down
+therefore ends in the portal, where joining the stored network again needs
+the portal itself or a reboot once the AP is back.
 
 How to find the IP: the serial monitor line above, or the DHCP client list of
 your router for the host name `esp32-s3-<mac>`.

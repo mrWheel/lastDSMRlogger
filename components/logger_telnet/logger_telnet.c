@@ -75,6 +75,11 @@
 //-- commands show it.
 extern const char* getAppVersion(void);
 
+//-- Live Wi-Fi link state from the recovery manager in the application
+//-- entry (main/app_main.c): the provisioner's own state latches, this one
+//-- follows the station.
+extern bool wifiManagerStationHasIp(void);
+
 static const char* tag = "loggerTelnet";
 
 #define TELNET_PORT 23
@@ -462,7 +467,11 @@ static void printStatus(int fd)
   esp_netif_ip_info_t ipInfo;
   char ip[16] = "not connected";
 
-  if (wifi_prov_get_ip_info(&ipInfo) == ESP_OK)
+  //-- The recovery manager owns the live link state: the provisioner's
+  //-- wifi_prov_get_ip_info() latches its first join and can keep reporting
+  //-- the last address over an outage, so its answer only counts while the
+  //-- manager actually sees an address in hand.
+  if (wifiManagerStationHasIp() && (wifi_prov_get_ip_info(&ipInfo) == ESP_OK))
   {
     snprintf(ip, sizeof ip, IPSTR, IP2STR(&ipInfo.ip));
   }

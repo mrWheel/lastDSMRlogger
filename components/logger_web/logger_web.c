@@ -66,6 +66,11 @@ static loggerWebSettingsSavedCb settingsSavedCallback = NULL;
 //-- through the status JSON.
 extern const char* getAppVersion(void);
 
+//-- Live Wi-Fi link state from the recovery manager in the application
+//-- entry (main/app_main.c): the provisioner's own state latches, this one
+//-- follows the station.
+extern bool wifiManagerStationHasIp(void);
+
 //-- Embedded SPA assets (EMBED_TXTFILES in CMakeLists.txt).
 extern const char indexHtmlStart[] asm("_binary_index_html_start");
 extern const char indexHtmlEnd[] asm("_binary_index_html_end");
@@ -2722,7 +2727,12 @@ static esp_err_t handleApiV3StatusGet(httpd_req_t* req)
   esp_netif_ip_info_t ipInfo;
   memset(&ipInfo, 0, sizeof ipInfo);
   char ip[16] = "not connected";
-  bool wifiConnected = (wifi_prov_get_ip_info(&ipInfo) == ESP_OK);
+
+  //-- The recovery manager owns the live link state: the provisioner's
+  //-- wifi_prov_get_ip_info() latches its first join and can keep reporting
+  //-- the last address over an outage, so its answer only counts while the
+  //-- manager actually sees an address in hand.
+  bool wifiConnected = wifiManagerStationHasIp() && (wifi_prov_get_ip_info(&ipInfo) == ESP_OK);
 
   if (wifiConnected)
   {
