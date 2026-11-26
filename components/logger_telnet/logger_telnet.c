@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_telnet.c - telnet console server on port 23
-//-- Date: 2026-11-26 · Build: 25
+//-- Date: 2026-11-26 · Build: 26
 //--
 //-- A plain BSD-socket console task: it listens on port 23, serves exactly
 //-- one session at a time and answers a command set from the receiver,
@@ -22,7 +22,8 @@
 //-- a file name a command would ask for may follow the command directly
 //-- (filesystem show RINGmonths.csv) and [Tab] completes the word under the
 //-- cursor from the command table, the option table of the typed command or
-//-- the files on the LittleFS volume; a bare [Enter] prints
+//-- the files on the LittleFS volume (several matches complete to their
+//-- common prefix and are listed); a bare [Enter] prints
 //-- the help list, and the prompt the session shows is registered with the
 //-- arbiter so event and mirror lines end on a re-printed prompt instead of
 //-- a blank line; every write of this task brackets the shared console
@@ -576,8 +577,9 @@ static void printHelp(int fd)
                      "  (show == showring, popu m == populate months)\r\n"
                      "a file name may follow its command directly\r\n"
                      "  (filesystem show RINGmonths.csv)\r\n"
-                     "[Tab] completes command, option and volume file names and lists\r\n"
-                     "the choices when more than one matches\r\n"
+                     "[Tab] completes command, option and volume file names:\r\n"
+                     "  a unique match is typed out, several complete to their\r\n"
+                     "  common prefix and the choices are listed\r\n"
                      "an empty line shows this command list too\r\n");
 }
 
@@ -1768,8 +1770,9 @@ static size_t collectVolumeNames(const char* prefix)
 //-- arguments of the filesystem, settings, populate and ring2csv commands,
 //-- from the files on the volume; while a file question is open the whole
 //-- line completes against the volume files. One match is typed out for the
-//-- user, several are listed and the prompt or question is re-printed below
-//-- the list so the text typed so far stays visible.
+//-- user; several complete the word to their longest common prefix and are
+//-- listed, and the prompt or question is re-printed with the completed
+//-- line below the list so the choices and the text typed stay visible.
 static void handleTab(int fd, char* line, size_t* linePos)
 {
   const char* const* tableNames = NULL;
@@ -1975,8 +1978,21 @@ static void handleTab(int fd, char* line, size_t* linePos)
     return;
   }
 
-  //-- Several matches: list them, then re-print the question or prompt
-  //-- with the text typed so far below the list.
+  //-- Several matches: complete the word to the longest common prefix of
+  //-- the matches (the way shells do) and list them, then re-print the
+  //-- question or prompt with the completed line below the list. The names
+  //-- are sorted, so the case-insensitive common prefix of the first and
+  //-- the last match is shared by all of them; the casing echoed is the one
+  //-- of the first match.
+  size_t commonLength = 0u;
+
+  while ((completionNames[0][commonLength] != '\0') &&
+         (tolower((unsigned char)completionNames[0][commonLength]) ==
+          tolower((unsigned char)completionNames[count - 1u][commonLength])))
+  {
+    commonLength++;
+  }
+
   telnetSendText(fd, "\r\n");
 
   for (size_t index = 0u; index < count; index++)
@@ -1987,6 +2003,15 @@ static void handleTab(int fd, char* line, size_t* linePos)
   if (completionTruncated)
   {
     telnetSendText(fd, "...\r\n");
+  }
+
+  //-- The word only grows when the shared prefix runs past what was typed;
+  //-- an equal prefix leaves the line untouched under the listing.
+  if ((commonLength > strlen(prefix)) && ((tokenStart + commonLength + 1u) <= TELNET_LINE_MAX))
+  {
+    memcpy(line + tokenStart, completionNames[0], commonLength);
+    line[tokenStart + commonLength] = '\0';
+    *linePos = tokenStart + commonLength;
   }
 
   if (atQuestion)
