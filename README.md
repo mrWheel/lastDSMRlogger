@@ -1,6 +1,6 @@
 # lastDSMRlogger
 <!--
-fileVersion: [62] - 25-11-2026 - 09:12
+fileVersion: [63] - 26-11-2026 - 11:15
 -->
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -599,10 +599,10 @@ typed confirmation):
 |`raw [<seq>]`    |exact accepted bytes of one retained telegram; without a sequence the most recently accepted telegram |
 |`power`          |the realtime power frame of the newest accepted telegram         |
 |`showring <ring>`|stored records of one meter ring: `month`, `days` or `hours`       |
-|`ring2csv <ring>`|writes one meter ring to the volume (asks the csv file name; empty = `YYMMDDhhmm-<ring>.csv`, newest period first) (see below) |
-|`populate <ring> [mode]`|imports a LittleFS csv file into one meter ring: `hours`, `days` or `months`, mode `overwrite` or `update` (see below) |
-|`filesystem <action>`|LittleFS volume: `list` shows files with sizes, capacity and free space (the old `store` command); `delete` asks `delete what file: ` and, when the file exists, `Are you sure (N/y)?`; `rename` asks the old name, the new name and `Are you sure (N/y)?`; `show` asks `show what file` and prints its contents skipping every control character (only visible characters) |
-|`settings <action>`|`save` asks the ini file name (empty = `YYMMDDhhmm-settings.ini`, a plain name gets the `.ini` suffix) and writes every NVS entry to the volume; `load` asks the file and stores its values back into NVS (a restart applies them) |
+|`ring2csv <ring> [csv]`|writes one meter ring to the volume (asks the csv file name unless it follows the command; empty = `YYMMDDhhmm-<ring>.csv`, newest period first) (see below) |
+|`populate <ring> [mode] [file]`|imports a LittleFS csv file into one meter ring: `hours`, `days` or `months`, mode `overwrite` or `update`; the file may follow the command directly (see below) |
+|`filesystem <action> [file]`|LittleFS volume: `list` shows files with sizes, capacity and free space (the old `store` command); `delete` asks `delete what file: ` and, when the file exists, `Are you sure (N/y)?`; `rename` asks the old name, the new name and `Are you sure (N/y)?`; `show` asks `show what file` and prints its contents skipping every control character (only visible characters); the file name may follow the action directly |
+|`settings <action> [file]`|`save` asks the ini file name (empty = `YYMMDDhhmm-settings.ini`, a plain name gets the `.ini` suffix) and writes every NVS entry to the volume; `load` asks the file and stores its values back into NVS (a restart applies them); the file name may follow the action directly |
 |`sync`           |write all ring files to storage at once and restart the synchronisation interval |
 |`verbose {0..3}`  |set console event reporting: 0 no debug lines, 1 events + errors, 2 + telegram related, 3 + info + warnings (see below) |
 |`restart`        |synchronise the ring files and reboot the device (asks `are you sure (N/y)?`, anything but `y`/`yes` cancels) |
@@ -612,7 +612,14 @@ Commands are case-insensitive and may be shortened to any leading part that
 names exactly one command (`show` and `showri` both mean `showring`); a word
 that matches nothing is unknown and one that matches several commands is
 reported as ambiguous. `ringfile` stays available as the old synonym of
-`showring`.
+`showring`. The option words of the commands (ring selectors, the filesystem
+and settings actions and the populate mode) shorten the same way — `popu m`
+names `populate months` — and a file name a command would ask for may follow
+the command directly (`filesystem show RINGmonths.csv`,
+`settings load my.ini`, `ring2csv months out.csv`). `[Tab]` completes the
+word under the cursor: command words, option words and volume file names — a
+unique match is typed out for you, several matches are listed and the prompt
+or question is re-printed below the list.
 
 `verbose {0,1,2,3}` sets how loudly the console reports background lines:
 0 prints no debug lines, 1 prints one tagged line per notable event — every

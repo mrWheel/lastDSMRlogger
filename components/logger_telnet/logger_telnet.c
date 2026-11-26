@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_telnet.c - telnet console server on port 23
-//-- Date: 2026-11-24 · Build: 24
+//-- Date: 2026-11-26 · Build: 25
 //--
 //-- A plain BSD-socket console task: it listens on port 23, serves exactly
 //-- one session at a time and answers a command set from the receiver,
@@ -17,7 +17,12 @@
 //-- the reporting level at which the background event lines the store, MQTT
 //-- and API paths send through the control arbiter reach the console (at
 //-- level 3 the arbiter additionally mirrors the serial console log into the
-//-- session), and help shows the level currently set; a bare [Enter] prints
+//-- session), and help shows the level currently set; command and option
+//-- words shorten to any unique leading part (popu m names populate months),
+//-- a file name a command would ask for may follow the command directly
+//-- (filesystem show RINGmonths.csv) and [Tab] completes the word under the
+//-- cursor from the command table, the option table of the typed command or
+//-- the files on the LittleFS volume; a bare [Enter] prints
 //-- the help list, and the prompt the session shows is registered with the
 //-- arbiter so event and mirror lines end on a re-printed prompt instead of
 //-- a blank line; every write of this task brackets the shared console
@@ -148,6 +153,11 @@ static char fsPendingNewName[TELNET_LINE_MAX];
 static bool settingsAwaitingSaveName = false;
 static bool settingsAwaitingLoadName = false;
 
+//-- The question line currently awaiting a file name, kept so a [Tab]
+//-- completion listing can re-print the question (and the answer typed so
+//-- far) below the choices instead of leaving the user on a bare line.
+static char pendingQuestion[TELNET_LINE_MAX];
+
 //-- Every command word the console knows. Synonyms stay separate entries
 //-- (raw for the raw telegram dump, ringfile and exit as older spellings)
 //-- so a shortened word can name them too.
@@ -156,6 +166,15 @@ static const char* const telnetCommands[] = {
     "power", "showring", "ringfile", "filesystem", "settings", "populate",
     "quit",  "exit",     "ring2csv", "sync",       "verbose",  "restart",
 };
+
+//-- The option words of the commands that take them: the unique leading-part
+//-- abbreviation the command words get applies here too (popu m names
+//-- populate months) and [Tab] completes from these tables.
+static const char* const filesystemActions[] = {"list", "delete", "rename", "show"};
+static const char* const settingsActions[] = {"save", "load"};
+static const char* const ringSelections[] = {"hours", "days", "months"};
+static const char* const populateModeNames[] = {"overwrite", "update"};
+static const char* const verboseLevelNames[] = {"0", "1", "2", "3"};
 
 //-- The printf-style session writer is defined further down, the device
 //-- state block (part of the status command) further up than its user.
@@ -168,7 +187,7 @@ static void printComponentVersions(int fd);
 //-- unambiguous leading part of exactly one command ("show" and "showri"
 //-- both name "showring"). Unknown and ambiguous words are reported here
 //-- and give NULL.
-static const char* resolveCommand(int fd, const char* typed)
+static const char* findCommand(const char* typed, bool* ambiguous)
 {
   size_t typedLength = strlen(typed);
   const char* found = NULL;
@@ -178,6 +197,11 @@ static const char* resolveCommand(int fd, const char* typed)
   {
     if (strcasecmp(telnetCommands[index], typed) == 0)
     {
+      if (ambiguous != NULL)
+      {
+        *ambiguous = false;
+      }
+
       return telnetCommands[index];
     }
 
@@ -188,14 +212,162 @@ static const char* resolveCommand(int fd, const char* typed)
     }
   }
 
-  if (hits == 1u)
+  if (ambiguous != NULL)
+  {
+    *ambiguous = (hits != 1u);
+  }
+
+  return (hits == 1u) ? found : NULL;
+}
+
+static const char* resolveCommand(int fd, const char* typed)
+{
+  bool ambiguous = false;
+  const char* command = findCommand(typed, &ambiguous);
+
+  if (command == NULL)
+  {
+    telnetPrintf(fd, "%s command '%s' - type help for the command list\r\n",
+                 ambiguous ? "ambiguous" : "unknown", typed);
+  }
+
+  return command;
+}
+
+//-- Matches one typed option word against a table of option names the same
+//-- way findCommand does for command words: a case-insensitive exact match
+//-- always wins, otherwise the word must be an unambiguous leading part of
+//-- exactly one name. Silent: callers report, [Tab] completes with it.
+static const char* matchOption(const char* typed, const char* const* names, size_t nameCount,
+                               bool* ambiguous)
+{
+  size_t typedLength = strlen(typed);
+  const char* found = NULL;
+  uint8_t hits = 0u;
+
+  for (size_t index = 0u; index < nameCount; index++)
+  {
+    if (strcasecmp(names[index], typed) == 0)
+    {
+      if (ambiguous != NULL)
+      {
+        *ambiguous = false;
+      }
+
+      return names[index];
+    }
+
+    if ((typedLength > 0u) && (strncasecmp(names[index], typed, typedLength) == 0))
+    {
+      found = names[index];
+      hits++;
+    }
+  }
+
+  if (ambiguous != NULL)
+  {
+    *ambiguous = (hits != 1u);
+  }
+
+  return (hits == 1u) ? found : NULL;
+}
+
+//-- Resolves one typed option word against a table of option names,
+//-- reporting unknown and ambiguous words on the session the way
+//-- resolveCommand does for command words; label names the option set in
+//-- the report ("ring", "filesystem action", ...) and the report lists the
+//-- table's own names as the choices.
+static const char* resolveOption(int fd, const char* typed, const char* const* names,
+                                 size_t nameCount, const char* label)
+{
+  bool ambiguous = false;
+  const char* found = matchOption(typed, names, nameCount, &ambiguous);
+
+  if (found != NULL)
   {
     return found;
   }
 
-  telnetPrintf(fd, "%s command '%s' - type help for the command list\r\n",
-               (hits == 0u) ? "unknown" : "ambiguous", typed);
+  char choices[TELNET_PRINT_LINE_BYTES];
+  choices[0] = '\0';
+  size_t used = 0u;
+
+  for (size_t index = 0u; index < nameCount; index++)
+  {
+    int written =
+        snprintf(choices + used, sizeof choices - used, "%s%s",
+                 (index == 0u) ? "" : ((index + 1u == nameCount) ? " or " : ", "), names[index]);
+
+    if ((written < 0) || (used + (size_t)written >= sizeof choices))
+    {
+      break;
+    }
+
+    used += (size_t)written;
+  }
+
+  telnetPrintf(fd, "%s %s '%s' - use %s\r\n", ambiguous ? "ambiguous" : "unknown", label, typed,
+               choices);
   return NULL;
+}
+
+//-- Maps a typed ring selector to one meter ring: the store's own name table
+//-- first (it keeps the console's singular "month" spelling), then the
+//-- unique leading-part abbreviation the command and option words get ("m"
+//-- and "mo" both name the months ring).
+static bool resolveRing(int fd, const char* typed, loggerMeterRing_t* outRing)
+{
+  if (loggerStoreRingFromName(typed, outRing))
+  {
+    return true;
+  }
+
+  const char* found = resolveOption(fd, typed, ringSelections,
+                                    sizeof ringSelections / sizeof ringSelections[0], "ring");
+
+  return ((found != NULL) && loggerStoreRingFromName(found, outRing));
+}
+
+//-- The text with its surrounding spaces removed (a typed file name may
+//-- carry spaces around it; inner spaces stay, like the answer of a file
+//-- question which takes the whole line).
+static char* trimSpaces(char* text)
+{
+  while (isspace((unsigned char)*text))
+  {
+    text++;
+  }
+
+  size_t length = strlen(text);
+
+  while ((length > 0u) && isspace((unsigned char)text[length - 1u]))
+  {
+    text[--length] = '\0';
+  }
+
+  return text;
+}
+
+//-- Splits the next space-delimited word off *cursor (its trailing space
+//-- becomes a terminator) and moves the cursor past it. NULL when nothing
+//-- is left. The words live in the caller's line buffer.
+static char* nextArgument(char** cursor)
+{
+  char* start = trimSpaces(*cursor);
+  char* end = start;
+
+  while ((*end != '\0') && !isspace((unsigned char)*end))
+  {
+    end++;
+  }
+
+  if (*end != '\0')
+  {
+    *end++ = '\0';
+  }
+
+  *cursor = end;
+  return (start[0] != '\0') ? start : NULL;
 }
 
 //-- Suffix the importing line carries for a non-default populate mode.
@@ -366,20 +538,23 @@ static void printHelp(int fd)
           "  power              the realtime power frame of the newest telegram\r\n"
           "  showring {month|days|hours}\r\n"
           "                     the stored records of one meter ring (default hours)\r\n"
-          "  ring2csv {month|days|hours}\r\n"
+          "  ring2csv {month|days|hours} [csv]\r\n"
           "                     write one meter ring to the volume (asks the csv file\r\n"
-          "                     name; empty = YYMMDDhhmm-<name>.csv, newest period first)\r\n"
-          "  populate {hours|days|months} [overwrite|update]\r\n"
+          "                     name unless it follows the command; empty =\r\n"
+          "                     YYMMDDhhmm-<name>.csv, newest period first)\r\n"
+          "  populate {hours|days|months} [overwrite|update] [file]\r\n"
           "                     import a LittleFS csv file into one meter ring: merge\r\n"
           "                     (default) fills free slots, overwrite clears the ring\r\n"
-          "                     first, update only revises stored periods\r\n"
-          "  filesystem {list|delete|rename|show}\r\n"
+          "                     first, update only revises stored periods; the file\r\n"
+          "                     may follow the command directly\r\n"
+          "  filesystem {list|delete|rename|show} [file]\r\n"
           "                     LittleFS volume: list files with sizes, capacity\r\n"
           "                     and free space; delete and rename ask the file\r\n"
           "                     names (and an Are you sure (N/y) confirmation);\r\n"
           "                     show prints a file's contents skipping control\r\n"
-          "                     characters except tab, CR and LF (shown as-is)\r\n"
-          "  settings {save|load}\r\n"
+          "                     characters except tab, CR and LF (shown as-is);\r\n"
+          "                     the file may follow the command directly\r\n"
+          "  settings {save|load} [file]\r\n"
           "                     save asks the ini file name (empty =\r\n"
           "                     YYMMDDhhmm-settings.ini, a plain name gets the\r\n"
           "                     .ini suffix) and writes every settings field as\r\n"
@@ -397,7 +572,12 @@ static void printHelp(int fd)
                      "  restart            synchronise the ring files and reboot the device\r\n"
                      "                     (asks for confirmation)\r\n"
                      "  quit               close this session\r\n"
-                     "\r\ncommands may be shortened to a unique leading part (show == showring)\r\n"
+                     "\r\ncommands and options may be shortened to a unique leading part\r\n"
+                     "  (show == showring, popu m == populate months)\r\n"
+                     "a file name may follow its command directly\r\n"
+                     "  (filesystem show RINGmonths.csv)\r\n"
+                     "[Tab] completes command, option and volume file names and lists\r\n"
+                     "the choices when more than one matches\r\n"
                      "an empty line shows this command list too\r\n");
 }
 
@@ -1013,10 +1193,9 @@ static void printRingFile(int fd, const char* periodText)
 {
   loggerMeterRing_t ring = LOGGER_RING_HOURS;
 
-  if ((periodText != NULL) && (periodText[0] != '\0') &&
-      !loggerStoreRingFromName(periodText, &ring))
+  if ((periodText != NULL) && (periodText[0] != '\0') && !resolveRing(fd, periodText, &ring))
   {
-    telnetPrintf(fd, "unknown ring '%s' - use month, days or hours\r\n", periodText);
+    //-- resolveRing reported the unknown or ambiguous ring.
     return;
   }
 
@@ -1330,6 +1509,500 @@ static void runPopulate(int fd, const char* fileName)
   }
 }
 
+//-- --------------------------------------------------------------------------
+//-- Question answers (shared by the pending-answer blocks of handleLine and
+//-- by the file names that follow their command directly)
+//-- --------------------------------------------------------------------------
+
+//-- Answers the ring2csv csv-name question with a typed (or directly
+//-- supplied) name; the default name is passed as NULL so the store stamps
+//-- YYMMDDhhmm-<ring>.csv. Reports the outcome.
+static void answerExportName(int fd, const char* name)
+{
+  uint32_t records = 0u;
+  char finalName[TELNET_PATH_BYTES];
+  finalName[0] = '\0';
+
+  esp_err_t outcome =
+      loggerStoreRingToCsvNamed(exportRing, name, &records, finalName, sizeof finalName);
+
+  if (outcome != ESP_OK)
+  {
+    telnetPrintf(fd, "ring2csv failed: %s\r\n", esp_err_to_name(outcome));
+    return;
+  }
+
+  telnetPrintf(fd, "wrote %" PRIu32 " record(s) to %s on the volume (newest first)\r\n", records,
+               finalName);
+}
+
+//-- Answers the delete file question with a typed (or directly supplied)
+//-- name: an unknown file is reported, an existing one gets the typed
+//-- confirmation. True when the confirmation question is now open.
+static bool answerFsDeleteName(int fd, const char* name)
+{
+  if (!telnetFileExists(name))
+  {
+    telnetPrintf(fd, "no such file on the volume: '%s'\r\n", name);
+    return false;
+  }
+
+  snprintf(fsPendingName, sizeof fsPendingName, "%s", name);
+  fsConfirmIsRename = false;
+  fsAwaitingConfirm = true;
+  loggerControlConsoleSetPrompt(NULL);
+  telnetPrintf(fd, "\r\ndelete '%s' from the volume.\r\nAre you sure (N/y)? ", fsPendingName);
+  return true;
+}
+
+//-- Answers the rename old-name question with a typed (or directly supplied)
+//-- name: an unknown file is reported, an existing one is stored as the
+//-- rename source and the new name is asked. True when a question is open.
+static bool answerFsOldName(int fd, const char* name)
+{
+  if (!telnetFileExists(name))
+  {
+    telnetPrintf(fd, "no such file on the volume: '%s'\r\n", name);
+    return false;
+  }
+
+  snprintf(fsPendingName, sizeof fsPendingName, "%s", name);
+  fsAwaitingNewName = true;
+  snprintf(pendingQuestion, sizeof pendingQuestion, "%s", "new name: ");
+  loggerControlConsoleSetPrompt(NULL);
+  telnetPrintf(fd, "\r\nnew name: ");
+  return true;
+}
+
+//-- Answers the rename new-name question with a typed (or directly supplied)
+//-- name: an existing name is refused, a free one gets the typed
+//-- confirmation. True when the confirmation question is now open.
+static bool answerFsNewName(int fd, const char* name)
+{
+  if (telnetFileExists(name))
+  {
+    telnetPrintf(fd, "a file named '%s' already exists on the volume\r\n", name);
+    return false;
+  }
+
+  snprintf(fsPendingNewName, sizeof fsPendingNewName, "%s", name);
+  fsConfirmIsRename = true;
+  fsAwaitingConfirm = true;
+  loggerControlConsoleSetPrompt(NULL);
+  telnetPrintf(fd, "\r\nrename '%s' to '%s'.\r\nAre you sure (N/y)? ", fsPendingName,
+               fsPendingNewName);
+  return true;
+}
+
+//-- Answers the show file question with a typed (or directly supplied) name:
+//-- an unknown file is reported, an existing one is printed.
+static void answerFsShowName(int fd, const char* name)
+{
+  if (!telnetFileExists(name))
+  {
+    telnetPrintf(fd, "no such file on the volume: '%s'\r\n", name);
+    return;
+  }
+
+  printVolumeFile(fd, name);
+}
+
+//-- Answers the settings save name question with a typed (or directly
+//-- supplied) name; the default name is passed as NULL so the file is
+//-- stamped YYMMDDhhmm-settings.ini. Reports the outcome.
+static void answerSettingsSaveName(int fd, const char* requested)
+{
+  char finalName[TELNET_LINE_MAX + 8];
+  buildSettingsFileName(requested, finalName, sizeof finalName);
+
+  char path[TELNET_PATH_BYTES];
+  snprintf(path, sizeof path, "%s/%s", loggerStoreMountPoint(), finalName);
+
+  uint32_t fields = 0u;
+  esp_err_t outcome = loggerSettingsExportToFile(path, &fields);
+
+  if (outcome != ESP_OK)
+  {
+    telnetPrintf(fd, "settings save to %s failed: %s\r\n", finalName, esp_err_to_name(outcome));
+    return;
+  }
+
+  telnetPrintf(fd, "wrote %" PRIu32 " setting(s) to %s on the volume\r\n", fields, finalName);
+}
+
+//-- Answers the settings load question with a typed (or directly supplied)
+//-- name: an unknown file is reported, an existing one is read back into
+//-- NVS (a restart applies the values).
+static void answerSettingsLoadName(int fd, const char* name)
+{
+  if (!telnetFileExists(name))
+  {
+    telnetPrintf(fd, "no such file on the volume: '%s'\r\n", name);
+    return;
+  }
+
+  char path[TELNET_PATH_BYTES];
+  snprintf(path, sizeof path, "%s/%s", loggerStoreMountPoint(), name);
+
+  uint32_t fields = 0u;
+  esp_err_t outcome = loggerSettingsImportFromFile(path, &fields);
+
+  if (outcome != ESP_OK)
+  {
+    telnetPrintf(fd, "settings load of %s failed: %s\r\n", name, esp_err_to_name(outcome));
+    return;
+  }
+
+  telnetPrintf(fd, "loaded %" PRIu32 " setting(s) from %s into NVS - restart to apply them\r\n",
+               fields, name);
+}
+
+//-- --------------------------------------------------------------------------
+//-- Tab completion
+//-- --------------------------------------------------------------------------
+
+#define TELNET_COMPLETION_MAX_NAMES 24
+
+//-- One completion run fills this table; the single console task is its only
+//-- user, so a static buffer keeps the task stack clear of it. The truncated
+//-- flag notes a listing that hit the bound (only file listings can).
+static char completionNames[TELNET_COMPLETION_MAX_NAMES][TELNET_LINE_MAX];
+static bool completionTruncated = false;
+
+static int compareCompletionNames(const void* left, const void* right)
+{
+  return strcasecmp((const char*)left, (const char*)right);
+}
+
+//-- True while the session awaits an answer that names a volume file: [Tab]
+//-- then completes the whole line against the files on the LittleFS volume.
+static bool awaitingFileNameAnswer(void)
+{
+  return populateAwaitingFile || exportAwaitingName || fsAwaitingDeleteName || fsAwaitingOldName ||
+         fsAwaitingNewName || fsAwaitingShowName || settingsAwaitingSaveName ||
+         settingsAwaitingLoadName;
+}
+
+//-- Copies the table names that start with the prefix (case-insensitive)
+//-- into the completion table, alphabetically. Returns the collected count.
+static size_t collectTableNames(const char* prefix, const char* const* names, size_t nameCount)
+{
+  completionTruncated = false;
+  size_t prefixLength = strlen(prefix);
+  size_t count = 0u;
+
+  for (size_t index = 0u; index < nameCount; index++)
+  {
+    if (strncasecmp(names[index], prefix, prefixLength) != 0)
+    {
+      continue;
+    }
+
+    if (count < TELNET_COMPLETION_MAX_NAMES)
+    {
+      snprintf(completionNames[count], TELNET_LINE_MAX, "%s", names[index]);
+      count++;
+    }
+  }
+
+  qsort(completionNames, count, sizeof completionNames[0], compareCompletionNames);
+  return count;
+}
+
+//-- The same for the files on the LittleFS volume.
+static size_t collectVolumeNames(const char* prefix)
+{
+  completionTruncated = false;
+  const char* mountPoint = loggerStoreMountPoint();
+
+  if (mountPoint == NULL)
+  {
+    return 0u;
+  }
+
+  DIR* directory = opendir(mountPoint);
+
+  if (directory == NULL)
+  {
+    return 0u;
+  }
+
+  size_t prefixLength = strlen(prefix);
+  size_t count = 0u;
+  struct dirent* entry = NULL;
+
+  while ((entry = readdir(directory)) != NULL)
+  {
+    if ((strcmp(entry->d_name, ".") == 0) || (strcmp(entry->d_name, "..") == 0))
+    {
+      continue;
+    }
+
+    if ((prefixLength > 0u) && (strncasecmp(entry->d_name, prefix, prefixLength) != 0))
+    {
+      continue;
+    }
+
+    if (count < TELNET_COMPLETION_MAX_NAMES)
+    {
+      //-- The precision keeps a longer d_name inside the row and silence
+      //-- about it; volume names stay well below this bound.
+      snprintf(completionNames[count], TELNET_LINE_MAX, "%.*s", TELNET_LINE_MAX - 1, entry->d_name);
+      count++;
+    }
+    else
+    {
+      completionTruncated = true;
+    }
+  }
+
+  closedir(directory);
+
+  qsort(completionNames, count, sizeof completionNames[0], compareCompletionNames);
+  return count;
+}
+
+//-- Completes the word the cursor sits on when [Tab] is typed. At the
+//-- prompt the first word completes from the command table and the words
+//-- behind it from the option table of the command typed or, for the file
+//-- arguments of the filesystem, settings, populate and ring2csv commands,
+//-- from the files on the volume; while a file question is open the whole
+//-- line completes against the volume files. One match is typed out for the
+//-- user, several are listed and the prompt or question is re-printed below
+//-- the list so the text typed so far stays visible.
+static void handleTab(int fd, char* line, size_t* linePos)
+{
+  const char* const* tableNames = NULL;
+  size_t tableNameCount = 0u;
+  bool fileCompletion = false;
+  size_t tokenStart = 0u;
+  bool atQuestion = awaitingFileNameAnswer();
+  char prefix[TELNET_LINE_MAX];
+
+  if (!atQuestion)
+  {
+    //-- The word at the cursor: everything after the last space typed.
+    tokenStart = *linePos;
+
+    while ((tokenStart > 0u) && (line[tokenStart - 1u] != ' '))
+    {
+      tokenStart--;
+    }
+
+    //-- How many words sit before it: zero names the command word.
+    size_t wordIndex = 0u;
+    bool betweenWords = true;
+
+    for (size_t index = 0u; index < tokenStart; index++)
+    {
+      if (line[index] == ' ')
+      {
+        betweenWords = true;
+      }
+      else if (betweenWords)
+      {
+        betweenWords = false;
+        wordIndex++;
+      }
+    }
+
+    memcpy(prefix, line + tokenStart, *linePos - tokenStart);
+    prefix[*linePos - tokenStart] = '\0';
+
+    if (wordIndex == 0u)
+    {
+      tableNames = telnetCommands;
+      tableNameCount = sizeof telnetCommands / sizeof telnetCommands[0];
+    }
+    else
+    {
+      //-- The command word decides which table (or the volume) completes.
+      char firstWord[TELNET_LINE_MAX];
+      size_t firstLength = 0u;
+
+      while ((firstLength < (sizeof firstWord - 1u)) && (firstLength < tokenStart) &&
+             (line[firstLength] != ' '))
+      {
+        firstWord[firstLength] = line[firstLength];
+        firstLength++;
+      }
+
+      firstWord[firstLength] = '\0';
+
+      bool ambiguous = false;
+      const char* command = findCommand(firstWord, &ambiguous);
+
+      if (command == NULL)
+      {
+        return;
+      }
+
+      if (strcmp(command, "filesystem") == 0)
+      {
+        if (wordIndex == 1u)
+        {
+          tableNames = filesystemActions;
+          tableNameCount = sizeof filesystemActions / sizeof filesystemActions[0];
+        }
+        else
+        {
+          fileCompletion = true;
+        }
+      }
+      else if (strcmp(command, "settings") == 0)
+      {
+        if (wordIndex == 1u)
+        {
+          tableNames = settingsActions;
+          tableNameCount = sizeof settingsActions / sizeof settingsActions[0];
+        }
+        else
+        {
+          fileCompletion = true;
+        }
+      }
+      else if (strcmp(command, "populate") == 0)
+      {
+        if (wordIndex == 1u)
+        {
+          tableNames = ringSelections;
+          tableNameCount = sizeof ringSelections / sizeof ringSelections[0];
+        }
+        else if (wordIndex == 2u)
+        {
+          //-- The third word is the import mode or, when it names no mode,
+          //-- already the csv file to import.
+          if (matchOption(prefix, populateModeNames,
+                          sizeof populateModeNames / sizeof populateModeNames[0], NULL) != NULL)
+          {
+            tableNames = populateModeNames;
+            tableNameCount = sizeof populateModeNames / sizeof populateModeNames[0];
+          }
+          else
+          {
+            fileCompletion = true;
+          }
+        }
+        else
+        {
+          fileCompletion = true;
+        }
+      }
+      else if (strcmp(command, "ring2csv") == 0)
+      {
+        if (wordIndex == 1u)
+        {
+          tableNames = ringSelections;
+          tableNameCount = sizeof ringSelections / sizeof ringSelections[0];
+        }
+        else
+        {
+          fileCompletion = true;
+        }
+      }
+      else if ((strcmp(command, "showring") == 0) || (strcmp(command, "ringfile") == 0))
+      {
+        if (wordIndex == 1u)
+        {
+          tableNames = ringSelections;
+          tableNameCount = sizeof ringSelections / sizeof ringSelections[0];
+        }
+        else
+        {
+          return;
+        }
+      }
+      else if (strcmp(command, "verbose") == 0)
+      {
+        if (wordIndex == 1u)
+        {
+          tableNames = verboseLevelNames;
+          tableNameCount = sizeof verboseLevelNames / sizeof verboseLevelNames[0];
+        }
+        else
+        {
+          return;
+        }
+      }
+      else
+      {
+        return;
+      }
+    }
+  }
+  else
+  {
+    //-- A file question is open: the whole line is the file name.
+    fileCompletion = true;
+    memcpy(prefix, line, *linePos);
+    prefix[*linePos] = '\0';
+  }
+
+  size_t count = fileCompletion ? collectVolumeNames(prefix)
+                                : collectTableNames(prefix, tableNames, tableNameCount);
+
+  if ((count == 0u) || ((count == 1u) && (strcasecmp(prefix, completionNames[0]) == 0)))
+  {
+    //-- Nothing matches, or the word is already typed in full.
+    return;
+  }
+
+  if (count == 1u)
+  {
+    char replacement[TELNET_LINE_MAX + 2];
+    snprintf(replacement, sizeof replacement, "%s", completionNames[0]);
+
+    if (tableNames != NULL)
+    {
+      //-- Commands and options end here: the space invites the next word.
+      strcat(replacement, " ");
+    }
+
+    if ((tokenStart + strlen(replacement) + 1u) > TELNET_LINE_MAX)
+    {
+      return;
+    }
+
+    //-- Erase the typed word, echo the completed one and keep the line.
+    for (size_t index = *linePos; index > tokenStart; index--)
+    {
+      telnetSendText(fd, "\b \b");
+    }
+
+    telnetSendText(fd, replacement);
+    memcpy(line + tokenStart, replacement, strlen(replacement) + 1u);
+    *linePos = tokenStart + strlen(replacement);
+    return;
+  }
+
+  //-- Several matches: list them, then re-print the question or prompt
+  //-- with the text typed so far below the list.
+  telnetSendText(fd, "\r\n");
+
+  for (size_t index = 0u; index < count; index++)
+  {
+    telnetPrintf(fd, "%s\r\n", completionNames[index]);
+  }
+
+  if (completionTruncated)
+  {
+    telnetSendText(fd, "...\r\n");
+  }
+
+  if (atQuestion)
+  {
+    telnetSendText(fd, pendingQuestion);
+  }
+  else
+  {
+    telnetShowPrompt(fd);
+  }
+
+  //-- Only the typed part of the buffer: the bytes behind the cursor are
+  //-- stale from earlier, longer lines.
+  telnetSend(fd, line, *linePos);
+}
+
 //-- Handles one complete command line. Returns false when the session must
 //-- close (the quit command).
 static bool handleLine(int fd, char* line)
@@ -1363,24 +2036,7 @@ static bool handleLine(int fd, char* line)
   if (exportAwaitingName)
   {
     exportAwaitingName = false;
-
-    uint32_t records = 0u;
-    char finalName[TELNET_PATH_BYTES];
-    finalName[0] = '\0';
-
-    esp_err_t outcome = loggerStoreRingToCsvNamed(exportRing, (*line != '\0') ? line : NULL,
-                                                  &records, finalName, sizeof finalName);
-
-    if (outcome != ESP_OK)
-    {
-      telnetPrintf(fd, "ring2csv failed: %s\r\n", esp_err_to_name(outcome));
-    }
-    else
-    {
-      telnetPrintf(fd, "wrote %" PRIu32 " record(s) to %s on the volume (newest first)\r\n",
-                   records, finalName);
-    }
-
+    answerExportName(fd, (*line != '\0') ? line : NULL);
     telnetShowPrompt(fd);
     return true;
   }
@@ -1433,21 +2089,11 @@ static bool handleLine(int fd, char* line)
     {
       telnetPrintf(fd, "delete cancelled\r\n");
     }
-    else if (!telnetFileExists(line))
+    else if (!answerFsDeleteName(fd, line))
     {
-      telnetPrintf(fd, "no such file on the volume: '%s'\r\n", line);
-    }
-    else
-    {
-      snprintf(fsPendingName, sizeof fsPendingName, "%s", line);
-      fsConfirmIsRename = false;
-      fsAwaitingConfirm = true;
-      loggerControlConsoleSetPrompt(NULL);
-      telnetPrintf(fd, "\r\ndelete '%s' from the volume.\r\nAre you sure (N/y)? ", fsPendingName);
-      return true;
+      telnetShowPrompt(fd);
     }
 
-    telnetShowPrompt(fd);
     return true;
   }
 
@@ -1461,20 +2107,11 @@ static bool handleLine(int fd, char* line)
     {
       telnetPrintf(fd, "rename cancelled\r\n");
     }
-    else if (!telnetFileExists(line))
+    else if (!answerFsOldName(fd, line))
     {
-      telnetPrintf(fd, "no such file on the volume: '%s'\r\n", line);
-    }
-    else
-    {
-      snprintf(fsPendingName, sizeof fsPendingName, "%s", line);
-      fsAwaitingNewName = true;
-      loggerControlConsoleSetPrompt(NULL);
-      telnetPrintf(fd, "new name: ");
-      return true;
+      telnetShowPrompt(fd);
     }
 
-    telnetShowPrompt(fd);
     return true;
   }
 
@@ -1488,22 +2125,11 @@ static bool handleLine(int fd, char* line)
     {
       telnetPrintf(fd, "rename cancelled\r\n");
     }
-    else if (telnetFileExists(line))
+    else if (!answerFsNewName(fd, line))
     {
-      telnetPrintf(fd, "a file named '%s' already exists on the volume\r\n", line);
-    }
-    else
-    {
-      snprintf(fsPendingNewName, sizeof fsPendingNewName, "%s", line);
-      fsConfirmIsRename = true;
-      fsAwaitingConfirm = true;
-      loggerControlConsoleSetPrompt(NULL);
-      telnetPrintf(fd, "\r\nrename '%s' to '%s'.\r\nAre you sure (N/y)? ", fsPendingName,
-                   fsPendingNewName);
-      return true;
+      telnetShowPrompt(fd);
     }
 
-    telnetShowPrompt(fd);
     return true;
   }
 
@@ -1516,13 +2142,9 @@ static bool handleLine(int fd, char* line)
     {
       telnetPrintf(fd, "show cancelled\r\n");
     }
-    else if (!telnetFileExists(line))
-    {
-      telnetPrintf(fd, "no such file on the volume: '%s'\r\n", line);
-    }
     else
     {
-      printVolumeFile(fd, line);
+      answerFsShowName(fd, line);
     }
 
     telnetShowPrompt(fd);
@@ -1582,25 +2204,7 @@ static bool handleLine(int fd, char* line)
   if (settingsAwaitingSaveName)
   {
     settingsAwaitingSaveName = false;
-
-    char finalName[TELNET_LINE_MAX + 8];
-    buildSettingsFileName((*line != '\0') ? line : NULL, finalName, sizeof finalName);
-
-    char path[TELNET_PATH_BYTES];
-    snprintf(path, sizeof path, "%s/%s", loggerStoreMountPoint(), finalName);
-
-    uint32_t fields = 0u;
-    esp_err_t outcome = loggerSettingsExportToFile(path, &fields);
-
-    if (outcome != ESP_OK)
-    {
-      telnetPrintf(fd, "settings save to %s failed: %s\r\n", finalName, esp_err_to_name(outcome));
-    }
-    else
-    {
-      telnetPrintf(fd, "wrote %" PRIu32 " setting(s) to %s on the volume\r\n", fields, finalName);
-    }
-
+    answerSettingsSaveName(fd, (*line != '\0') ? line : NULL);
     telnetShowPrompt(fd);
     return true;
   }
@@ -1615,28 +2219,9 @@ static bool handleLine(int fd, char* line)
     {
       telnetPrintf(fd, "load cancelled\r\n");
     }
-    else if (!telnetFileExists(line))
-    {
-      telnetPrintf(fd, "no such file on the volume: '%s'\r\n", line);
-    }
     else
     {
-      char path[TELNET_PATH_BYTES];
-      snprintf(path, sizeof path, "%s/%s", loggerStoreMountPoint(), line);
-
-      uint32_t fields = 0u;
-      esp_err_t outcome = loggerSettingsImportFromFile(path, &fields);
-
-      if (outcome != ESP_OK)
-      {
-        telnetPrintf(fd, "settings load of %s failed: %s\r\n", line, esp_err_to_name(outcome));
-      }
-      else
-      {
-        telnetPrintf(fd,
-                     "loaded %" PRIu32 " setting(s) from %s into NVS - restart to apply them\r\n",
-                     fields, line);
-      }
+      answerSettingsLoadName(fd, line);
     }
 
     telnetShowPrompt(fd);
@@ -1737,36 +2322,47 @@ static bool handleLine(int fd, char* line)
   }
   else if (strcmp(command, "ring2csv") == 0)
   {
-    //-- The selector picks the ring (no default: exporting is a write); the
-    //-- file lands at the volume root as YYMMDDhhmm-<name>.csv, ready for
-    //-- the SMB share and for a populate re-import.
+    //-- The first word picks the ring (no default: exporting is a write),
+    //-- the optional rest names the csv file (empty keeps the default
+    //-- YYMMDDhhmm-<name>.csv, stamped with the wall clock at export time,
+    //-- a plain name gets the .csv suffix); without it the command asks.
+    //-- The export lands at the volume root newest period first, ready for
+    //-- the SMB share and a populate re-import.
+    char* cursor = (arguments != NULL) ? arguments : (char*)"";
+    char* ringText = nextArgument(&cursor);
     loggerMeterRing_t ring = LOGGER_RING_HOURS;
 
-    if ((arguments == NULL) || (arguments[0] == '\0'))
+    if (ringText == NULL)
     {
-      telnetPrintf(fd, "usage: ring2csv {hours|days|months}\r\n");
+      telnetPrintf(fd, "usage: ring2csv {hours|days|months} [csv file]\r\n");
     }
-    else if (!loggerStoreRingFromName(arguments, &ring))
+    else if (!resolveRing(fd, ringText, &ring))
     {
-      telnetPrintf(fd, "unknown ring '%s' - use month, days or hours\r\n", arguments);
+      //-- resolveRing reported the unknown or ambiguous ring.
     }
     else
     {
-      //-- The selector names the ring, the next line names the csv file
-      //-- (empty keeps the default YYMMDDhhmm-<name>.csv, stamped with the
-      //-- wall clock at export time, a plain name gets the .csv suffix);
-      //-- the export then lands at the volume root newest
-      //-- period first, ready for the SMB share and a populate re-import.
       exportRing = ring;
-      exportAwaitingName = true;
+      char* csvName = trimSpaces(cursor);
 
-      //-- The question replaces the prompt: an event line landing while the
-      //-- question waits must not re-print a prompt below the answer.
-      loggerControlConsoleSetPrompt(NULL);
-      telnetPrintf(fd,
-                   "\r\nexporting the %s ring.\r\nnew csv file name (empty = YYMMDDhhmm-%s.csv): ",
-                   loggerStoreRingName(ring), loggerStoreRingName(ring));
-      return true; //-- the file name replaces the next prompt
+      if (csvName[0] != '\0')
+      {
+        answerExportName(fd, csvName);
+      }
+      else
+      {
+        exportAwaitingName = true;
+
+        //-- The question replaces the prompt: an event line landing while the
+        //-- question waits must not re-print a prompt below the answer.
+        snprintf(pendingQuestion, sizeof pendingQuestion,
+                 "new csv file name (empty = YYMMDDhhmm-%s.csv): ", loggerStoreRingName(ring));
+        loggerControlConsoleSetPrompt(NULL);
+        telnetPrintf(
+            fd, "\r\nexporting the %s ring.\r\nnew csv file name (empty = YYMMDDhhmm-%s.csv): ",
+            loggerStoreRingName(ring), loggerStoreRingName(ring));
+        return true; //-- the file name replaces the next prompt
+      }
     }
   }
   else if (strcmp(command, "sync") == 0)
@@ -1834,160 +2430,243 @@ static bool handleLine(int fd, char* line)
   }
   else if (strcmp(command, "filesystem") == 0)
   {
-    //-- The action word picks the volume operation: list reports the volume
-    //-- (the old store command), delete and rename ask their questions and
-    //-- confirm before they touch a file, show prints one file's contents
-    //-- (tab, CR and LF shown as-is, other control characters skipped).
-    char actionText[32];
-    actionText[0] = '\0';
+    //-- The action word picks the volume operation (it shortens like the
+    //-- command words: file s == filesystem show): list reports the volume
+    //-- (the old store command), delete and rename confirm before they touch
+    //-- a file, show prints one file's contents (tab, CR and LF shown as-is,
+    //-- other control characters skipped). The file a command would ask for
+    //-- may follow the action directly; without it the question is asked.
+    char* cursor = (arguments != NULL) ? arguments : (char*)"";
+    char* actionText = nextArgument(&cursor);
+    const char* action = (actionText != NULL)
+                             ? resolveOption(fd, actionText, filesystemActions,
+                                             sizeof filesystemActions / sizeof filesystemActions[0],
+                                             "filesystem action")
+                             : NULL;
 
-    if (arguments != NULL)
+    if (actionText == NULL)
     {
-      (void)sscanf(arguments, "%31s", actionText);
+      telnetPrintf(fd, "usage: filesystem {list|delete|rename|show} [file]\r\n");
     }
-
-    if (actionText[0] == '\0')
+    else if (action == NULL)
     {
-      telnetPrintf(fd, "usage: filesystem {list|delete|rename|show}\r\n");
+      //-- resolveOption reported the unknown or ambiguous action.
     }
-    else if (strcasecmp(actionText, "list") == 0)
+    else if (strcmp(action, "list") == 0)
     {
       printStore(fd);
     }
-    else if (strcasecmp(actionText, "delete") == 0)
+    else if (strcmp(action, "delete") == 0)
     {
       if (telnetVolumeMounted(fd))
       {
+        char* fileName = trimSpaces(cursor);
+
+        if (fileName[0] != '\0')
+        {
+          if (!answerFsDeleteName(fd, fileName))
+          {
+            telnetShowPrompt(fd);
+          }
+
+          return true;
+        }
+
         fsAwaitingDeleteName = true;
+        snprintf(pendingQuestion, sizeof pendingQuestion, "%s", "delete what file: ");
         loggerControlConsoleSetPrompt(NULL);
         telnetPrintf(fd, "\r\ndelete what file: ");
         return true;
       }
     }
-    else if (strcasecmp(actionText, "rename") == 0)
+    else if (strcmp(action, "rename") == 0)
     {
       if (telnetVolumeMounted(fd))
       {
-        fsAwaitingOldName = true;
-        loggerControlConsoleSetPrompt(NULL);
-        telnetPrintf(fd, "\r\nrename old name: ");
+        char* oldName = nextArgument(&cursor);
+
+        if (oldName == NULL)
+        {
+          fsAwaitingOldName = true;
+          snprintf(pendingQuestion, sizeof pendingQuestion, "%s", "rename old name: ");
+          loggerControlConsoleSetPrompt(NULL);
+          telnetPrintf(fd, "\r\nrename old name: ");
+          return true;
+        }
+
+        if (!answerFsOldName(fd, oldName))
+        {
+          telnetShowPrompt(fd);
+          return true;
+        }
+
+        //-- The new name may ride along too; without it the question asks.
+        char* newName = trimSpaces(cursor);
+
+        if ((newName[0] != '\0') && !answerFsNewName(fd, newName))
+        {
+          telnetShowPrompt(fd);
+        }
+
         return true;
       }
     }
-    else if (strcasecmp(actionText, "show") == 0)
+    else if (strcmp(action, "show") == 0)
     {
       if (telnetVolumeMounted(fd))
       {
-        fsAwaitingShowName = true;
-        loggerControlConsoleSetPrompt(NULL);
-        telnetPrintf(fd, "\r\nshow what file: ");
-        return true;
+        char* fileName = trimSpaces(cursor);
+
+        if (fileName[0] != '\0')
+        {
+          answerFsShowName(fd, fileName);
+        }
+        else
+        {
+          fsAwaitingShowName = true;
+          snprintf(pendingQuestion, sizeof pendingQuestion, "%s", "show what file: ");
+          loggerControlConsoleSetPrompt(NULL);
+          telnetPrintf(fd, "\r\nshow what file: ");
+          return true;
+        }
       }
-    }
-    else
-    {
-      telnetPrintf(fd, "unknown filesystem action '%s' - use list, delete, rename or show\r\n",
-                   actionText);
     }
   }
   else if (strcmp(command, "settings") == 0)
   {
     //-- save writes every settings field as a plain ascii ini file on the
-    //-- volume, load reads such a file back into NVS; both ask their
-    //-- question first.
-    char actionText[32];
-    actionText[0] = '\0';
+    //-- volume, load reads such a file back into NVS; the action shortens
+    //-- like the command words and the file name may follow it directly;
+    //-- without one save keeps its stamped default and load asks.
+    char* cursor = (arguments != NULL) ? arguments : (char*)"";
+    char* actionText = nextArgument(&cursor);
+    const char* action =
+        (actionText != NULL)
+            ? resolveOption(fd, actionText, settingsActions,
+                            sizeof settingsActions / sizeof settingsActions[0], "settings action")
+            : NULL;
 
-    if (arguments != NULL)
+    if (actionText == NULL)
     {
-      (void)sscanf(arguments, "%31s", actionText);
+      telnetPrintf(fd, "usage: settings {save|load} [file]\r\n");
     }
-
-    if (actionText[0] == '\0')
+    else if (action == NULL)
     {
-      telnetPrintf(fd, "usage: settings {save|load}\r\n");
+      //-- resolveOption reported the unknown or ambiguous action.
     }
-    else if (strcasecmp(actionText, "save") == 0)
+    else if (strcmp(action, "save") == 0)
     {
       if (telnetVolumeMounted(fd))
       {
-        settingsAwaitingSaveName = true;
-        loggerControlConsoleSetPrompt(NULL);
-        telnetPrintf(fd, "\r\nsave settings to (empty = YYMMDDhhmm-settings.ini): ");
-        return true;
+        char* fileName = trimSpaces(cursor);
+
+        if (fileName[0] != '\0')
+        {
+          answerSettingsSaveName(fd, fileName);
+        }
+        else
+        {
+          settingsAwaitingSaveName = true;
+          snprintf(pendingQuestion, sizeof pendingQuestion, "%s",
+                   "save settings to (empty = YYMMDDhhmm-settings.ini): ");
+          loggerControlConsoleSetPrompt(NULL);
+          telnetPrintf(fd, "\r\nsave settings to (empty = YYMMDDhhmm-settings.ini): ");
+          return true;
+        }
       }
     }
-    else if (strcasecmp(actionText, "load") == 0)
+    else if (strcmp(action, "load") == 0)
     {
       if (telnetVolumeMounted(fd))
       {
-        settingsAwaitingLoadName = true;
-        loggerControlConsoleSetPrompt(NULL);
-        telnetPrintf(fd, "\r\nload what settings file: ");
-        return true;
+        char* fileName = trimSpaces(cursor);
+
+        if (fileName[0] != '\0')
+        {
+          answerSettingsLoadName(fd, fileName);
+        }
+        else
+        {
+          settingsAwaitingLoadName = true;
+          snprintf(pendingQuestion, sizeof pendingQuestion, "%s", "load what settings file: ");
+          loggerControlConsoleSetPrompt(NULL);
+          telnetPrintf(fd, "\r\nload what settings file: ");
+          return true;
+        }
       }
-    }
-    else
-    {
-      telnetPrintf(fd, "unknown settings action '%s' - use save or load\r\n", actionText);
     }
   }
   else if (strcmp(command, "populate") == 0)
   {
-    //-- The first argument picks the ring (no default: importing is a
-    //-- write), the optional second one how the ring's current records are
-    //-- treated (merge is the default); accepted arguments then ask for
-    //-- the csv file to import.
+    //-- The first word picks the ring (no default: importing is a write),
+    //-- the optional second one how the ring's current records are treated
+    //-- (merge is the default) and the optional rest names the csv file to
+    //-- import. Ring and mode shorten like the command words (popu m names
+    //-- populate months); a word that names no mode is the file, and
+    //-- without one the command asks.
+    char* cursor = (arguments != NULL) ? arguments : (char*)"";
+    char* ringText = nextArgument(&cursor);
     loggerMeterRing_t ring = LOGGER_RING_HOURS;
     loggerPopulateMode_t mode = LOGGER_POPULATE_MERGE;
-    bool accepted = true;
-    char ringText[32];
-    char modeText[32];
-    ringText[0] = '\0';
-    modeText[0] = '\0';
 
-    if ((arguments == NULL) || (arguments[0] == '\0'))
+    if (ringText == NULL)
     {
-      telnetPrintf(fd, "usage: populate {hours|days|months} [overwrite|update]\r\n");
-      accepted = false;
+      telnetPrintf(fd, "usage: populate {hours|days|months} [overwrite|update] [file]\r\n");
+    }
+    else if (!resolveRing(fd, ringText, &ring))
+    {
+      //-- resolveRing reported the unknown or ambiguous ring.
     }
     else
     {
-      (void)sscanf(arguments, "%31s %31s", ringText, modeText);
-    }
+      //-- The second word is the mode (or its shortened form) or, when it
+      //-- names no mode, the csv file itself.
+      char* fileName = cursor;
+      char modeWord[TELNET_LINE_MAX];
+      size_t wordLength = 0u;
 
-    if (accepted && !loggerStoreRingFromName(ringText, &ring))
-    {
-      telnetPrintf(fd, "unknown ring '%s' - use month, days or hours\r\n", ringText);
-      accepted = false;
-    }
-
-    if (accepted && (modeText[0] != '\0'))
-    {
-      if (strcasecmp(modeText, "overwrite") == 0)
+      while ((wordLength < (sizeof modeWord - 1u)) && (fileName[wordLength] != '\0') &&
+             !isspace((unsigned char)fileName[wordLength]))
       {
-        mode = LOGGER_POPULATE_OVERWRITE;
+        modeWord[wordLength] = fileName[wordLength];
+        wordLength++;
       }
-      else if (strcasecmp(modeText, "update") == 0)
+
+      modeWord[wordLength] = '\0';
+
+      const char* modeHit =
+          (modeWord[0] != '\0')
+              ? matchOption(modeWord, populateModeNames,
+                            sizeof populateModeNames / sizeof populateModeNames[0], NULL)
+              : NULL;
+
+      if (modeHit != NULL)
       {
-        mode = LOGGER_POPULATE_UPDATE;
+        mode = (strcasecmp(modeHit, "overwrite") == 0) ? LOGGER_POPULATE_OVERWRITE
+                                                       : LOGGER_POPULATE_UPDATE;
+        fileName = trimSpaces(fileName + wordLength);
       }
       else
       {
-        telnetPrintf(fd, "unknown mode '%s' - use overwrite or update\r\n", modeText);
-        accepted = false;
+        fileName = trimSpaces(fileName);
       }
-    }
 
-    if (accepted)
-    {
       populateRing = ring;
       populateMode = mode;
-      populateAwaitingFile = true;
-      loggerControlConsoleSetPrompt(NULL);
-      telnetPrintf(fd, "\r\nimporting into the %s ring%s.\r\n%s", loggerStoreRingName(ring),
-                   populateModeLabel(mode), TELNET_POPULATE_QUESTION);
-      return true; //-- the file name replaces the next prompt
+
+      if (fileName[0] != '\0')
+      {
+        runPopulate(fd, fileName);
+      }
+      else
+      {
+        populateAwaitingFile = true;
+        snprintf(pendingQuestion, sizeof pendingQuestion, "%s", TELNET_POPULATE_QUESTION);
+        loggerControlConsoleSetPrompt(NULL);
+        telnetPrintf(fd, "\r\nimporting into the %s ring%s.\r\n%s", loggerStoreRingName(ring),
+                     populateModeLabel(mode), TELNET_POPULATE_QUESTION);
+        return true; //-- the file name replaces the next prompt
+      }
     }
   }
   else if ((strcmp(command, "quit") == 0) || (strcmp(command, "exit") == 0))
@@ -2229,6 +2908,13 @@ static void telnetTaskLoop(void* argument)
               linePos--;
               telnetSendText(clientFd, "\b \b");
             }
+          }
+          else if (byte == '\t')
+          {
+            //-- [Tab] completes the word under the cursor: command, option
+            //-- or volume file name (see handleTab).
+            pendingCr = false;
+            handleTab(clientFd, line, &linePos);
           }
           else if (isprint((int)byte))
           {
