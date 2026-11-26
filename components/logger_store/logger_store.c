@@ -256,14 +256,29 @@ bool loggerStoreRingFromName(const char* name, loggerMeterRing_t* outRing)
 static const char* const wantedObis[STORE_WANTED_COUNT] = {
     "1-0:1.8.1", "1-0:1.8.2", "1-0:2.8.1", "1-0:2.8.2", "0-1:24.2.1", "0-1:24.2.3", "0-0:96.14.0"};
 
+//-- The wanted codes up to (but excluding) this index are the cumulative
+//-- counters; the last one is the tariff indicator (an indicator code, not
+//-- a counter, so the never-negative rule does not apply to it).
+#define STORE_WANTED_COUNTER_COUNT 6u
+
 typedef struct
 {
   float values[STORE_WANTED_COUNT];
   bool found[STORE_WANTED_COUNT];
+
+  //-- Set when the telegram published a counter as a negative number: the
+  //-- P1 port never does that, so the caller refuses the whole scan. The
+  //-- OBIS is copied here for the warning the caller logs outside the
+  //-- receive-side lock.
+  bool counterNegative;
+  char negativeObis[LOGGER_SNAPSHOT_OBIS_MAX];
 } MeterFieldScan;
 
 //-- Inspect callback: copies the first numeric value published per wanted
-//-- OBIS code. Runs while the receive-side lock is held, so it only reads.
+//-- OBIS code. A counter published negative is flagged and never copied (a
+//-- P1 port never publishes one; normalised histories arrive through the
+//-- populate import instead). Runs while the receive-side lock is held, so
+//-- it only reads.
 static bool collectMeterFields(const loggerTelegramRecord* record, void* userData)
 {
   MeterFieldScan* scan = (MeterFieldScan*)userData;
@@ -281,8 +296,25 @@ static bool collectMeterFields(const loggerTelegramRecord* record, void* userDat
     {
       if (!scan->found[wanted] && (strcmp(field->obis, wantedObis[wanted]) == 0))
       {
-        scan->values[wanted] = (float)atof(field->value);
-        scan->found[wanted] = true;
+        const float value = (float)atof(field->value);
+
+        //-- A cumulative counter published negative is not a P1 reading:
+        //-- flag the scan (the caller refuses it and logs the copied OBIS)
+        //-- and leave the counter unfound.
+        if ((wanted < STORE_WANTED_COUNTER_COUNT) && (value < 0.0f))
+        {
+          scan->counterNegative = true;
+
+          if (scan->negativeObis[0] == '\0')
+          {
+            snprintf(scan->negativeObis, sizeof scan->negativeObis, "%s", field->obis);
+          }
+        }
+        else
+        {
+          scan->values[wanted] = value;
+          scan->found[wanted] = true;
+        }
       }
     }
   }
@@ -294,11 +326,17 @@ static bool collectMeterFields(const loggerTelegramRecord* record, void* userDat
 //-- the tariff indicator that telegram published (1 or 2; 0 when the meter
 //-- names no active tariff, and also 0 when no telegram was inspected).
 //-- Counters the telegram did not publish stay 0.0; the return value only
-//-- reports whether a telegram was inspected.
-static bool readLatestMeterCounters(loggerMeterRecord* record, uint8_t* outTariffIndicator)
+//-- reports whether a telegram was inspected. A telegram publishing a
+//-- counter negative is refused (the P1 port never publishes one — only the
+//-- populate import carries normalised negative history): the record stays
+//-- zeroed, the telegram counts as not inspected and *outRefused is set so
+//-- the caller can postpone the snapshot instead of storing zeros.
+static bool readLatestMeterCounters(loggerMeterRecord* record, uint8_t* outTariffIndicator,
+                                    bool* outRefused)
 {
   memset(record, 0, sizeof *record);
   *outTariffIndicator = 0u;
+  *outRefused = false;
 
   loggerTelegramMeta meta;
 
@@ -312,6 +350,17 @@ static bool readLatestMeterCounters(loggerMeterRecord* record, uint8_t* outTarif
 
   if (!loggerReceiverInspectRecord(meta.sequence, collectMeterFields, &scan))
   {
+    return false;
+  }
+
+  if (scan.counterNegative)
+  {
+    LOGGER_LOGW(tag,
+                "telegram %" PRIu32 " published %s as a negative counter: the P1 port never "
+                "does that, the reading is refused for the rings (the raw record stays "
+                "retained)",
+                meta.sequence, scan.negativeObis);
+    *outRefused = true;
     return false;
   }
 
@@ -1702,21 +1751,16 @@ static void runEditorJob(EditorJob* job)
       continue;
     }
 
+    //-- The sign of a reading is free: a normalised populate history keeps
+    //-- running below zero after an event like a meter exchange, so only
+    //-- the strict descent is checked here (never-negative is a P1-input
+    //-- rule, enforced where the telegrams are read).
     for (uint32_t index = 0u; index + 1u < count; index++)
     {
       const float newer = *editorChannelFieldConst(&draft[index], channel);
       const float older = *editorChannelFieldConst(&draft[index + 1u], channel);
       const uint64_t newerKey = entries[index].keys.usedKey % active->centuryModulus;
       const uint64_t olderKey = entries[index + 1u].keys.usedKey % active->centuryModulus;
-
-      if (older < 0.0f)
-      {
-        editorFail(job, ESP_ERR_INVALID_ARG,
-                   "%s: the reading of %llu would become negative (a meter reset or a "
-                   "discontinuity is not allowed here)",
-                   editorChannelName(channel), (unsigned long long)olderKey);
-        goto cleanup;
-      }
 
       if (!(older < newer))
       {
@@ -3192,7 +3236,16 @@ static bool storeSnapshot(uint64_t* outTimeStamp)
 
   loggerMeterRecord record;
   uint8_t tariffIndicator = 0u;
-  bool telegramSeen = readLatestMeterCounters(&record, &tariffIndicator);
+  bool refusedByNegative = false;
+  bool telegramSeen = readLatestMeterCounters(&record, &tariffIndicator, &refusedByNegative);
+
+  //-- A telegram publishing a negative counter is not a P1 reading: the
+  //-- snapshot is postponed and the rings keep their previous values until
+  //-- a sound telegram arrives (the reader already named the OBIS).
+  if (refusedByNegative)
+  {
+    return false;
+  }
 
   //-- The network and transport month amount stored with every record of
   //-- this snapshot, prorated to each ring's period below. An unreadable

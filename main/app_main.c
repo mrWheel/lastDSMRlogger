@@ -26,7 +26,7 @@
 
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
-static const char* PROG_VERSION = "v0.6.3";
+static const char* PROG_VERSION = "v0.6.4";
 
 #include <inttypes.h>
 #include <stdio.h>
