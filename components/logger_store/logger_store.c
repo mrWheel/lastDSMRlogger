@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.c - hour, day and month smart meter ring file store
-//-- Date: 2026-11-24 · Build: 18
+//-- Date: 2026-11-25 · Build: 22
 //--
 //-- The store task owns all ring_file_store work: it mounts the LittleFS
 //-- storage partition, removes the ring file of the retired minute store,
@@ -36,6 +36,19 @@
 //-- ring before importing and update only revises stored periods. The
 //-- console's ring2csv command writes one ring back to the volume root as
 //-- a re-importable csv through loggerStoreRingToCsv().
+//--
+//-- The SPA's Edit view reads one ring through loggerStoreEditorSnapshot()
+//-- (the ring's own bucket order newest first, a content pin and a calendar
+//-- key repair preview per row) and revises it through
+//-- loggerStoreApplyRingEdits(): the store task rebuilds the complete ring
+//-- (repaired keys, edited payloads, draft consumption edits applied newest
+//-- to oldest per channel), validates every candidate value, writes it as
+//-- a verified journal ring file and publishes it through two atomic
+//-- renames, so a failed or interrupted Save always yields the complete old
+//-- or the complete new ring (recoverPendingRingEdits() resolves leftovers
+//-- at startup, before the rings open). The newest record — the open period
+//-- the snapshot upsert rewrites every minute — is locked: shown, never
+//-- edited.
 //-- ==========================================================================
 
 #include "logger_store.h"
@@ -44,6 +57,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,6 +71,7 @@
 #include "esp_littlefs.h"
 #include "esp_random.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "logger_control.h"
@@ -138,6 +154,23 @@ static volatile bool syncRequested = false;
 //-- it): the store task gives it after every commit of all three rings, so
 //-- a waiter learns the staged records have really reached storage.
 static SemaphoreHandle_t syncDoneSem;
+
+//-- Locks of the editor transactions (see the RFS history editor section):
+//-- storeAccessMutex guards the live handles through the rare moments the
+//-- store task closes one (a Save publishes a replacement ring); every walk
+//-- of a ring (console, SPA, editor snapshot) holds it, so a walk never
+//-- runs against a handle that was just closed. storeWriterMutex serialises
+//-- the whole-ring writers against each other: the editor Save and the
+//-- populate import never edit one ring at the same time. Both are taken in
+//-- that order (writer, then access) and only by tasks that may block.
+static SemaphoreHandle_t storeAccessMutex;
+static SemaphoreHandle_t storeWriterMutex;
+
+//-- Editor Save jobs: the public entry hands the parsed request to the
+//-- store task (the rings' owner) through this queue and waits on the job's
+//-- completion token, so a Save never races the minute snapshot (the store
+//-- task runs the whole transaction between two snapshots).
+static QueueHandle_t editorQueue;
 
 void loggerStoreSetTariffCalculator(loggerStoreTariffCalculator calculator)
 {
@@ -553,6 +586,65 @@ static void ensureRingRecordLayout(void)
   }
 }
 
+//-- Takes the editor locks (writer first, then access) with a bounded
+//-- wait: false when a lock stayed busy (another whole-ring writer or a
+//-- long walk). Releases everything it managed to take before failing.
+static bool storeTakeLocks(TickType_t timeout)
+{
+  if ((storeWriterMutex == NULL) || (storeAccessMutex == NULL))
+  {
+    //-- The store task never started (no Init, no rings): nothing to guard.
+    return false;
+  }
+
+  if (xSemaphoreTake(storeWriterMutex, timeout) != pdTRUE)
+  {
+    return false;
+  }
+
+  if (xSemaphoreTake(storeAccessMutex, timeout) != pdTRUE)
+  {
+    xSemaphoreGive(storeWriterMutex);
+    return false;
+  }
+
+  return true;
+}
+
+static void storeReleaseLocks(void)
+{
+  if (storeAccessMutex != NULL)
+  {
+    xSemaphoreGive(storeAccessMutex);
+  }
+
+  if (storeWriterMutex != NULL)
+  {
+    xSemaphoreGive(storeWriterMutex);
+  }
+}
+
+//-- Only the plain ring access (walks, exports, snapshots) needs the access
+//-- guard; these paths never close a handle, they only read it.
+static bool storeTakeAccess(TickType_t timeout)
+{
+  return ((storeAccessMutex != NULL) && (xSemaphoreTake(storeAccessMutex, timeout) == pdTRUE));
+}
+
+static void storeReleaseAccess(void)
+{
+  if (storeAccessMutex != NULL)
+  {
+    xSemaphoreGive(storeAccessMutex);
+  }
+}
+
+//-- Resolves an unfinished editor Save left on the volume by an interrupted
+//-- run (power loss between the rename steps): deterministic so recovery
+//-- yields either the complete old ring or the complete new one, and it
+//-- runs before any ring opens. Defined with the editor section below.
+static void recoverPendingRingEdits(void);
+
 //-- Mounts LittleFS, clears the retired minute ring file and opens the
 //-- three meter rings. False when the volume or any ring could not be
 //-- opened; already opened rings are closed again so a retry starts clean.
@@ -586,6 +678,11 @@ static bool openMeterRings(void)
   }
 
   ensureRingRecordLayout();
+
+  //-- An editor Save interrupted by a power loss leaves its journal and
+  //-- backup behind: resolve them before the rings open (and before any
+  //-- automatic rebuild or resizing could meet them unawares).
+  recoverPendingRingEdits();
 
   for (loggerMeterRing_t ring = LOGGER_RING_HOURS; ring < LOGGER_RING_COUNT; ring++)
   {
@@ -632,10 +729,19 @@ esp_err_t loggerStoreListRecords(loggerMeterRing_t ring, loggerStoreRecordVisito
   }
 
   MeterRing* active = &rings[ring];
+
+  //-- The access guard keeps the walk off a handle an editor Save is about
+  //-- to close for its rename swap.
+  if (!storeTakeAccess(pdMS_TO_TICKS(60000)))
+  {
+    return ESP_ERR_INVALID_STATE;
+  }
+
   ringFileHandle_t* handle = active->handle;
 
   if (handle == NULL)
   {
+    storeReleaseAccess();
     return ESP_ERR_INVALID_STATE;
   }
 
@@ -659,6 +765,7 @@ esp_err_t loggerStoreListRecords(loggerMeterRing_t ring, loggerStoreRecordVisito
       //-- visitor the plain wall-clock period key of this ring.
       if (!visitor(entry.keys.usedKey % active->centuryModulus, &entry.meter, userData))
       {
+        storeReleaseAccess();
         return ESP_OK;
       }
     }
@@ -668,6 +775,7 @@ esp_err_t loggerStoreListRecords(loggerMeterRing_t ring, loggerStoreRecordVisito
       //-- Safety net against a pathological invalidate/re-begin cycle.
       LOGGER_LOGW(tag, "%s ring list walk abandoned after %" PRIu32 " entries", active->name,
                   emitted);
+      storeReleaseAccess();
       return ESP_FAIL;
     }
 
@@ -685,6 +793,8 @@ esp_err_t loggerStoreListRecords(loggerMeterRing_t ring, loggerStoreRecordVisito
     }
   }
 
+  storeReleaseAccess();
+
   if ((result != RING_FILE_STORE_ERR_ITER_END) && (result != RING_FILE_STORE_ERR_RING_EMPTY))
   {
     LOGGER_LOGW(tag, "%s ring list walk stopped after %" PRIu32 " records: %s", active->name,
@@ -694,6 +804,1338 @@ esp_err_t loggerStoreListRecords(loggerMeterRing_t ring, loggerStoreRecordVisito
 
   return ESP_OK;
 }
+
+//-- ==========================================================================
+//-- RFS history editor (the SPA's Edit view)
+//--
+//-- One Save is a whole-ring transaction: the store task walks the ring,
+//-- rebuilds a complete candidate (repaired keys, edited payloads), writes
+//-- it to a journal ring file, verifies it on storage and only then swaps
+//-- the live file for the journal through two renames (live -> backup,
+//-- journal -> live). LittleFS renames are atomic, so every crash moment
+//-- leaves a volume state that startup recovery can resolve to either the
+//-- complete old ring or the complete new one. The newest record — the open
+//-- period the logger rewrites with every snapshot — is locked: the editor
+//-- shows it and refuses to edit it, so a Save never fights the snapshot
+//-- and saved corrections to closed periods stay (the tariff calculator
+//-- only ever values the live period, never a closed record).
+//-- ==========================================================================
+
+//-- Volume companions of one ring file during a Save.
+#define EDITOR_JOURNAL_SUFFIX ".edit.tmp"
+#define EDITOR_BACKUP_SUFFIX ".bak"
+#define EDITOR_PATH_BYTES 320
+
+//-- Readable name of a ring_file_store result code, defined with the
+//-- populate import below and reused for the editor's failure reasons.
+static const char* importErrName(esp_err_t err);
+
+//-- Bounds of the typed SPA API: at most this many records per ring (the
+//-- largest ring capacity with headroom for the staged record).
+#define EDITOR_MAX_ENTRIES 52u
+#define EDITOR_MAX_CONSUMPTION 99999.999f
+#define EDITOR_MAX_AMOUNT 99999.99f
+
+//-- Seconds of grace the newest key may sit ahead of the device clock
+//-- before the anchor is called untrustworthy (per ring granularity).
+#define EDITOR_ANCHOR_GRACE_HOURS_S 7200
+#define EDITOR_ANCHOR_GRACE_DAYS_S (2 * 86400)
+#define EDITOR_ANCHOR_GRACE_MONTHS_S (62 * 86400)
+
+//-- The five payload readings behind their channel index, so the editor
+//-- loops over channels instead of naming each field.
+static float* editorChannelField(loggerMeterRecord* record, uint32_t channel)
+{
+  switch (channel)
+  {
+  case 0u:
+    return &record->energyDeliveredTariff1Kwh;
+  case 1u:
+    return &record->energyDeliveredTariff2Kwh;
+  case 2u:
+    return &record->energyReturnedTariff1Kwh;
+  case 3u:
+    return &record->energyReturnedTariff2Kwh;
+  default:
+    return &record->gasDeliveredM3;
+  }
+}
+
+static const float* editorChannelFieldConst(const loggerMeterRecord* record, uint32_t channel)
+{
+  return editorChannelField((loggerMeterRecord*)record, channel);
+}
+
+//-- The three tariff amounts behind their index (import, export, gas).
+static float* editorAmountField(loggerMeterRecord* record, uint32_t amount)
+{
+  switch (amount)
+  {
+  case 0u:
+    return &record->tariffAmountImportEuro;
+  case 1u:
+    return &record->tariffAmountExportEuro;
+  default:
+    return &record->tariffAmountGasEuro;
+  }
+}
+
+//-- The payload field a channel names for the validation messages.
+static const char* editorChannelName(uint32_t channel)
+{
+  static const char* const names[LOGGER_STORE_EDITOR_CHANNELS] = {"Ed T1", "Ed T2", "Er T1",
+                                                                  "Er T2", "gas"};
+
+  return (channel < LOGGER_STORE_EDITOR_CHANNELS) ? names[channel] : "channel";
+}
+
+static uint8_t editorKeyDigits(loggerMeterRing_t ring)
+{
+  return (ring == LOGGER_RING_HOURS) ? 8u : ((ring == LOGGER_RING_DAYS) ? 6u : 4u);
+}
+
+static ringFileGranularity_t editorGranularity(loggerMeterRing_t ring)
+{
+  return (ring == LOGGER_RING_HOURS) ? RING_FILE_GRANULARITY_HOUR
+                                     : ((ring == LOGGER_RING_DAYS) ? RING_FILE_GRANULARITY_DAY
+                                                                   : RING_FILE_GRANULARITY_MONTH);
+}
+
+//-- Splits a wall-clock period key into its date parts (the digits the
+//-- ring's schema names; the months ring has no day or hour digits and the
+//-- days ring no hour). False for impossible digits (month 0 or 13, day 0
+//-- or 32, hour 24 ..) — a day that is not valid for its month is caught
+//-- separately through the component's timestamp validation.
+static bool editorKeyParts(loggerMeterRing_t ring, uint64_t key, unsigned* outYear2,
+                           unsigned* outMonth, unsigned* outDay, unsigned* outHour)
+{
+  const uint8_t digits = editorKeyDigits(ring);
+  uint64_t rest = key;
+
+  unsigned hour = 0u;
+  unsigned day = 1u;
+
+  if (digits == 8u)
+  {
+    hour = (unsigned)(rest % 100u);
+    rest /= 100u;
+  }
+
+  if (digits >= 6u)
+  {
+    day = (unsigned)(rest % 100u);
+    rest /= 100u;
+  }
+
+  unsigned month = (unsigned)(rest % 100u);
+  unsigned year2 = (unsigned)(rest / 100u);
+
+  if ((year2 > 99u) || (month < 1u) || (month > 12u) || (day < 1u) || (day > 31u) || (hour > 23u))
+  {
+    return false;
+  }
+
+  *outYear2 = year2;
+  *outMonth = month;
+  *outDay = day;
+  *outHour = hour;
+  return true;
+}
+
+//-- The 14-digit ring timestamp of a period key (minute and second always
+//-- zero padding, the day defaults to 01 and the hour to 00 where the ring
+//-- has no such digits — the spelling the populate import already uses).
+static bool editorKeyToTimeStamp(loggerMeterRing_t ring, uint64_t key, uint64_t* outTimeStamp)
+{
+  unsigned year2 = 0u;
+  unsigned month = 0u;
+  unsigned day = 0u;
+  unsigned hour = 0u;
+
+  if (!editorKeyParts(ring, key, &year2, &month, &day, &hour))
+  {
+    return false;
+  }
+
+  uint64_t timeStamp = 20u;
+  timeStamp = (timeStamp * 100u) + year2;
+  timeStamp = (timeStamp * 100u) + month;
+  timeStamp = (timeStamp * 100u) + day;
+  timeStamp = (timeStamp * 100u) + hour;
+  timeStamp = timeStamp * 10000u;
+
+  uint64_t probeUsedKey = 0u;
+
+  if (ringFileTimeStampToUsedKey(timeStamp, editorGranularity(ring), &probeUsedKey) != ESP_OK)
+  {
+    //-- The component names the exact rules (century 20, real day of the
+    //-- month including leap years): a key it refuses is malformed.
+    return false;
+  }
+
+  *outTimeStamp = timeStamp;
+  return true;
+}
+
+//-- True when the ring's schema accepts the key as a period label.
+static bool editorKeyLegal(loggerMeterRing_t ring, uint64_t key)
+{
+  uint64_t timeStamp = 0u;
+  return editorKeyToTimeStamp(ring, key, &timeStamp);
+}
+
+//-- The broken-down local wall clock an anchor key stands for. The months
+//-- anchor rides the 15th at noon and the days anchor noon itself, so the
+//-- daylight-saving shifts (which sit in the small hours) can never push
+//-- the probe into the neighbouring month or day.
+static bool editorAnchorTime(loggerMeterRing_t ring, uint64_t anchorKey, time_t* outTime,
+                             struct tm* outTm)
+{
+  unsigned year2 = 0u;
+  unsigned month = 0u;
+  unsigned day = 0u;
+  unsigned hour = 0u;
+
+  if (!editorKeyParts(ring, anchorKey, &year2, &month, &day, &hour))
+  {
+    return false;
+  }
+
+  struct tm brokenTime;
+  memset(&brokenTime, 0, sizeof brokenTime);
+  brokenTime.tm_year = (int)(100u + year2);
+  brokenTime.tm_mon = (int)month - 1;
+  brokenTime.tm_mday = (ring == LOGGER_RING_MONTHS) ? 15 : (int)day;
+  brokenTime.tm_hour =
+      (ring == LOGGER_RING_MONTHS) ? 12 : ((ring == LOGGER_RING_DAYS) ? 12 : (int)hour);
+  brokenTime.tm_isdst = -1;
+
+  time_t anchorTime = mktime(&brokenTime);
+
+  if (anchorTime == (time_t)-1)
+  {
+    return false;
+  }
+
+  if (localtime_r(&anchorTime, outTm) == NULL)
+  {
+    return false;
+  }
+
+  *outTime = anchorTime;
+  return true;
+}
+
+//-- The expected key sequence for count records ending at the anchor:
+//-- expected[i] names the period of the row at snapshot position i (newest
+//-- first). The hours ring steps the anchor's unix time back one hour per
+//-- row, so the sequence reproduces the device's daylight-saving behaviour
+//-- exactly (the skipped spring-forward hour and the coalesced
+//-- fall-back hour — the logger's existing collision policy). The days
+//-- ring steps whole days from local noon, the months ring steps calendar
+//-- months. False (with the reason) when the anchor cannot be trusted or
+//-- the sequence would put two rows in the same period (a repeated local
+//-- hour that the hour schema cannot represent side by side).
+static bool editorExpectedSequence(loggerMeterRing_t ring, uint64_t anchorKey, uint32_t count,
+                                   uint64_t* outKeys, char* outReason, size_t reasonSize)
+{
+  if (count == 0u)
+  {
+    return true;
+  }
+
+  if (!editorKeyLegal(ring, anchorKey))
+  {
+    snprintf(outReason, reasonSize,
+             "the newest record carries a malformed period key (%llu): the calendar anchor "
+             "cannot be trusted",
+             (unsigned long long)anchorKey);
+    return false;
+  }
+
+  time_t anchorTime = 0u;
+  struct tm anchorTm;
+
+  if (!editorAnchorTime(ring, anchorKey, &anchorTime, &anchorTm))
+  {
+    snprintf(outReason, reasonSize, "the newest period key cannot be resolved to a local date");
+    return false;
+  }
+
+  time_t now = time(NULL);
+
+  if (now >= (time_t)STORE_CLOCK_SYNCED_EPOCH)
+  {
+    const time_t grace = (ring == LOGGER_RING_HOURS)
+                             ? EDITOR_ANCHOR_GRACE_HOURS_S
+                             : ((ring == LOGGER_RING_DAYS) ? EDITOR_ANCHOR_GRACE_DAYS_S
+                                                           : EDITOR_ANCHOR_GRACE_MONTHS_S);
+
+    if ((anchorTime - now) > grace)
+    {
+      snprintf(outReason, reasonSize,
+               "the newest record names a period far ahead of the device clock: the clock or the "
+               "newest key is not trustworthy");
+      return false;
+    }
+  }
+
+  const uint8_t digits = editorKeyDigits(ring);
+
+  for (uint32_t index = 0u; index < count; index++)
+  {
+    struct tm probe = anchorTm;
+    time_t probeTime;
+
+    if (ring == LOGGER_RING_MONTHS)
+    {
+      probe.tm_mon = anchorTm.tm_mon - (int)index;
+      probe.tm_isdst = -1;
+      probeTime = mktime(&probe);
+
+      if (probeTime == (time_t)-1)
+      {
+        snprintf(outReason, reasonSize, "the expected month sequence could not be derived");
+        return false;
+      }
+    }
+    else
+    {
+      const time_t stepSeconds =
+          (ring == LOGGER_RING_HOURS) ? ((time_t)index * 3600) : ((time_t)index * 86400);
+      probeTime = anchorTime - stepSeconds;
+    }
+
+    struct tm probeTm;
+
+    if (localtime_r(&probeTime, &probeTm) == NULL)
+    {
+      snprintf(outReason, reasonSize, "the expected period sequence could not be derived");
+      return false;
+    }
+
+    uint64_t expected = (uint64_t)(probeTm.tm_year - 100) * 100u + (uint64_t)(probeTm.tm_mon + 1);
+
+    if (digits >= 6u)
+    {
+      expected = expected * 100u + (uint64_t)probeTm.tm_mday;
+    }
+
+    if (digits == 8u)
+    {
+      expected = expected * 100u + (uint64_t)probeTm.tm_hour;
+    }
+
+    outKeys[index] = expected;
+
+    if ((index > 0u) && (expected == outKeys[index - 1u]))
+    {
+      snprintf(outReason, reasonSize,
+               "the local hour repeats across the daylight-saving transition: the ring schema "
+               "cannot name both occurrences (the logger coalesces them into one record)");
+      return false;
+    }
+  }
+
+  return true;
+}
+
+//-- FNV-1a over the stored record bytes (the two key fields plus the
+//-- payload): the content pin the Save carries back to detect a record
+//-- that changed since the snapshot.
+static uint32_t editorChecksum(const MeterRingEntry* entry)
+{
+  const uint8_t* bytes = (const uint8_t*)entry;
+  uint32_t hash = 2166136261u;
+
+  for (size_t index = 0u; index < sizeof *entry; index++)
+  {
+    hash ^= bytes[index];
+    hash *= 16777619u;
+  }
+
+  return hash;
+}
+
+//-- The editor walk of one ring: the retained records in the ring's own
+//-- bucket order, newest first, the staging buffer included. Unlike the
+//-- console walk it never filters on a decreasing key (a corrupt key must
+//-- stay visible, it is what the repair is for) — deduplication of the
+//-- records a concurrent snapshot re-hands after an iterator invalidation
+//-- runs on physical slots, which stay stable regardless of the keys.
+static esp_err_t editorWalkRing(loggerMeterRing_t ring, MeterRingEntry* entries, bool* outStaged,
+                                uint32_t maxEntries, uint32_t* outCount, uint32_t* outCapacity)
+{
+  MeterRing* active = &rings[ring];
+  ringFileHandle_t* handle = active->handle;
+
+  *outCount = 0u;
+  *outCapacity = active->maxRecords;
+
+  if (handle == NULL)
+  {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  ringFileInfo_t info;
+  memset(&info, 0, sizeof info);
+
+  if (ringFileGetInfo(handle, &info) == ESP_OK)
+  {
+    *outCapacity = info.capacity;
+  }
+
+  const uint32_t capacity = (*outCapacity > 0u) ? *outCapacity : active->maxRecords;
+  bool seen[EDITOR_MAX_ENTRIES + 2u];
+  bool seenStaged = false;
+  memset(seen, 0, sizeof seen);
+
+  MeterRingEntry entry;
+  ringFileIterator_t iterator;
+  memset(&entry, 0, sizeof entry);
+  memset(&iterator, 0, sizeof iterator);
+
+  esp_err_t result = ringFileIteratorBegin(handle, &iterator, RING_FILE_ITER_NEWEST, NULL, &entry);
+  uint32_t steps = 0u;
+
+  while (result == ESP_OK)
+  {
+    uint32_t slot = 0u;
+    bool staged = false;
+
+    if (ringFileIteratorGetSlot(handle, &iterator, &slot) == ESP_OK)
+    {
+      staged = (slot == RING_FILE_SLOT_STAGED);
+    }
+    else
+    {
+      slot = capacity; //-- unknown slot: only ever emitted once
+    }
+
+    const bool fresh =
+        staged ? !seenStaged : ((slot < (sizeof seen / sizeof seen[0])) && !seen[slot]);
+
+    if (fresh)
+    {
+      if (staged)
+      {
+        seenStaged = true;
+      }
+      else if (slot < (sizeof seen / sizeof seen[0]))
+      {
+        seen[slot] = true;
+      }
+
+      if (*outCount < maxEntries)
+      {
+        entries[*outCount] = entry;
+
+        if (outStaged != NULL)
+        {
+          outStaged[*outCount] = staged;
+        }
+
+        (*outCount)++;
+      }
+      else
+      {
+        LOGGER_LOGW(tag, "%s editor walk truncated at %" PRIu32 " records", active->name,
+                    *outCount);
+        break;
+      }
+    }
+
+    steps++;
+
+    if (steps > ((capacity + 2u) * 3u))
+    {
+      LOGGER_LOGW(tag, "%s editor walk abandoned after %" PRIu32 " steps", active->name, steps);
+      return ESP_FAIL;
+    }
+
+    vTaskDelay(1);
+
+    result = ringFileIteratorPrevious(handle, &iterator, &entry);
+
+    if (result == RING_FILE_STORE_ERR_ITER_INVALIDATED)
+    {
+      result = ringFileIteratorBegin(handle, &iterator, RING_FILE_ITER_NEWEST, NULL, &entry);
+    }
+  }
+
+  if ((result != RING_FILE_STORE_ERR_ITER_END) && (result != RING_FILE_STORE_ERR_RING_EMPTY))
+  {
+    LOGGER_LOGW(tag, "%s editor walk stopped after %" PRIu32 " records: %s", active->name,
+                *outCount, esp_err_to_name(result));
+    return result;
+  }
+
+  return ESP_OK;
+}
+
+esp_err_t loggerStoreEditorSnapshot(loggerMeterRing_t ring, loggerStoreEditorMeta* outMeta,
+                                    loggerStoreEditorRecord* outRecords, uint32_t maxRecords,
+                                    uint32_t* outCount)
+{
+  if ((ring >= LOGGER_RING_COUNT) || (outMeta == NULL) || (outCount == NULL))
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  memset(outMeta, 0, sizeof *outMeta);
+  *outCount = 0u;
+
+  if (rings[ring].handle == NULL)
+  {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (!storeTakeAccess(pdMS_TO_TICKS(60000)))
+  {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  MeterRingEntry* entries = calloc(EDITOR_MAX_ENTRIES, sizeof *entries);
+  bool* stagedFlags = calloc(EDITOR_MAX_ENTRIES, sizeof *stagedFlags);
+  uint64_t* expectedKeys = calloc(EDITOR_MAX_ENTRIES, sizeof *expectedKeys);
+  esp_err_t outcome = ESP_ERR_NO_MEM;
+
+  if ((entries != NULL) && (stagedFlags != NULL) && (expectedKeys != NULL))
+  {
+    uint32_t capacity = 0u;
+    outcome =
+        editorWalkRing(ring, entries, stagedFlags, EDITOR_MAX_ENTRIES, &outMeta->count, &capacity);
+    outMeta->capacity = capacity;
+    outMeta->storeRunning = true;
+
+    uint64_t timeStamp = 0u;
+    outMeta->clockSynced = currentTimeStamp(&timeStamp);
+
+    if (outMeta->clockSynced)
+    {
+      (void)meterRingKey(&rings[ring], timeStamp, &outMeta->openPeriodKey);
+    }
+
+    uint64_t anchorKey =
+        (outMeta->count > 0u) ? (entries[0].keys.usedKey % rings[ring].centuryModulus) : 0u;
+
+    outMeta->anchorOk =
+        editorExpectedSequence(ring, anchorKey, outMeta->count, expectedKeys,
+                               outMeta->anchorProblem, sizeof outMeta->anchorProblem);
+
+    if ((outcome == ESP_OK) && (outMeta->count > maxRecords))
+    {
+      LOGGER_LOGW(tag, "%s editor snapshot truncated: %" PRIu32 " records beyond %" PRIu32,
+                  rings[ring].name, outMeta->count - maxRecords, maxRecords);
+      outMeta->count = maxRecords;
+    }
+
+    for (uint32_t index = 0u; (outcome == ESP_OK) && (index < outMeta->count); index++)
+    {
+      loggerStoreEditorRecord* row = &outRecords[index];
+      const uint64_t key = entries[index].keys.usedKey % rings[ring].centuryModulus;
+
+      memset(row, 0, sizeof *row);
+      row->key = key;
+      row->timeStamp = entries[index].keys.timeStamp;
+      row->record = entries[index].meter;
+      row->staged = stagedFlags[index];
+      row->checksum = editorChecksum(&entries[index]);
+      row->locked = (index == 0u) || (outMeta->clockSynced && (key == outMeta->openPeriodKey));
+      row->keyOk = editorKeyLegal(ring, key);
+
+      if (!outMeta->anchorOk)
+      {
+        //-- No repair preview without a trustworthy anchor: the row keeps
+        //-- its key and the Save will only land when no row needs one.
+        if (!row->keyOk)
+        {
+          snprintf(row->keyProblem, sizeof row->keyProblem,
+                   "malformed period key: no trustworthy calendar anchor, repair blocked "
+                   "(see toolbar note)");
+        }
+      }
+      else if (!row->keyOk)
+      {
+        row->keyRepair = true;
+        row->expectedKey = expectedKeys[index];
+        snprintf(row->keyProblem, sizeof row->keyProblem,
+                 "malformed period key: the Save will relabel it to %llu",
+                 (unsigned long long)expectedKeys[index]);
+      }
+      else if (key != expectedKeys[index])
+      {
+        bool duplicate =
+            ((index > 0u) && (entries[index - 1u].keys.usedKey == entries[index].keys.usedKey)) ||
+            ((index + 1u < outMeta->count) &&
+             (entries[index + 1u].keys.usedKey == entries[index].keys.usedKey));
+
+        row->keyRepair = true;
+        row->expectedKey = expectedKeys[index];
+        snprintf(row->keyProblem, sizeof row->keyProblem,
+                 "%s period key: the Save will relabel "
+                 "it to %llu",
+                 duplicate ? "duplicate" : "out of sequence",
+                 (unsigned long long)expectedKeys[index]);
+      }
+    }
+
+    *outCount = (outcome == ESP_OK) ? outMeta->count : 0u;
+  }
+
+  free(entries);
+  free(stagedFlags);
+  free(expectedKeys);
+  storeReleaseAccess();
+
+  return outcome;
+}
+
+//-- --------------------------------------------------------------------------
+//-- The Save transaction
+//-- --------------------------------------------------------------------------
+
+typedef struct
+{
+  loggerMeterRing_t ring;
+  const loggerStoreRowEdit* edits;
+  uint32_t editCount;
+  uint32_t snapshotCount;
+  uint64_t snapshotNewestKey;
+  char* outReason;
+  size_t reasonSize;
+  SemaphoreHandle_t done;
+  esp_err_t outcome;
+} EditorJob;
+
+//-- One edit lookup result: the request entries for a row position.
+typedef struct
+{
+  bool used;
+  bool hasConsumption[LOGGER_STORE_EDITOR_CHANNELS];
+  float consumption[LOGGER_STORE_EDITOR_CHANNELS];
+  bool hasAmount[LOGGER_STORE_EDITOR_AMOUNTS];
+  float amount[LOGGER_STORE_EDITOR_AMOUNTS];
+} EditorRowEdits;
+
+static void editorFail(EditorJob* job, esp_err_t err, const char* fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+
+  if ((job->outReason != NULL) && (job->reasonSize > 0u))
+  {
+    vsnprintf(job->outReason, job->reasonSize, fmt, args);
+  }
+
+  va_end(args);
+  job->outcome = err;
+}
+
+//-- Rounds to the precision the ring stores (three decimals for the kWh
+//-- and m³ counters, two for the EUR amounts).
+static float editorRound3(float value)
+{
+  return nearbyintf(value * 1000.0f) / 1000.0f;
+}
+
+static float editorRound2(float value)
+{
+  return nearbyintf(value * 100.0f) / 100.0f;
+}
+
+//-- The whole Save, on the store task between two snapshots.
+static void runEditorJob(EditorJob* job)
+{
+  MeterRing* active = &rings[job->ring];
+
+  if (!storeTakeLocks(pdMS_TO_TICKS(60000)))
+  {
+    editorFail(job, ESP_ERR_INVALID_STATE,
+               "another store writer (populate import or a Save) is still running; try again");
+    return;
+  }
+
+  MeterRingEntry* entries = calloc(EDITOR_MAX_ENTRIES, sizeof *entries);
+  EditorRowEdits* rowEdits = calloc(EDITOR_MAX_ENTRIES, sizeof *rowEdits);
+  loggerMeterRecord* draft = calloc(EDITOR_MAX_ENTRIES, sizeof draft[0]);
+  uint64_t* expectedKeys = calloc(EDITOR_MAX_ENTRIES, sizeof *expectedKeys);
+  uint64_t* finalKeys = calloc(EDITOR_MAX_ENTRIES, sizeof *finalKeys);
+  uint64_t* finalKeysTs = calloc(EDITOR_MAX_ENTRIES, sizeof finalKeysTs[0]);
+
+  if ((entries == NULL) || (rowEdits == NULL) || (draft == NULL) || (expectedKeys == NULL) ||
+      (finalKeys == NULL) || (finalKeysTs == NULL))
+  {
+    editorFail(job, ESP_ERR_NO_MEM, "the editor save ran out of memory");
+    goto cleanup;
+  }
+
+  uint32_t capacity = 0u;
+  uint32_t count = 0u;
+  job->outcome = editorWalkRing(job->ring, entries, NULL, EDITOR_MAX_ENTRIES, &count, &capacity);
+
+  if (job->outcome != ESP_OK)
+  {
+    editorFail(job, job->outcome, "the ring could not be read: %s", importErrName(job->outcome));
+    goto cleanup;
+  }
+
+  if (count == 0u)
+  {
+    if (job->editCount > 0u)
+    {
+      editorFail(job, ESP_ERR_INVALID_STATE,
+                 "the ring holds no records to edit; reload the editor");
+      goto cleanup;
+    }
+
+    job->outcome = ESP_OK;
+    goto cleanup;
+  }
+
+  //-- Stale snapshot guard: the record count and the newest key name the
+  //-- ring the editor saw; a rollover or a new snapshot that moved either
+  //-- means the positions (and the baselines the edits lean on) no longer
+  //-- line up and the operator has to reload.
+  if ((count != job->snapshotCount) ||
+      ((entries[0].keys.usedKey % active->centuryModulus) != job->snapshotNewestKey))
+  {
+    editorFail(job, ESP_ERR_INVALID_STATE,
+               "the ring changed while the page was open (new periods arrived or the ring "
+               "wrapped); reload the editor and try again");
+    goto cleanup;
+  }
+
+  //-- The key of the open period the logger keeps rewriting; the row that
+  //-- carries it is locked exactly like the newest row.
+  uint64_t openKey = 0u;
+  uint64_t timeStampNow = 0u;
+
+  if (currentTimeStamp(&timeStampNow))
+  {
+    (void)meterRingKey(active, timeStampNow, &openKey);
+  }
+
+  //-- Map the request onto rows and pin every edited row.
+  for (uint32_t index = 0u; index < job->editCount; index++)
+  {
+    const loggerStoreRowEdit* edit = &job->edits[index];
+
+    if (edit->index >= count)
+    {
+      editorFail(job, ESP_ERR_INVALID_ARG, "the request names row %lu beyond the ring",
+                 (unsigned long)edit->index);
+      goto cleanup;
+    }
+
+    if (rowEdits[edit->index].used)
+    {
+      editorFail(job, ESP_ERR_INVALID_ARG, "duplicate edit target for row %lu",
+                 (unsigned long)edit->index);
+      goto cleanup;
+    }
+
+    const uint64_t key = entries[edit->index].keys.usedKey % active->centuryModulus;
+
+    if ((edit->index == 0u) || (key == openKey))
+    {
+      editorFail(job, ESP_ERR_INVALID_ARG,
+                 "the newest (open-period) record is rewritten by the logger every minute and "
+                 "cannot be edited");
+      goto cleanup;
+    }
+
+    if (edit->checksum != editorChecksum(&entries[edit->index]))
+    {
+      editorFail(job, ESP_ERR_INVALID_STATE,
+                 "record %llu changed since the snapshot; reload the editor and try again",
+                 (unsigned long long)key);
+      goto cleanup;
+    }
+
+    rowEdits[edit->index].used = true;
+
+    for (uint32_t channel = 0u; channel < LOGGER_STORE_EDITOR_CHANNELS; channel++)
+    {
+      rowEdits[edit->index].hasConsumption[channel] = edit->hasConsumption[channel];
+      rowEdits[edit->index].consumption[channel] = edit->consumption[channel];
+    }
+
+    for (uint32_t amount = 0u; amount < LOGGER_STORE_EDITOR_AMOUNTS; amount++)
+    {
+      rowEdits[edit->index].hasAmount[amount] = edit->hasAmount[amount];
+      rowEdits[edit->index].amount[amount] = edit->amount[amount];
+    }
+  }
+
+  //-- Value bounds of the entered numbers (finite, positive consumption,
+  //-- bounded amounts, the decimal precision the ring stores).
+  for (uint32_t index = 0u; index < count; index++)
+  {
+    if (!rowEdits[index].used)
+    {
+      continue;
+    }
+
+    for (uint32_t channel = 0u; channel < LOGGER_STORE_EDITOR_CHANNELS; channel++)
+    {
+      if (!rowEdits[index].hasConsumption[channel])
+      {
+        continue;
+      }
+
+      const float value = rowEdits[index].consumption[channel];
+
+      if (!isfinite(value) || (value <= 0.0f) || (value > EDITOR_MAX_CONSUMPTION) ||
+          (fabsf(value - editorRound3(value)) > 0.0002f))
+      {
+        editorFail(job, ESP_ERR_INVALID_ARG,
+                   "row %lu %s: the entered use must be a positive number with at most three "
+                   "decimals, up to %u",
+                   (unsigned long)index, editorChannelName(channel),
+                   (unsigned)EDITOR_MAX_CONSUMPTION);
+        goto cleanup;
+      }
+
+      if (index + 1u >= count)
+      {
+        editorFail(job, ESP_ERR_INVALID_ARG,
+                   "the oldest record has no older baseline, so its use cannot be edited");
+        goto cleanup;
+      }
+    }
+
+    for (uint32_t amount = 0u; amount < LOGGER_STORE_EDITOR_AMOUNTS; amount++)
+    {
+      if (!rowEdits[index].hasAmount[amount])
+      {
+        continue;
+      }
+
+      const float value = rowEdits[index].amount[amount];
+
+      if (!isfinite(value) || (fabsf(value) > EDITOR_MAX_AMOUNT) ||
+          (fabsf(value - editorRound2(value)) > 0.002f))
+      {
+        editorFail(job, ESP_ERR_INVALID_ARG,
+                   "row %lu: a period amount must be a number with at most two decimals, "
+                   "between -%.2f and %.2f",
+                   (unsigned long)index, (double)EDITOR_MAX_AMOUNT, (double)EDITOR_MAX_AMOUNT);
+        goto cleanup;
+      }
+    }
+  }
+
+  //-- The draft: copies of the stored payloads. Consumption edits are
+  //-- applied newest to oldest per channel, so the result never depends on
+  //-- the order the browser happened to receive the edits in and every
+  //-- explicitly requested difference survives as long as the combined
+  //-- draft is valid.
+  for (uint32_t index = 0u; index < count; index++)
+  {
+    draft[index] = entries[index].meter;
+  }
+
+  for (uint32_t channel = 0u; channel < LOGGER_STORE_EDITOR_CHANNELS; channel++)
+  {
+    for (uint32_t index = 0u; index + 1u < count; index++)
+    {
+      if (!rowEdits[index].hasConsumption[channel])
+      {
+        continue;
+      }
+
+      //-- An edit to A's use keeps A's current draft reading and sets the
+      //-- immediately older reading to A's reading minus the entered use.
+      *editorChannelField(&draft[index + 1u], channel) =
+          *editorChannelField(&draft[index], channel) - rowEdits[index].consumption[channel];
+    }
+  }
+
+  for (uint32_t index = 0u; index < count; index++)
+  {
+    if (!rowEdits[index].used)
+    {
+      continue;
+    }
+
+    for (uint32_t amount = 0u; amount < LOGGER_STORE_EDITOR_AMOUNTS; amount++)
+    {
+      if (rowEdits[index].hasAmount[amount])
+      {
+        *editorAmountField(&draft[index], amount) = rowEdits[index].amount[amount];
+      }
+    }
+  }
+
+  //-- Convert to the persisted representation first, then validate: what
+  //-- passes here is exactly what lands on storage.
+  for (uint32_t index = 0u; index < count; index++)
+  {
+    for (uint32_t channel = 0u; channel < LOGGER_STORE_EDITOR_CHANNELS; channel++)
+    {
+      *editorChannelField(&draft[index], channel) =
+          editorRound3(*editorChannelField(&draft[index], channel));
+    }
+
+    for (uint32_t amount = 0u; amount < LOGGER_STORE_EDITOR_AMOUNTS; amount++)
+    {
+      *editorAmountField(&draft[index], amount) =
+          editorRound2(*editorAmountField(&draft[index], amount));
+    }
+  }
+
+  for (uint32_t channel = 0u; channel < LOGGER_STORE_EDITOR_CHANNELS; channel++)
+  {
+    bool recorded = false;
+
+    for (uint32_t index = 0u; (index < count) && !recorded; index++)
+    {
+      recorded = (*editorChannelFieldConst(&draft[index], channel) != 0.0f);
+    }
+
+    if (!recorded)
+    {
+      //-- A channel no record ever used (an unused tariff register, a meter
+      //-- without gas) is not a recorded channel: equal zeros stay valid
+      //-- and the view shows the channel as unavailable.
+      continue;
+    }
+
+    for (uint32_t index = 0u; index + 1u < count; index++)
+    {
+      const float newer = *editorChannelFieldConst(&draft[index], channel);
+      const float older = *editorChannelFieldConst(&draft[index + 1u], channel);
+      const uint64_t newerKey = entries[index].keys.usedKey % active->centuryModulus;
+      const uint64_t olderKey = entries[index + 1u].keys.usedKey % active->centuryModulus;
+
+      if (older < 0.0f)
+      {
+        editorFail(job, ESP_ERR_INVALID_ARG,
+                   "%s: the reading of %llu would become negative (a meter reset or a "
+                   "discontinuity is not allowed here)",
+                   editorChannelName(channel), (unsigned long long)olderKey);
+        goto cleanup;
+      }
+
+      if (!(older < newer))
+      {
+        editorFail(job, ESP_ERR_INVALID_ARG,
+                   "%s: the reading of %llu must stay lower than the reading of %llu "
+                   "(cumulative readings are strictly descending; equal readings, zero-use "
+                   "periods included, are invalid)",
+                   editorChannelName(channel), (unsigned long long)olderKey,
+                   (unsigned long long)newerKey);
+        goto cleanup;
+      }
+    }
+  }
+
+  //-- The key plan: with a trustworthy anchor the candidate takes the
+  //-- expected sequence (a row whose key already matches keeps its exact
+  //-- stored timestamp, a mismatching or malformed key is relabeled);
+  //-- without one the Save may only land when every stored key is legal
+  //-- and unique, keeping the ring as it is.
+  const uint64_t anchorKey = entries[0].keys.usedKey % active->centuryModulus;
+  char anchorReason[96] = "";
+  const bool anchorOk = editorExpectedSequence(job->ring, anchorKey, count, expectedKeys,
+                                               anchorReason, sizeof anchorReason);
+
+  if (anchorOk)
+  {
+    for (uint32_t index = 0u; index < count; index++)
+    {
+      const uint64_t key = entries[index].keys.usedKey % active->centuryModulus;
+
+      if (key == expectedKeys[index])
+      {
+        finalKeysTs[index] = entries[index].keys.timeStamp;
+      }
+      else if (!editorKeyToTimeStamp(job->ring, expectedKeys[index], &finalKeysTs[index]))
+      {
+        editorFail(job, ESP_ERR_INVALID_ARG, "the proposed key %llu is not a legal period",
+                   (unsigned long long)expectedKeys[index]);
+        goto cleanup;
+      }
+
+      finalKeys[index] = expectedKeys[index];
+    }
+  }
+  else
+  {
+    bool blocked = false;
+
+    for (uint32_t index = 0u; (index < count) && !blocked; index++)
+    {
+      const uint64_t key = entries[index].keys.usedKey % active->centuryModulus;
+      finalKeys[index] = key;
+      finalKeysTs[index] = entries[index].keys.timeStamp;
+
+      if (!editorKeyLegal(job->ring, key))
+      {
+        editorFail(job, ESP_ERR_INVALID_ARG,
+                   "record %llu carries a malformed period key and the calendar anchor is "
+                   "unresolved (%s): the Save is blocked until the keys can be repaired",
+                   (unsigned long long)key, anchorReason);
+        blocked = true;
+        break;
+      }
+
+      if ((index > 0u) && (key == finalKeys[index - 1u]))
+      {
+        editorFail(job, ESP_ERR_INVALID_ARG,
+                   "duplicate period key %llu cannot be published without a repair: reload "
+                   "the editor once the clock is trustworthy",
+                   (unsigned long long)key);
+        blocked = true;
+        break;
+      }
+    }
+
+    if (blocked)
+    {
+      goto cleanup;
+    }
+  }
+
+  //-- Nothing changed at all: answer success without touching storage.
+  bool changed = false;
+
+  for (uint32_t index = 0u; (index < count) && !changed; index++)
+  {
+    changed = (memcmp(&draft[index], &entries[index].meter, sizeof draft[index]) != 0) ||
+              (finalKeysTs[index] != entries[index].keys.timeStamp);
+  }
+
+  if (!changed)
+  {
+    job->outcome = ESP_OK;
+    goto cleanup;
+  }
+
+  //-- The journal: a complete ring file beside the live one, built through
+  //-- the ring library with the live ring's own schema and capacity,
+  //-- records added oldest to newest (append order keeps the logical
+  //-- order), flushed and closed.
+  char journalPath[EDITOR_PATH_BYTES];
+  char backupPath[EDITOR_PATH_BYTES];
+  char lockPath[EDITOR_PATH_BYTES + 8];
+  snprintf(journalPath, sizeof journalPath, "%s%s", active->path, EDITOR_JOURNAL_SUFFIX);
+  snprintf(backupPath, sizeof backupPath, "%s%s", active->path, EDITOR_BACKUP_SUFFIX);
+
+  (void)unlink(journalPath);
+  snprintf(lockPath, sizeof lockPath, "%s.lck", journalPath);
+  (void)unlink(lockPath);
+
+  ringFileConfig_t journalConfig;
+  memset(&journalConfig, 0, sizeof journalConfig);
+  journalConfig.maxRecords = (capacity > 0u) ? capacity : active->maxRecords;
+  journalConfig.schemaId = active->schemaId;
+  journalConfig.recordSize = sizeof(loggerMeterRecord);
+  journalConfig.persistMode = RING_FILE_PERSIST_IMMEDIATE;
+
+  ringFileHandle_t* journal = NULL;
+  esp_err_t result = ringFileCreate(journalPath, &journalConfig, &journal);
+
+  if (result != ESP_OK)
+  {
+    editorFail(job, result, "the journal file could not be created: %s", importErrName(result));
+    goto cleanup;
+  }
+
+  for (uint32_t index = count; index > 0u; index--)
+  {
+    result = ringFileAdd(journal, finalKeysTs[index - 1u], &draft[index - 1u]);
+
+    if (result != ESP_OK)
+    {
+      break;
+    }
+  }
+
+  ringFileClose(journal);
+  journal = NULL;
+
+  if (result != ESP_OK)
+  {
+    (void)unlink(journalPath);
+    editorFail(job, result, "the journal ring could not be built: %s", importErrName(result));
+    goto cleanup;
+  }
+
+  //-- Reopen and verify the complete logical contents before anything is
+  //-- published: count, capacity and every key and payload byte.
+  ringFileOpenConfig_t openConfig;
+  memset(&openConfig, 0, sizeof openConfig);
+  openConfig.expectedSchemaId = active->schemaId;
+  openConfig.expectedRecordSize = sizeof(loggerMeterRecord);
+  openConfig.readOnly = true;
+
+  ringFileHandle_t* verified = NULL;
+  result = ringFileOpen(journalPath, &openConfig, &verified);
+
+  if (result != ESP_OK)
+  {
+    (void)unlink(journalPath);
+    editorFail(job, result, "the journal ring could not be reopened for verification: %s",
+               importErrName(result));
+    goto cleanup;
+  }
+
+  ringFileInfo_t journalInfo;
+  memset(&journalInfo, 0, sizeof journalInfo);
+  bool verifiedOk = (ringFileGetInfo(verified, &journalInfo) == ESP_OK) &&
+                    (journalInfo.count == count) &&
+                    (journalInfo.capacity == journalConfig.maxRecords);
+
+  if (verifiedOk)
+  {
+    MeterRingEntry checkEntry;
+    ringFileIterator_t checkIterator;
+    memset(&checkEntry, 0, sizeof checkEntry);
+    memset(&checkIterator, 0, sizeof checkIterator);
+
+    result =
+        ringFileIteratorBegin(verified, &checkIterator, RING_FILE_ITER_NEWEST, NULL, &checkEntry);
+    uint32_t index = 0u;
+
+    while ((result == ESP_OK) && (index < count))
+    {
+      //-- The stored usedKey is the ring's own truncation of the full
+      //-- timestamp (century included): let the component derive it so the
+      //-- check matches the schema's digits for every granularity.
+      uint64_t expectedUsedKey = 0u;
+
+      if ((ringFileTimeStampToUsedKey(finalKeysTs[index], editorGranularity(job->ring),
+                                      &expectedUsedKey) != ESP_OK) ||
+          (checkEntry.keys.usedKey != expectedUsedKey) ||
+          (memcmp(&checkEntry.meter, &draft[index], sizeof checkEntry.meter) != 0))
+      {
+        verifiedOk = false;
+        break;
+      }
+
+      result = ringFileIteratorPrevious(verified, &checkIterator, &checkEntry);
+      index++;
+    }
+
+    if ((index != count) || ((result != RING_FILE_STORE_ERR_ITER_END) && (result != ESP_OK)))
+    {
+      verifiedOk = false;
+    }
+  }
+
+  ringFileClose(verified);
+
+  if (!verifiedOk)
+  {
+    (void)unlink(journalPath);
+    editorFail(job, ESP_FAIL, "the journal ring did not verify on storage; nothing was changed");
+    goto cleanup;
+  }
+
+  //-- The publish, still on the store task between two snapshots: flush
+  //-- and close the live handle, then the two renames. Each crash moment
+  //-- leaves a state startup recovery resolves to the old or the new ring.
+  (void)ringFileSync(active->handle);
+  ringFileClose(active->handle);
+  active->handle = NULL;
+
+  (void)unlink(backupPath);
+  result = rename(active->path, backupPath);
+
+  if (result != 0)
+  {
+    openMeterRing(active);
+    editorFail(job, ESP_FAIL,
+               "the live ring could not be moved aside (errno %d): the old ring "
+               "stays in place",
+               errno);
+    goto cleanup;
+  }
+
+  result = rename(journalPath, active->path);
+
+  if (result != 0)
+  {
+    (void)rename(backupPath, active->path);
+    openMeterRing(active);
+    editorFail(job, ESP_FAIL,
+               "the new ring could not be published (errno %d): the old ring was restored", errno);
+    goto cleanup;
+  }
+
+  if (!openMeterRing(active))
+  {
+    (void)unlink(active->path);
+    (void)rename(backupPath, active->path);
+    (void)openMeterRing(active);
+    editorFail(job, ESP_FAIL,
+               "the new ring could not be opened after the swap: the old ring was restored");
+    goto cleanup;
+  }
+
+  (void)unlink(backupPath);
+
+  LOGGER_LOGI(tag, "editor save published the %s ring: %" PRIu32 " record(s)", active->name, count);
+  job->outcome = ESP_OK;
+
+cleanup:
+  free(entries);
+  free(rowEdits);
+  free(draft);
+  free(expectedKeys);
+  free(finalKeys);
+  free(finalKeysTs);
+  storeReleaseLocks();
+}
+
+esp_err_t loggerStoreApplyRingEdits(loggerMeterRing_t ring, const loggerStoreRowEdit* edits,
+                                    uint32_t editCount, uint32_t snapshotCount,
+                                    uint64_t snapshotNewestKey, char* outReason, size_t reasonSize)
+{
+  if ((ring >= LOGGER_RING_COUNT) || ((editCount > 0u) && (edits == NULL)))
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (editCount > LOGGER_STORE_EDITOR_MAX_EDITS)
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (rings[ring].handle == NULL)
+  {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if ((outReason != NULL) && (reasonSize > 0u))
+  {
+    outReason[0] = '\0';
+  }
+
+  if (editorQueue == NULL)
+  {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  SemaphoreHandle_t done = xSemaphoreCreateBinary();
+
+  if (done == NULL)
+  {
+    return ESP_ERR_NO_MEM;
+  }
+
+  EditorJob job;
+  memset(&job, 0, sizeof job);
+  job.ring = ring;
+  job.edits = edits;
+  job.editCount = editCount;
+  job.snapshotCount = snapshotCount;
+  job.snapshotNewestKey = snapshotNewestKey;
+  job.outReason = outReason;
+  job.reasonSize = reasonSize;
+  job.done = done;
+  job.outcome = ESP_FAIL;
+
+  EditorJob* editorJob = &job;
+
+  if (xQueueSend(editorQueue, &editorJob, pdMS_TO_TICKS(5000)) != pdTRUE)
+  {
+    vSemaphoreDelete(done);
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (storeWakeSem != NULL)
+  {
+    xSemaphoreGive(storeWakeSem);
+  }
+
+  const bool answered = (xSemaphoreTake(done, pdMS_TO_TICKS(120000)) == pdTRUE);
+  vSemaphoreDelete(done);
+
+  if (!answered)
+  {
+    if ((outReason != NULL) && (reasonSize > 0u))
+    {
+      snprintf(outReason, reasonSize, "the store task did not answer the save in time");
+    }
+
+    return ESP_ERR_TIMEOUT;
+  }
+
+  return job.outcome;
+}
+
+//-- Resolves the volume companions a Save left behind (see the swap in
+//-- runEditorJob): backup + journal means the swap never completed (undo
+//-- to the old ring), a lone backup means the new ring was published
+//-- (drop the old copy), a lone journal was never published (drop it).
+//-- Runs at startup before any ring opens.
+static void recoverPendingRingEdits(void)
+{
+  for (loggerMeterRing_t ring = LOGGER_RING_HOURS; ring < LOGGER_RING_COUNT; ring++)
+  {
+    char journalPath[EDITOR_PATH_BYTES];
+    char backupPath[EDITOR_PATH_BYTES];
+    snprintf(journalPath, sizeof journalPath, "%s%s", rings[ring].path, EDITOR_JOURNAL_SUFFIX);
+    snprintf(backupPath, sizeof backupPath, "%s%s", rings[ring].path, EDITOR_BACKUP_SUFFIX);
+
+    struct stat details;
+    const bool journal = (stat(journalPath, &details) == 0);
+    const bool backup = (stat(backupPath, &details) == 0);
+
+    if (backup && journal)
+    {
+      //-- Interrupted between the two renames: undo back to the old ring.
+      //-- The rename replaces the live file in one step, so a failing
+      //-- restore never leaves the ring without a file on disk.
+      if (rename(backupPath, rings[ring].path) == 0)
+      {
+        LOGGER_LOGW(tag, "reverted the interrupted editor save of the %s ring", rings[ring].name);
+      }
+      else
+      {
+        LOGGER_LOGE(tag, "could not restore the %s ring backup (errno %d)", rings[ring].name,
+                    errno);
+      }
+
+      (void)unlink(journalPath);
+    }
+    else if (backup)
+    {
+      struct stat liveDetails;
+
+      if (stat(rings[ring].path, &liveDetails) != 0)
+      {
+        //-- The live file is gone while its retained copy stayed: put the
+        //-- copy back rather than let the ring open (and grow) as an empty
+        //-- one — recovery never replaces a ring with nothing.
+        if (rename(backupPath, rings[ring].path) == 0)
+        {
+          LOGGER_LOGW(tag, "restored the %s ring from its retained copy", rings[ring].name);
+        }
+        else
+        {
+          LOGGER_LOGE(tag, "could not restore the %s ring copy (errno %d)", rings[ring].name,
+                      errno);
+        }
+      }
+      else
+      {
+        //-- The new ring is in place; the retained copy can go.
+        (void)unlink(backupPath);
+      }
+    }
+    else if (journal)
+    {
+      (void)unlink(journalPath);
+    }
+  }
+}
+
+//-- --------------------------------------------------------------------------
+//-- Populate import
 
 //-- --------------------------------------------------------------------------
 //-- Populate import
@@ -1263,7 +2705,21 @@ static void importRingTask(void* argument)
 {
   ImportJob* job = (ImportJob*)argument;
 
+  //-- The import is a whole-ring writer too: it never runs alongside an
+  //-- editor Save (writer lock) and never against a handle that one is
+  //-- about to close (access lock).
+  if (!storeTakeLocks(pdMS_TO_TICKS(60000)))
+  {
+    job->outcome = ESP_ERR_INVALID_STATE;
+    snprintf(job->result->firstError, sizeof job->result->firstError,
+             "the ring is busy (an editor save is publishing); try again");
+    xSemaphoreGive(job->done);
+    vTaskDelete(NULL);
+    return;
+  }
+
   job->outcome = importRingFile(job->ring, job->relativePath, job->mode, job->result);
+  storeReleaseLocks();
   xSemaphoreGive(job->done);
   vTaskDelete(NULL);
 }
@@ -1526,8 +2982,19 @@ static void exportRingTask(void* argument)
 {
   ExportJob* job = (ExportJob*)argument;
 
+  //-- The export walk rides the shared handle: keep it off a handle an
+  //-- editor Save is closing for its rename swap.
+  if (!storeTakeAccess(pdMS_TO_TICKS(60000)))
+  {
+    job->outcome = ESP_ERR_INVALID_STATE;
+    xSemaphoreGive(job->done);
+    vTaskDelete(NULL);
+    return;
+  }
+
   job->outcome =
       exportRingFile(job->ring, job->file, job->relativeName, job->newestFirst, job->outRecords);
+  storeReleaseAccess();
   xSemaphoreGive(job->done);
   vTaskDelete(NULL);
 }
@@ -1858,6 +3325,17 @@ static void storeTask(void* argument)
       vTaskDelay(pdMS_TO_TICKS(STORE_RECORD_INTERVAL_MS));
     }
 
+    //-- Editor Save jobs first: the store task runs the whole transaction
+    //-- here, between two snapshots, so a publish never interleaves with
+    //-- the minute's upsert.
+    EditorJob* editorJob = NULL;
+
+    while ((editorQueue != NULL) && (xQueueReceive(editorQueue, &editorJob, 0) == pdTRUE))
+    {
+      runEditorJob(editorJob);
+      xSemaphoreGive(editorJob->done);
+    }
+
     uint64_t timeStamp = 0u;
 
     if (!storeSnapshot(&timeStamp))
@@ -2051,6 +3529,41 @@ esp_err_t loggerStoreInit(void)
     if (syncDoneSem == NULL)
     {
       LOGGER_LOGE(tag, "could not create the store sync-done semaphore");
+      return ESP_ERR_NO_MEM;
+    }
+  }
+
+  //-- The editor transaction guards and the Save job queue (created once,
+  //-- kept for life; see the RFS history editor section).
+  if (storeAccessMutex == NULL)
+  {
+    storeAccessMutex = xSemaphoreCreateMutex();
+
+    if (storeAccessMutex == NULL)
+    {
+      LOGGER_LOGE(tag, "could not create the store access mutex");
+      return ESP_ERR_NO_MEM;
+    }
+  }
+
+  if (storeWriterMutex == NULL)
+  {
+    storeWriterMutex = xSemaphoreCreateMutex();
+
+    if (storeWriterMutex == NULL)
+    {
+      LOGGER_LOGE(tag, "could not create the store writer mutex");
+      return ESP_ERR_NO_MEM;
+    }
+  }
+
+  if (editorQueue == NULL)
+  {
+    editorQueue = xQueueCreate(4, sizeof(EditorJob*));
+
+    if (editorQueue == NULL)
+    {
+      LOGGER_LOGE(tag, "could not create the editor save queue");
       return ESP_ERR_NO_MEM;
     }
   }

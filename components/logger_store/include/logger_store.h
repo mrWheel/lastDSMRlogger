@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_store.h - hour, day and month smart meter ring file store
-//-- Date: 2026-11-24 · Build: 15
+//-- Date: 2026-11-25 · Build: 16
 //--
 //-- Three fixed-capacity ring files land on the LittleFS storage partition,
 //-- written through mrwheel's ring_file_store component: the hours ring
@@ -22,6 +22,18 @@
 //-- ringFileEdit(): missing counter values become 0.0, missing ti, te, tg
 //-- and nc values are computed from the stored settings (average tariffs
 //-- and the prorated network and transport month amount).
+//--
+//-- The SPA's Edit view reads and revises one ring through the editor API:
+//-- loggerStoreEditorSnapshot() hands the retained records newest first
+//-- (the ring's own bucket order kept even when keys are corrupt) with a
+//-- content pin per row, the expected calendar key per position and a
+//-- repair preview, and loggerStoreApplyRingEdits() applies one Save as a
+//-- single transaction: the whole ring is rebuilt into a journal file,
+//-- verified and published through a rename swap, so a failed or
+//-- power-interrupted Save yields either the complete old ring or the
+//-- complete new one (startup recovery resolves any unfinished swap before
+//-- the rings open). The newest record — the open period the logger
+//-- rewrites with every snapshot — is always locked: shown, never edited.
 //-- ==========================================================================
 
 #ifndef LOGGER_STORE_H
@@ -169,6 +181,116 @@ typedef bool (*loggerStoreRecordVisitor)(uint64_t key, const loggerMeterRecord* 
 //-- visitor).
 esp_err_t loggerStoreListRecords(loggerMeterRing_t ring, loggerStoreRecordVisitor visitor,
                                  void* userData);
+
+//-- --------------------------------------------------------------------------
+//-- RFS history editor (the SPA's Edit view)
+//-- --------------------------------------------------------------------------
+
+//-- The five cumulative meter channels of a record, in payload order. A
+//-- consumption edit names the channel it edits; the resulting older
+//-- reading lands in the same channel of the immediately older row.
+#define LOGGER_STORE_EDITOR_CHANNELS 5u
+#define LOGGER_STORE_EDITOR_AMOUNTS 3u
+
+//-- One row of the editor snapshot: one retained record in logical (ring)
+//-- order, newest first, with everything the Edit view needs to render and
+//-- pin it. The keys and the checksum pin the row: a Save carries them back
+//-- and the store refuses the whole edit when any pinned row changed since
+//-- the snapshot. locked marks the row the logger still owns (the newest
+//-- record, the one of the open period): the logger rewrites it with every
+//-- snapshot, so the editor shows it but never edits it. The oldest row has
+//-- no older baseline, so its consumption inputs stay unavailable (the view
+//-- decides that from its position). keyOk reports a stored period key the
+//-- ring's schema accepts; when the key differs from the expected sequence
+//-- (or is not acceptable at all), keyRepair previews the replacement the
+//-- Save would write in keyProblem's words.
+typedef struct
+{
+  uint64_t key;             //-- wall-clock period key as stored ("YYMMDDhh"...)
+  uint64_t timeStamp;       //-- full stored timestamp (century digits included)
+  uint32_t checksum;        //-- content pin of the stored record
+  loggerMeterRecord record; //-- the stored payload
+  bool staged;              //-- still in the one-record staging buffer
+  bool locked;              //-- newest / open-period record: never editable
+  bool keyOk;               //-- stored key legal for this ring's schema
+  bool keyRepair;           //-- key differs from the expected sequence
+  uint64_t expectedKey;     //-- proposed replacement key (when keyRepair)
+  char keyProblem[96];      //-- what is wrong with the key, empty when fine
+} loggerStoreEditorRecord;
+
+//-- Snapshot facts beside the rows: the ring's capacity and retained count,
+//-- the key the device clock currently names for this ring (0 while the
+//-- clock never synchronised) and the anchor verdict. anchorOk says the
+//-- newest-period anchor could be trusted and the expected sequence built;
+//-- when false the anchorProblem names why, key repairs stay blocked and a
+//-- Save can only land when no row needs one.
+typedef struct
+{
+  uint32_t capacity;      //-- ring capacity from the file header
+  uint32_t count;         //-- retained records, staging buffer included
+  bool storeRunning;      //-- the store task has the ring open
+  bool clockSynced;       //-- the device wall clock is usable
+  uint64_t openPeriodKey; //-- key of the period the clock names now (0 unknown)
+  bool anchorOk;          //-- expected sequence could be derived
+  char anchorProblem[96]; //-- why the anchor is untrusted, empty when ok
+} loggerStoreEditorMeta;
+
+//-- One row's edit of a Save, by position in the snapshot (index 0 is the
+//-- newest row the snapshot handed). The row's checksum (and, for a
+//-- consumption edit, the checksum of the immediately older row whose
+//-- reading the edit rewrites) must still match storage, else the whole
+//-- Save is refused as stale. A consumption edit names the entered use of
+//-- the channel for this row; the store derives reading(older) =
+//-- reading(this) − use from the draft readings. An amount edit sets the
+//-- stored period amount (import, export or gas EUR) as it stands — the
+//-- store never reprices it. At most one edit per channel per row;
+//-- duplicates are refused.
+typedef struct
+{
+  uint32_t index;    //-- row position in the snapshot, newest first
+  uint32_t checksum; //-- pin of the row as the snapshot showed it
+  bool hasConsumption[LOGGER_STORE_EDITOR_CHANNELS];
+  float consumption[LOGGER_STORE_EDITOR_CHANNELS];
+  bool hasAmount[LOGGER_STORE_EDITOR_AMOUNTS];
+  float amount[LOGGER_STORE_EDITOR_AMOUNTS];
+} loggerStoreRowEdit;
+
+//-- Upper bound of one Save request (rows per ring plus headroom); a larger
+//-- request is refused as oversized.
+#define LOGGER_STORE_EDITOR_MAX_EDITS 64u
+
+//-- Builds the editor snapshot of one ring on the calling task: the meta
+//-- facts plus up to maxRecords rows in logical order, newest first
+//-- (staging buffer included). The walk keeps the ring's own bucket order
+//-- even when keys are corrupt: unlike loggerStoreListRecords it never
+//-- drops a record over a key that does not decrease. Returns
+//-- ESP_ERR_INVALID_ARG for a bad argument, ESP_ERR_INVALID_STATE while the
+//-- store is not running (meta->storeRunning also reports it), and ESP_OK
+//-- with the count filled. The rows carry no edit state: the view layers
+//-- its drafts over these stored values.
+esp_err_t loggerStoreEditorSnapshot(loggerMeterRing_t ring, loggerStoreEditorMeta* outMeta,
+                                    loggerStoreEditorRecord* outRecords, uint32_t maxRecords,
+                                    uint32_t* outCount);
+
+//-- Applies one editor Save to one ring as a single transaction. The edits
+//-- rebuild a draft over the stored records (explicit consumption edits
+//-- applied newest to oldest per channel, amount edits stored verbatim),
+//-- the expected key sequence repairs the period keys, and the complete
+//-- candidate is validated on the server before anything is written. The
+//-- ring is then replaced through a journal file and a rename swap, so a
+//-- failed or power-interrupted Save yields either the complete old ring or
+//-- the complete new one, and normal logging keeps running while the page
+//-- stays open. outReason (optional) receives a one-line human explanation
+//-- on failure. Returns ESP_ERR_INVALID_ARG for a bad request (unknown
+//-- row, locked row, oldest-row consumption edit, duplicate edit target,
+//-- oversized request, invalid value, failed validation), ESP_ERR_INVALID_STATE
+//-- while the store is not running or another writer is active, an I/O
+//-- error when the replacement could not be published, and ESP_OK when the
+//-- new ring is durably in place (a Save that changes nothing answers ESP_OK
+//-- without writing).
+esp_err_t loggerStoreApplyRingEdits(loggerMeterRing_t ring, const loggerStoreRowEdit* edits,
+                                    uint32_t editCount, uint32_t snapshotCount,
+                                    uint64_t snapshotNewestKey, char* outReason, size_t reasonSize);
 
 //-- --------------------------------------------------------------------------
 //-- Populate import

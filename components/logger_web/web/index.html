@@ -389,6 +389,53 @@
       </div>
     </section>
 
+    <section id="viewRingEdit" class="card" hidden>
+      <h2>Edit</h2>
+      <div id="ringEditState" class="message"></div>
+      <div class="listToolbar">
+        <!-- The ring to edit. Opening the view always shows an empty
+             screen: selecting a radio button only names the ring, nothing
+             is read from the device until [Load] fetches the snapshot, and
+             [Cancel] discards the pending edits of the shown ring and
+             returns to the empty screen. Drafts survive switching the ring
+             and leaving the view, and reappear on the next Load; a
+             successful [Save] clears the table back to empty as well. -->
+        <div class="ringRadioGroup">
+          <label><input type="radio" name="ringEditChoice" value="hours" checked> Hours</label>
+          <label><input type="radio" name="ringEditChoice" value="days"> Days</label>
+          <label><input type="radio" name="ringEditChoice" value="months"> Months</label>
+        </div>
+        <button id="ringEditLoad" type="button">Load</button>
+        <button id="ringEditCancel" type="button">Cancel</button>
+      </div>
+      <div id="ringEditHint" class="message" hidden></div>
+      <!-- One row per populated period, newest first (the store walks its
+           ring from the newest slot, the staged RAM record included): the
+           period key and the five cumulative readings read-only, a use
+           input next to each reading (kWh or m³ — the newest open-period
+           row and the oldest baseline row have no editable use), the three
+           editable period amounts (EUR; the export is a credit) and the
+           stored network costs as a separate read-only historical figure.
+           Invalid fields turn red with a tooltip, edited fields tint
+           subtly, repaired keys and recalculated readings mark pending.
+           Rows are built by app.js. -->
+      <div class="tableWrap" id="ringEditTableWrap" hidden>
+        <table id="ringEditTable">
+          <thead>
+            <tr><th id="ringEditKeyHeader">Hour</th><th class="valueNumeric">Ed T1 kWh</th><th class="valueNumeric">Use kWh</th><th class="valueNumeric">Ed T2 kWh</th><th class="valueNumeric">Use kWh</th><th class="valueNumeric">Er T1 kWh</th><th class="valueNumeric">Use kWh</th><th class="valueNumeric">Er T2 kWh</th><th class="valueNumeric">Use kWh</th><th class="valueNumeric">Gas m³</th><th class="valueNumeric">Use m³</th><th class="valueNumeric">Import €</th><th class="valueNumeric">Export € (credit)</th><th class="valueNumeric">Gas €</th><th class="valueNumeric">Netw. €</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <!-- Save applies the whole candidate of the selected ring as one
+           transaction on the device (validated, journalled and atomically
+           published by the store task) and stays disabled until the draft
+           holds valid edits. -->
+      <div class="ringEditActions">
+        <button id="ringEditSave" type="button" disabled>Save</button>
+      </div>
+    </section>
+
     <section id="viewHoursGraph" class="card" hidden>
       <h2>Hours Graph</h2>
       <div id="hoursGraphState" class="message"></div>

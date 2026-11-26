@@ -1,5 +1,5 @@
 // lastDSMRlogger SPA
-// Date: 2026-11-24 · Build: 37
+// Date: 2026-11-25 · Build: 39
 //
 // Views share one page and are listed in the VIEWS registry: the tab bar
 // (an iOS-style segmented control) is built from it, so a new feature only
@@ -92,6 +92,13 @@ const VIEWS =
    group: "logger"},
   {id: "ringfile", label: "Show RingFile", section: "viewRingFile",
    command: () => "cmd=ringfile&ring=" + selectedRing(), group: "system"},
+  // The RFS history editor (see the ring editor module below): reading and
+  // saving run over plain HTTP (GET/POST /api/v3/ringedit) like the Tariffs
+  // view. Nothing is fetched when the view opens or when the ring radio
+  // group changes — [Load] does that — so the entry carries a refresh hook
+  // that only repaints what is already loaded.
+  {id: "ringEdit", label: "Edit", section: "viewRingEdit", command: null,
+   refresh: ringEditViewOpened, group: "system"},
   {id: "hoursGraph", label: "Hours", section: "viewHoursGraph",
    command: "cmd=graph&ring=hours", group: "logger"},
   {id: "daysGraph", label: "Days", section: "viewDaysGraph",
@@ -148,6 +155,8 @@ function bindElements()
                "powerPanel", "powerTelegram", "powerRows",
                "powerScaleLabel", "powerSpark",
                "ringFileState", "refreshRingFile", "ringFileTable", "ringFileKeyHeader",
+               "ringEditState", "ringEditHint", "ringEditTableWrap", "ringEditTable",
+               "ringEditKeyHeader", "ringEditLoad", "ringEditCancel", "ringEditSave",
                "hoursGraphState", "refreshHoursGraph", "hoursGraphCanvas",
                "hoursGraphCanvasWrap", "hoursGraphTableWrap", "hoursGraphTable",
                "daysGraphState", "refreshDaysGraph", "daysGraphCanvas",
@@ -157,7 +166,8 @@ function bindElements()
                "monthsGraphCostsTableWrap", "monthsGraphCostsTable",
                "actualGraphState", "refreshActualGraph", "actualGraphCanvas", "actualGraphChecks",
                "tariffsState", "refreshTariffs", "tariffsTable",
-               "viewSettings", "viewTelegrams", "viewPower", "viewRingFile", "viewHoursGraph",
+               "viewSettings", "viewTelegrams", "viewPower", "viewRingFile", "viewRingEdit",
+               "viewHoursGraph",
                "viewDaysGraph", "viewMonthsGraph", "viewActualGraph", "viewTariffs", "viewApi",
                "apiState", "apiList",
                "takeoverModal", "takeoverMessage", "takeoverTakeBack"];
@@ -1812,6 +1822,871 @@ function renderRingFileList(message)
 
     tbody.appendChild(row);
   });
+}
+
+//-- --------------------------------------------------------------------------
+//-- RFS history editor (Edit view)
+//-- --------------------------------------------------------------------------
+
+// The Edit view reads and revises one meter ring through the bounded typed
+// SPA API (GET/POST /api/v3/ringedit). Opening the view always shows an
+// empty screen: selecting Hours, Days or Months only names the ring and
+// nothing is read until [Load] fetches the snapshot. [Cancel] discards the
+// pending edits of the shown ring (and an in-flight load) and returns to
+// that empty state; typed drafts survive switching the radio group and
+// leaving the view, and reappear when the ring is loaded again. [Save]
+// (below the table) posts the candidate as one transaction: the store
+// validates every value and pin, repairs the calendar keys it previewed and
+// swaps the ring atomically, so the browser never touches a file or a path.
+// A successful save clears the table back to the empty screen; a failed one
+// keeps the draft and names the reason.
+//
+// Each row shows the period key and the five cumulative readings read-only,
+// a consumption input next to each reading (kWh or m³) and the three
+// editable period amounts; the stored network costs figure stays a
+// separate read-only historical value. A consumption edit keeps the row's
+// current draft reading and sets the immediately older reading to the
+// difference — the same explicit-edits-newest-to-oldest rebuild the store
+// applies, so the result never depends on typing order. The newest (open
+// period) record is locked: the logger rewrites it every minute and the
+// store refuses its edit; the oldest row has no older baseline, so its use
+// cells stay unavailable. Cumulative readings must be strictly descending
+// per recorded channel: equal readings (zero-use periods included) and
+// reversed readings are invalid, shown red with a tooltip, and block Save.
+// Unused all-zero channels read as unavailable.
+
+// Wire names of the five channels' consumption edits and the three period
+// amounts (the typed API's keys), in payload order.
+const RING_EDIT_CONSUMPTION_FIELDS = ["edT1", "edT2", "erT1", "erT2", "gas"];
+const RING_EDIT_AMOUNT_FIELDS = ["ti", "te", "tg"];
+
+// Where the values come from and go: per-channel units for the tooltips.
+const RING_EDIT_CHANNEL_UNITS = ["kWh", "kWh", "kWh", "kWh", "m³"];
+const RING_EDIT_CHANNEL_NAMES = ["Ed T1", "Ed T2", "Er T1", "Er T2", "gas"];
+const RING_EDIT_AMOUNT_NAMES = ["Import €", "Export € (credit)", "Gas €"];
+
+const ringEditor =
+{
+  // Ring whose snapshot is currently shown (null: nothing loaded yet).
+  loadedRing: null,
+  // The last server snapshot (the single source of truth for pins).
+  snapshot: null,
+  // Per-ring pending edits, kept when switching rings or leaving the view:
+  // rows[key] = {consumption: {channel: cell}, amounts: {index: cell}}
+  // with cell = {text, value, invalid}; value is the entered number and
+  // invalid the field-level explanation (null when the entry is usable).
+  drafts: {hours: null, days: null, months: null},
+  // True while a Save is in flight (buttons and inputs are frozen).
+  saving: false,
+  // Token of the latest [Load] fetch; a [Cancel] or a newer load bumps it,
+  // so a response that arrives after the table was cleared is dropped
+  // instead of resurrecting the table.
+  loadSeq: 0,
+};
+
+function ringEditRing()
+{
+  const checked = document.querySelector('input[name="ringEditChoice"]:checked');
+
+  return (checked && RINGS[checked.value]) ? checked.value : "hours";
+}
+
+function setRingEditState(message)
+{
+  el.ringEditState.textContent = message;
+}
+
+function setRingEditHint(message)
+{
+  el.ringEditHint.textContent = message;
+  el.ringEditHint.hidden = (message === "");
+}
+
+function ringEditDraft(ring)
+{
+  if (ringEditor.drafts[ring] === null)
+  {
+    ringEditor.drafts[ring] = {rows: {}};
+  }
+
+  return ringEditor.drafts[ring];
+}
+
+function ringEditDraftRow(draft, key)
+{
+  if (draft.rows[key] === undefined)
+  {
+    draft.rows[key] = {consumption: {}, amounts: {}};
+  }
+
+  return draft.rows[key];
+}
+
+function ringEditHasEdits(draft)
+{
+  return Object.keys(draft.rows).some((key) =>
+  {
+    const row = draft.rows[key];
+
+    return (Object.keys(row.consumption).length > 0) ||
+           (Object.keys(row.amounts).length > 0);
+  });
+}
+
+// Parses one entered value the way the store validates it: a finite
+// number, positive use (amounts may go negative: the export is a credit),
+// inside the supported range and not finer than the stored precision.
+function ringEditParse(text, isConsumption)
+{
+  const trimmed = text.trim();
+
+  if (trimmed === "")
+  {
+    return {value: null, invalid: "empty — clear the field to undo the edit"};
+  }
+
+  const value = Number(trimmed.replace(",", "."));
+
+  if (!Number.isFinite(value))
+  {
+    return {value: null, invalid: "not a number"};
+  }
+
+  if (isConsumption)
+  {
+    if (value <= 0.0)
+    {
+      return {value: null, invalid: "use must be greater than zero (the readings must stay " +
+                                    "strictly descending, so a zero-use period is invalid here)"};
+    }
+
+    if (value > 99999.999)
+    {
+      return {value: null, invalid: "use is out of range (max 99999.999)"};
+    }
+
+    if (Math.abs(value * 1000 - Math.round(value * 1000)) > 0.001)
+    {
+      return {value: null, invalid: "use accepts at most three decimals (kWh and m³ precision)"};
+    }
+  }
+  else
+  {
+    if (Math.abs(value) > 99999.99)
+    {
+      return {value: null, invalid: "amount is out of range (-99999.99 .. 99999.99)"};
+    }
+
+    if (Math.abs(value * 100 - Math.round(value * 100)) > 0.001)
+    {
+      return {value: null, invalid: "amount accepts at most two decimals (EUR cents)"};
+    }
+  }
+
+  return {value: value, invalid: null};
+}
+
+// Rebuilds the draft readings from the snapshot plus the explicit
+// consumption edits, newest to oldest per channel (the store's algorithm):
+// an edit to A's use keeps A's current draft reading and sets the reading
+// of the immediately older row to reading(A) − use. The result is
+// independent of the order the edits were typed in.
+function ringEditRebuild(snapshot, draft)
+{
+  const count = snapshot.records.length;
+  const readings = snapshot.records.map((record) => record.readings.slice());
+  const edited = snapshot.records.map(() => ({}));
+
+  for (let channel = 0; channel < RING_EDIT_CONSUMPTION_FIELDS.length; channel++)
+  {
+    for (let index = 0; index < count; index++)
+    {
+      const row = draft.rows[String(snapshot.records[index].key)];
+      const cell = (row !== undefined) ? row.consumption[channel] : undefined;
+
+      if ((cell === undefined) || (cell.value === null) || (index + 1 >= count))
+      {
+        continue;
+      }
+
+      readings[index + 1][channel] =
+        Math.round((readings[index][channel] - cell.value) * 1000) / 1000;
+      edited[index + 1][channel] = true;
+    }
+  }
+
+  return {readings: readings, edited: edited};
+}
+
+// Field-level validity of the whole candidate: entered values plus the
+// strictly descending rule over the rebuilt draft readings of every
+// recorded channel. Returns per-row maps of invalid explanations for the
+// consumption inputs, the amount inputs, the reading cells and the key.
+function ringEditValidate(snapshot, draft, rebuilt)
+{
+  const count = snapshot.records.length;
+  const invalidConsumption = snapshot.records.map(() => ({}));
+  const invalidAmount = snapshot.records.map(() => ({}));
+  const invalidReading = snapshot.records.map(() => ({}));
+  const invalidKey = new Array(count).fill(null);
+
+  for (let index = 0; index < count; index++)
+  {
+    const record = snapshot.records[index];
+    const row = draft.rows[String(record.key)];
+
+    if (record.keyProblem !== "")
+    {
+      invalidKey[index] = record.keyProblem;
+    }
+
+    if (row === undefined)
+    {
+      continue;
+    }
+
+    for (let channel = 0; channel < RING_EDIT_CONSUMPTION_FIELDS.length; channel++)
+    {
+      const cell = row.consumption[channel];
+
+      if ((cell !== undefined) && (cell.invalid !== null))
+      {
+        invalidConsumption[index][channel] = cell.invalid;
+      }
+    }
+
+    for (let amount = 0; amount < RING_EDIT_AMOUNT_FIELDS.length; amount++)
+    {
+      const cell = row.amounts[amount];
+
+      if ((cell !== undefined) && (cell.invalid !== null))
+      {
+        invalidAmount[index][amount] = cell.invalid;
+      }
+    }
+  }
+
+  for (let channel = 0; channel < RING_EDIT_CONSUMPTION_FIELDS.length; channel++)
+  {
+    let recorded = false;
+
+    for (let index = 0; index < count; index++)
+    {
+      if (rebuilt.readings[index][channel] !== 0.0)
+      {
+        recorded = true;
+        break;
+      }
+    }
+
+    if (!recorded)
+    {
+      continue;
+    }
+
+    for (let index = 0; index + 1 < count; index++)
+    {
+      const newer = rebuilt.readings[index][channel];
+      const older = rebuilt.readings[index + 1][channel];
+
+      if (!(older < newer))
+      {
+        const reason = (older === newer)
+          ? "the " + RING_EDIT_CHANNEL_NAMES[channel] + " reading of " +
+            formatRingKey(snapshot.records[index + 1].key, RINGS[snapshot.ring].digits) +
+            " equals the newer reading — cumulative readings must be strictly descending" +
+            " (zero-use periods are invalid here)"
+          : "the " + RING_EDIT_CHANNEL_NAMES[channel] + " reading of " +
+            formatRingKey(snapshot.records[index + 1].key, RINGS[snapshot.ring].digits) +
+            " is not lower than the newer reading (a meter reset or discontinuity)";
+
+        invalidReading[index][channel] = reason;
+        invalidReading[index + 1][channel] = reason;
+
+        //-- The use input of the newer row produced this pair: mark it too
+        //-- unless its own entry already explained the field.
+        if (invalidConsumption[index][channel] === undefined)
+        {
+          invalidConsumption[index][channel] = reason;
+        }
+      }
+    }
+  }
+
+  return {consumption: invalidConsumption, amounts: invalidAmount, readings: invalidReading,
+          key: invalidKey};
+}
+
+// True when no field of the candidate is invalid.
+function ringEditCandidateValid(invalid)
+{
+  return invalid.key.every((reason) => reason === null) &&
+         invalid.consumption.every((row) => Object.keys(row).length === 0) &&
+         invalid.amounts.every((row) => Object.keys(row).length === 0) &&
+         invalid.readings.every((row) => Object.keys(row).length === 0);
+}
+
+// ---------------------------------------------------------------- Load / Cancel / Save
+
+// Return the view to its empty, not-loaded screen: no table, Save off, the
+// given state line. Typed drafts are left untouched (only [Cancel] discards
+// the shown ring's edits, a successful [Save] its own). A pending [Load]
+// response is invalidated so it cannot repaint the cleared table.
+function ringEditShowEmpty(message)
+{
+  ringEditor.loadSeq++;
+  ringEditor.snapshot = null;
+  ringEditor.loadedRing = null;
+  el.ringEditTableWrap.hidden = true;
+  el.ringEditTable.tBodies[0].textContent = "";
+  el.ringEditLoad.disabled = false;
+  el.ringEditCancel.disabled = false;
+  el.ringEditSave.disabled = true;
+  setRingEditHint("");
+  setRingEditState(message);
+}
+
+function ringEditLoad()
+{
+  const ring = ringEditRing();
+  const seq = ++ringEditor.loadSeq;
+
+  setRingEditState("Loading the " + ring + " ring from /api/v3/ringedit...");
+  setRingEditHint("");
+  el.ringEditLoad.disabled = true;
+
+  fetch("/api/v3/ringedit?ring=" + ring, {cache: "no-store"})
+    .then((response) =>
+    {
+      return response.json().then((data) =>
+      {
+        if (!response.ok)
+        {
+          throw new Error(data.error || ("HTTP " + response.status));
+        }
+
+        return data;
+      });
+    })
+    .then((data) =>
+    {
+      // A [Cancel] or a newer [Load] cleared the view while this request was
+      // in flight: drop the stale snapshot instead of repainting the table.
+      if (seq !== ringEditor.loadSeq)
+      {
+        return;
+      }
+
+      ringEditor.snapshot = data;
+      ringEditor.loadedRing = data.ring;
+      renderRingEditorTable();
+    })
+    .catch((error) =>
+    {
+      if (seq !== ringEditor.loadSeq)
+      {
+        return;
+      }
+
+      ringEditShowEmpty("Could not load the " + ring + " ring: " + error.message + ".");
+    });
+}
+
+// [Cancel]: discards the pending edits of the shown ring (and any load or
+// repaint still in flight) and returns the view to its empty state
+// (drafts of the other rings stay kept).
+function ringEditCancel()
+{
+  const ring = ringEditor.loadedRing;
+
+  if (ring !== null)
+  {
+    ringEditor.drafts[ring] = null;
+  }
+
+  ringEditShowEmpty("Edits discarded. Pick Hours, Days or Months and press Load to read a ring.");
+}
+
+// The hint line below the toolbar: while the loaded ring cannot anchor its
+// calendar keys, explain why repairs are blocked.
+function ringEditApplyAnchorHint()
+{
+  const snapshot = ringEditor.snapshot;
+
+  if ((snapshot !== null) && !snapshot.anchorOk && (snapshot.anchorProblem !== ""))
+  {
+    setRingEditHint("Calendar keys: " + snapshot.anchorProblem + " — key repairs are blocked " +
+                    "until it can be resolved.");
+    return;
+  }
+
+  setRingEditHint("");
+}
+
+function ringEditChoiceChanged()
+{
+  const ring = ringEditRing();
+
+  if (ringEditor.loadedRing === null)
+  {
+    setRingEditState("Pick a ring and press Load to read it (nothing is read until then).");
+    setRingEditHint("");
+    return;
+  }
+
+  if (ring === ringEditor.loadedRing)
+  {
+    ringEditApplyAnchorHint();
+    return;
+  }
+
+  setRingEditHint("The table still shows the " + ringEditor.loadedRing + " ring; press Load to " +
+                  "read the " + ring + " ring. Its pending edits stay kept.");
+}
+
+function ringEditBuildRequest(snapshot, draft)
+{
+  const records = [];
+
+  snapshot.records.forEach((record) =>
+  {
+    const row = draft.rows[String(record.key)];
+
+    if ((row === undefined) ||
+        ((Object.keys(row.consumption).length === 0) && (Object.keys(row.amounts).length === 0)))
+    {
+      return;
+    }
+
+    const entry = {index: record.index, checksum: record.checksum};
+    const consumption = {};
+    const amounts = {};
+
+    Object.keys(row.consumption).forEach((channel) =>
+    {
+      const cell = row.consumption[channel];
+
+      if (cell.value !== null)
+      {
+        consumption[RING_EDIT_CONSUMPTION_FIELDS[channel]] = cell.value;
+      }
+    });
+
+    Object.keys(row.amounts).forEach((amount) =>
+    {
+      const cell = row.amounts[amount];
+
+      if (cell.value !== null)
+      {
+        amounts[RING_EDIT_AMOUNT_FIELDS[amount]] = cell.value;
+      }
+    });
+
+    if ((Object.keys(consumption).length === 0) && (Object.keys(amounts).length === 0))
+    {
+      return;
+    }
+
+    entry.consumption = consumption;
+    entry.amounts = amounts;
+    records.push(entry);
+  });
+
+  return {ring: snapshot.ring, count: snapshot.count,
+          newestKey: (snapshot.records.length > 0) ? snapshot.records[0].key : 0,
+          records: records};
+}
+
+function ringEditSave()
+{
+  const snapshot = ringEditor.snapshot;
+
+  if ((snapshot === null) || ringEditor.saving)
+  {
+    return;
+  }
+
+  const ring = snapshot.ring;
+  const draft = ringEditor.drafts[ring] || {rows: {}};
+  const rebuilt = ringEditRebuild(snapshot, draft);
+  const invalid = ringEditValidate(snapshot, draft, rebuilt);
+
+  if (!ringEditCandidateValid(invalid))
+  {
+    setRingEditState("Save blocked: fix the red fields first.");
+    return;
+  }
+
+  const request = ringEditBuildRequest(snapshot, draft);
+  const body = JSON.stringify(request);
+
+  ringEditor.saving = true;
+  el.ringEditSave.disabled = true;
+  el.ringEditLoad.disabled = true;
+  el.ringEditCancel.disabled = true;
+  setRingEditState("Saving the " + ring + " ring...");
+
+  fetch("/api/v3/ringedit", {method: "POST", cache: "no-store",
+                             headers: {"Content-Type": "application/json"}, body: body})
+    .then((response) =>
+    {
+      return response.json().then((data) =>
+      {
+        if (!response.ok)
+        {
+          throw new Error(data.error || ("HTTP " + response.status));
+        }
+
+        return data;
+      });
+    })
+    .then(() =>
+    {
+      // The store answers success only after the new ring is durably in
+      // place: clear the draft and return the view to its empty screen,
+      // ready for the next Load.
+      ringEditor.drafts[ring] = null;
+      ringEditor.saving = false;
+      ringEditShowEmpty("The " + ring + " ring was saved (" + request.records.length +
+                        " edited row(s) applied). Press Load to read it back.");
+    })
+    .catch((error) =>
+    {
+      // Validation, conflict or storage failure: the draft stays exactly
+      // as typed so the operator can correct it. Repaint first (restores
+      // the buttons and Save's enabled state), then report the reason —
+      // reporting first would let the repaint overwrite it.
+      ringEditor.saving = false;
+      renderRingEditorTable();
+      setRingEditState("Save failed: " + error.message + " (your edits are kept).");
+    });
+}
+
+function ringEditDirty()
+{
+  const ring = ringEditor.loadedRing;
+
+  return (ring !== null) && (ringEditor.drafts[ring] !== null) &&
+         ringEditHasEdits(ringEditor.drafts[ring]);
+}
+
+// ----------------------------------------------------------------------- rendering
+
+function ringEditCell(text, className, tooltip)
+{
+  const cell = document.createElement("td");
+  cell.textContent = text;
+  cell.className = className;
+
+  if (tooltip !== "")
+  {
+    cell.title = tooltip;
+  }
+
+  return cell;
+}
+
+// (Re)paints the whole table of the loaded snapshot, layering the kept
+// draft of its ring over the stored values.
+function renderRingEditorTable()
+{
+  const snapshot = ringEditor.snapshot;
+  const tbody = el.ringEditTable.tBodies[0];
+
+  el.ringEditLoad.disabled = ringEditor.saving;
+  el.ringEditCancel.disabled = ringEditor.saving;
+
+  tbody.textContent = "";
+  el.ringEditTableWrap.hidden = false;
+  el.ringEditKeyHeader.textContent = RINGS[snapshot.ring].title;
+
+  const ring = snapshot.ring;
+  const draft = ringEditor.drafts[ring] || {rows: {}};
+  const rebuilt = ringEditRebuild(snapshot, draft);
+  const invalid = ringEditValidate(snapshot, draft, rebuilt);
+  const digits = RINGS[ring].digits;
+  const count = snapshot.records.length;
+
+  if (count === 0)
+  {
+    setRingEditState("The " + ring + " ring holds no records yet (is the clock synchronised?).");
+    el.ringEditSave.disabled = true;
+    ringEditApplyAnchorHint();
+    return;
+  }
+
+  let problems = 0;
+
+  snapshot.records.forEach((record, index) =>
+  {
+    const locked = (index === 0) || (snapshot.clockSynced && (record.key === snapshot.openPeriodKey));
+    const oldest = (index === count - 1);
+    const rowDraft = draft.rows[String(record.key)];
+
+    const tr = document.createElement("tr");
+
+    if (locked)
+    {
+      tr.className = "ringEditLockedRow";
+    }
+
+    //-- The period key, read-only; repaired keys show the original in red
+    //-- with the proposed replacement as a preview.
+    let keyText = formatRingKey(record.key, digits);
+    let keyClass = "valueText";
+    let keyTooltip = "";
+
+    if (record.keyRepair)
+    {
+      keyText = formatRingKey(record.key, digits) + " → " + formatRingKey(record.expectedKey, digits);
+      keyClass = "cellInvalid";
+      keyTooltip = record.keyProblem + " (applied when the Save lands)";
+      problems++;
+    }
+    else if (invalid.key[index] !== null)
+    {
+      keyClass = "cellInvalid";
+      keyTooltip = invalid.key[index];
+      problems++;
+    }
+
+    if (locked)
+    {
+      const lockedNote = "the newest (open-period) record is rewritten by the logger and " +
+                         "cannot be edited";
+      keyTooltip = (keyTooltip === "") ? lockedNote : (keyTooltip + " — " + lockedNote);
+    }
+
+    tr.appendChild(ringEditCell(keyText, keyClass, keyTooltip));
+
+    for (let channel = 0; channel < RING_EDIT_CONSUMPTION_FIELDS.length; channel++)
+    {
+      const stored = record.readings[channel];
+      const draftReading = rebuilt.readings[index][channel];
+      const channelUnusable = rebuilt.readings.every((row) => row[channel] === 0.0);
+      const cellDraft = (rowDraft !== undefined) ? rowDraft.consumption[channel] : undefined;
+
+      let readingText = draftReading.toFixed(3);
+      let readingClass = "valueNumeric";
+      let readingTooltip = "";
+
+      if (channelUnusable)
+      {
+        readingText = "—";
+        readingTooltip = "this channel is never used (every period is zero): unavailable";
+      }
+      else if (Math.abs(draftReading - stored) > 0.0005)
+      {
+        readingClass = "valueNumeric cellPending";
+        readingTooltip = "reading recalculated from a use edit (pending until saved)";
+      }
+
+      if (invalid.readings[index][channel] !== undefined)
+      {
+        readingClass = "valueNumeric cellInvalid";
+        readingTooltip = invalid.readings[index][channel];
+        problems++;
+      }
+
+      tr.appendChild(ringEditCell(readingText, readingClass, readingTooltip));
+
+      if (locked || oldest || channelUnusable)
+      {
+        tr.appendChild(ringEditCell("—", "valueNumeric ringEditNoInput",
+                                    locked ? "the newest (open-period) record cannot be edited"
+                                           : (oldest ? "the oldest record has no older baseline"
+                                                      : "unavailable channel")));
+        continue;
+      }
+
+      const input = document.createElement("input");
+      input.type = "text";
+      input.inputMode = "decimal";
+      input.className = "ringEditInput";
+      input.dataset.row = String(index);
+      input.dataset.channel = String(channel);
+
+      // The placeholder shows the use this row currently implies against
+      // its older neighbour (the value an edit would replace).
+      const impliedUse = draftReading - rebuilt.readings[index + 1][channel];
+      input.placeholder = impliedUse.toFixed(3);
+
+      if (cellDraft !== undefined)
+      {
+        input.value = cellDraft.text;
+        input.classList.add("modified");
+      }
+
+      if (invalid.consumption[index][channel] !== undefined)
+      {
+        input.classList.add("cellInvalid");
+        input.title = invalid.consumption[index][channel];
+        problems++;
+      }
+      else if (cellDraft !== undefined)
+      {
+        input.title = "explicit use edit (pending until saved)";
+      }
+
+      input.addEventListener("input", () =>
+      {
+        ringEditEdited("consumption", index, channel, input);
+      });
+
+      const wrapper = document.createElement("td");
+      wrapper.className = "valueNumeric ringEditInputCell";
+      wrapper.appendChild(input);
+      tr.appendChild(wrapper);
+    }
+
+    for (let amount = 0; amount < RING_EDIT_AMOUNT_FIELDS.length; amount++)
+    {
+      const stored = record.amounts[amount];
+      const cellDraft = (rowDraft !== undefined) ? rowDraft.amounts[amount] : undefined;
+      const effective = (cellDraft !== undefined && cellDraft.value !== null) ? cellDraft.value
+                                                                               : stored;
+
+      if (locked)
+      {
+        tr.appendChild(ringEditCell(effective.toFixed(2), "valueNumeric",
+                                    "the newest (open-period) record is recalculated by the " +
+                                    "logger: read-only until the period closes"));
+        continue;
+      }
+
+      const input = document.createElement("input");
+      input.type = "text";
+      input.inputMode = "decimal";
+      input.className = "ringEditInput ringEditAmountInput";
+      input.dataset.row = String(index);
+      input.dataset.amount = String(amount);
+      input.placeholder = stored.toFixed(2);
+
+      if (cellDraft !== undefined)
+      {
+        input.value = cellDraft.text;
+        input.classList.add("modified");
+      }
+
+      if (invalid.amounts[index][amount] !== undefined)
+      {
+        input.classList.add("cellInvalid");
+        input.title = invalid.amounts[index][amount];
+        problems++;
+      }
+      else if (cellDraft !== undefined)
+      {
+        input.title = "edited period amount (pending until saved; " +
+                      RING_EDIT_AMOUNT_NAMES[amount] + ")";
+      }
+
+      input.addEventListener("input", () =>
+      {
+        ringEditEdited("amount", index, amount, input);
+      });
+
+      const wrapper = document.createElement("td");
+      wrapper.className = "valueNumeric ringEditInputCell";
+      wrapper.appendChild(input);
+      tr.appendChild(wrapper);
+    }
+
+    tr.appendChild(ringEditCell(record.network.toFixed(2), "valueNumeric",
+                                "network and transport costs stored with this record " +
+                                "(historical figure, read-only)"));
+
+    tbody.appendChild(tr);
+  });
+
+  const stateLine = count + " " + RINGS[ring].unit + ((count === 1) ? " record" : " records") +
+                    " loaded, newest first" + (snapshot.clockSynced ? "" : " (device clock not " +
+                    "synchronised)") + (ringEditDirty() ? " — pending edits" : "") +
+                    (problems > 0 ? " · " + problems + " issue(s) block Save" : "");
+
+  setRingEditState(stateLine);
+
+  ringEditApplyAnchorHint();
+
+  el.ringEditSave.disabled = ringEditor.saving || !ringEditDirty() || !ringEditCandidateValid(invalid);
+}
+
+// One entered value changed: update the draft and repaint (the repaint
+// rebuilds the table, which is why focus is restored to the same input).
+function ringEditEdited(kind, index, field, input)
+{
+  if (ringEditor.saving)
+  {
+    return;
+  }
+
+  const snapshot = ringEditor.snapshot;
+  const ring = snapshot.ring;
+  const draft = ringEditDraft(ring);
+  const record = snapshot.records[index];
+  const rowDraft = ringEditDraftRow(draft, String(record.key));
+
+  const target = (kind === "consumption") ? rowDraft.consumption : rowDraft.amounts;
+  const text = input.value;
+
+  if (text.trim() === "")
+  {
+    delete target[field];
+  }
+  else
+  {
+    const parsed = ringEditParse(text, kind === "consumption");
+
+    // Reverting to the value this cell already implies is no edit at all:
+    // drop the draft cell so the modified highlight disappears (a cell only
+    // marks pending while it really deviates from what it would produce).
+    let reverts = false;
+
+    if (parsed.invalid === null && kind === "amount")
+    {
+      reverts = Math.abs(parsed.value - record.amounts[field]) < 0.0001;
+    }
+    else if (parsed.invalid === null && index + 1 < snapshot.records.length)
+    {
+      const before = ringEditRebuild(snapshot, draft);
+      const impliedUse = before.readings[index][field] - before.readings[index + 1][field];
+      reverts = Math.abs(parsed.value - impliedUse) < 0.0002;
+    }
+
+    if (reverts)
+    {
+      delete target[field];
+    }
+    else
+    {
+      target[field] = {text: text, value: parsed.value, invalid: parsed.invalid};
+    }
+  }
+
+  const focusRow = input.dataset.row;
+  const focusField = (kind === "consumption") ? input.dataset.channel : input.dataset.amount;
+
+  renderRingEditorTable();
+
+  const restored = el.ringEditTable.querySelector(
+    'input.ringEditInput[data-row="' + focusRow + '"][data-' +
+    (kind === "consumption" ? "channel" : "amount") + '="' + focusField + '"]');
+
+  if (restored !== null)
+  {
+    restored.focus();
+    const end = restored.value.length;
+    restored.setSelectionRange(end, end);
+  }
+}
+
+// Called when the Edit view opens (and on every return to it): the editor
+// always starts empty — no ring is read until [Load] is pressed. Typed
+// drafts of the rings stay kept internally and are re-applied when that
+// ring is loaded again; a response of a load still in flight is dropped.
+function ringEditViewOpened()
+{
+  ringEditShowEmpty("Pick Hours, Days or Months and press Load to read the ring (nothing is " +
+                    "read until then).");
 }
 
 //-- --------------------------------------------------------------------------
@@ -4085,6 +4960,33 @@ function boot()
     radio.addEventListener("change", () =>
     {
       sendRingFile();
+    });
+  });
+
+  // The Edit view never reads a ring on its own: the radio group only names
+  // the ring (kept drafts stay untouched) and [Load] fetches the snapshot.
+  // [Cancel] discards the shown ring's pending edits, [Save] posts the whole
+  // candidate as one transaction.
+  el.ringEditLoad.addEventListener("click", () =>
+  {
+    ringEditLoad();
+  });
+
+  el.ringEditCancel.addEventListener("click", () =>
+  {
+    ringEditCancel();
+  });
+
+  el.ringEditSave.addEventListener("click", () =>
+  {
+    ringEditSave();
+  });
+
+  document.querySelectorAll('input[name="ringEditChoice"]').forEach((radio) =>
+  {
+    radio.addEventListener("change", () =>
+    {
+      ringEditChoiceChanged();
     });
   });
 

@@ -1,5 +1,5 @@
 /* lastDSMRlogger SPA — iOS/macOS look and feel
-   Date: 2026-11-25 · Build: 29 */
+   Date: 2026-11-25 · Build: 30 */
 
 :root
 {
@@ -1471,4 +1471,154 @@ footer
     align-items: stretch;
     gap: 6px;
   }
+}
+
+/* --------------------------------------------------------------------------
+   Edit view: the RFS history editor. Selecting Hours, Days or Months only
+   names the ring; [Load] reads it, [Cancel] discards the pending edits and
+   [Save] (below the table) posts the whole candidate as one transaction.
+   Each row carries the period key, the five read-only cumulative readings
+   with a use input beside each (the open-period and oldest baseline rows
+   have none) and the three editable period amounts plus the read-only
+   network figure. Inputs follow the compact iOS control fill; a modified
+   field tints subtly, a pending (recalculated) reading tints, an invalid
+   field or cell turns red — invalid styling is declared last so it wins
+   over the modified tint and the muted locked row.
+   ------------------------------------------------------------------------ */
+#ringEditTable th,
+#ringEditTable td
+{
+  white-space: nowrap;
+}
+
+/* The newest (open-period) record is rewritten by the logger every minute:
+   its row reads muted (its inputs are absent, its values read-only). */
+#ringEditTable .ringEditLockedRow td
+{
+  color: var(--secondary);
+}
+
+.ringEditInputCell
+{
+  padding-left: 4px;
+  padding-right: 0;
+}
+
+/* Small numeric entry fields sized for a kWh/m³ use or a EUR amount. */
+.ringEditInput
+{
+  appearance: none;
+  font-family: inherit;
+  font-size: 0.78rem;
+  color: var(--fg);
+  width: 6.5ch;
+  padding: 3px 6px;
+  text-align: right;
+  border: 1px solid var(--separator);
+  border-radius: 8px;
+  background-color: var(--controlFill);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.ringEditInput::placeholder
+{
+  color: var(--secondary);
+  opacity: 0.6;
+}
+
+.ringEditInput:focus-visible
+{
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Unavailable use cell (oldest baseline, open period or unused channel). */
+#ringEditTable .ringEditNoInput
+{
+  color: var(--secondary);
+}
+
+/* Subtle tint while a field deviates from the loaded snapshot (use and
+   tariff edits alike). */
+#ringEditTable .ringEditInput.modified
+{
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--separator));
+  background-color: color-mix(in srgb, var(--accent) 10%, var(--card));
+}
+
+/* A reading recalculated from a use edit (pending until saved). */
+#ringEditTable td.cellPending
+{
+  background-color: color-mix(in srgb, var(--accent) 7%, transparent);
+  color: var(--accent);
+}
+
+/* Invalid values: red text and border with the explanation in the tooltip.
+   Declared after the modified and locked-row rules so a field that is both
+   modified and invalid still reads red. */
+#ringEditTable .ringEditInput.cellInvalid,
+#ringEditTable .cellInvalid,
+#ringEditTable .ringEditLockedRow .cellInvalid,
+#ringEditTable .ringEditLockedRow td.cellInvalid
+{
+  color: var(--error);
+}
+
+#ringEditTable .ringEditInput.cellInvalid
+{
+  border-color: var(--error);
+  background-color: color-mix(in srgb, var(--error) 9%, var(--card));
+}
+
+/* Save row below the table (the button is enabled only while the draft
+   holds valid edits). */
+.ringEditActions
+{
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+#ringEditLoad,
+#ringEditCancel
+{
+  appearance: none;
+  font-family: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--controlFill);
+  border: none;
+  border-radius: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+
+#ringEditLoad:active,
+#ringEditCancel:active,
+#ringEditSave:active
+{
+  transform: scale(0.97);
+}
+
+#ringEditLoad:disabled,
+#ringEditCancel:disabled,
+#ringEditSave:disabled
+{
+  opacity: 0.5;
+  cursor: default;
+}
+
+#ringEditSave
+{
+  appearance: none;
+  font-family: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #ffffff;
+  background: var(--accent);
+  border: none;
+  border-radius: 8px;
+  padding: 7px 20px;
+  cursor: pointer;
 }

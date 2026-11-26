@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_web.c - SPA, WebSocket transport and JSON API over esp_http_server
-//-- Date: 2026-11-24 · Build: 33
+//-- Date: 2026-11-25 · Build: 35
 //--
 //-- The SPA transfers all dynamic data over one WebSocket at /ws: the device
 //-- pushes status, telegram-list and realtime-power JSON and answers
@@ -54,6 +54,12 @@
 #include "logger_telnet.h"
 #include "wifi_provisioner.h"
 
+//-- The ring editor Save carries a typed JSON document (row positions,
+//-- pins and entered values) — the one API body that is not
+//-- form-urlencoded, parsed with the registry's cJSON like the tariff
+//-- documents.
+#include "cJSON.h"
+
 static const char* tag = "loggerWeb";
 
 //-- The application's notification for a saved configuration (network
@@ -92,6 +98,16 @@ extern const char styleCssEnd[] asm("_binary_style_css_end");
 //-- ring is the largest at forty-nine: key, five counters and three tariff
 //-- amounts each), so it is sized with headroom above the fullest table.
 #define WEB_RINGFILE_JSON_BYTES 8192
+//-- The editor snapshot lists at most the largest ring capacity (forty-
+//-- nine rows: key, five readings, three amounts, the row pin and the key
+//-- repair preview each), and the Save request is bounded by the store's
+//-- edit bound. Both travel as heap buffers of their own.
+#define WEB_RINGEDIT_JSON_BYTES (20u * 1024u)
+#define WEB_RINGEDIT_BODY_MAX (16u * 1024u)
+
+//-- Result codes from the ring library up from this value (its documented
+//-- error base) are storage trouble: the editor answers those as 500.
+#define WEB_RINGEDIT_IO_BASE 0x5600
 //-- The hours graph JSON lists one hourly usage line per retained hour
 //-- (forty-nine at most: key plus three deltas), well within the same
 //-- headroom.
@@ -2123,6 +2139,407 @@ static esp_err_t handleRingFileGet(httpd_req_t* req)
   return result;
 }
 
+//-- ------------------------------------------------------------------------
+//-- v3 API: RFS history editor (the SPA's Edit view)
+//--
+//-- The bounded typed SPA API over the store's editor transaction: the GET
+//-- answers one ring's snapshot (every populated logical record in ring
+//-- order newest first — the staged newest record included — each with its
+//-- content pin, locked/open flag and calendar key repair preview), the
+//-- POST applies one Save (ring selector, snapshot pins and the per-row
+//-- consumption and amount edits) as a single transaction. The browser
+//-- never writes an RFS file nor supplies a filesystem path: it names a
+//-- ring by selector and rows by snapshot position, and the store validates
+//-- every value, key and pin itself. Like the settings POST this is the
+//-- management channel of the single operator's own browser page, served
+//-- from the same origin by this server.
+//-- ------------------------------------------------------------------------
+
+static void appendRingEditRecordJson(stringBuilder* sb, uint32_t index,
+                                     const loggerStoreEditorRecord* row, bool first)
+{
+  sbAppendFmt(sb,
+              "%s{\"index\":%" PRIu32 ",\"key\":%" PRIu64 ",\"checksum\":%" PRIu32
+              ",\"staged\":%s,\"locked\":%s,\"keyOk\":%s,\"keyRepair\":%s,\"expectedKey\":%" PRIu64,
+              first ? "" : ",", index, row->key, row->checksum, row->staged ? "true" : "false",
+              row->locked ? "true" : "false", row->keyOk ? "true" : "false",
+              row->keyRepair ? "true" : "false", row->expectedKey);
+  sbAppend(sb, ",\"keyProblem\":");
+  sbAppendJsonString(sb, row->keyProblem);
+  sbAppendFmt(sb, ",\"readings\":[%.3f,%.3f,%.3f,%.3f,%.3f]", row->record.energyDeliveredTariff1Kwh,
+              row->record.energyDeliveredTariff2Kwh, row->record.energyReturnedTariff1Kwh,
+              row->record.energyReturnedTariff2Kwh, row->record.gasDeliveredM3);
+  sbAppendFmt(sb, ",\"amounts\":[%.2f,%.2f,%.2f]", row->record.tariffAmountImportEuro,
+              row->record.tariffAmountExportEuro, row->record.tariffAmountGasEuro);
+  sbAppendFmt(sb, ",\"network\":%.2f}", row->record.networkCostsEuro);
+}
+
+static void appendRingEditSnapshotJson(stringBuilder* sb, loggerMeterRing_t ring, bool* outOk)
+{
+  loggerStoreEditorMeta meta;
+  memset(&meta, 0, sizeof meta);
+
+  loggerStoreEditorRecord* rows =
+      malloc(sizeof(loggerStoreEditorRecord) * LOGGER_STORE_EDITOR_MAX_EDITS);
+
+  if (rows == NULL)
+  {
+    *outOk = false;
+    return;
+  }
+
+  uint32_t count = 0u;
+  esp_err_t walked =
+      loggerStoreEditorSnapshot(ring, &meta, rows, LOGGER_STORE_EDITOR_MAX_EDITS, &count);
+
+  sbAppendFmt(sb,
+              "{\"ok\":%s,\"type\":\"ringedit\",\"ring\":", (walked == ESP_OK) ? "true" : "false");
+  sbAppendJsonString(sb, loggerStoreRingName(ring));
+  sbAppendFmt(sb, ",\"capacity\":%" PRIu32 ",\"count\":%" PRIu32, meta.capacity, meta.count);
+  sbAppendFmt(sb, ",\"storeRunning\":%s,\"clockSynced\":%s,\"anchorOk\":%s",
+              meta.storeRunning ? "true" : "false", meta.clockSynced ? "true" : "false",
+              meta.anchorOk ? "true" : "false");
+  sbAppendFmt(sb, ",\"openPeriodKey\":%" PRIu64, meta.openPeriodKey);
+  sbAppend(sb, ",\"anchorProblem\":");
+  sbAppendJsonString(sb, meta.anchorProblem);
+  sbAppend(sb, ",\"records\":[");
+
+  for (uint32_t index = 0u; index < count; index++)
+  {
+    appendRingEditRecordJson(sb, index, &rows[index], (index == 0u));
+  }
+
+  sbAppend(sb, "]}");
+  free(rows);
+  *outOk = (walked == ESP_OK);
+}
+
+static esp_err_t handleRingEditGet(httpd_req_t* req)
+{
+  loggerMeterRing_t ring = LOGGER_RING_HOURS;
+  const char* query = strchr(req->uri, '?');
+
+  if ((query != NULL) && !ringFromParameters(query + 1, &ring))
+  {
+    return sendError(req, 400, "unknown ring");
+  }
+
+  char* buffer = malloc(WEB_RINGEDIT_JSON_BYTES);
+
+  if (buffer == NULL)
+  {
+    return sendError(req, 500, "out of memory");
+  }
+
+  stringBuilder sb;
+  sbInit(&sb, buffer, WEB_RINGEDIT_JSON_BYTES);
+  bool ok = false;
+  appendRingEditSnapshotJson(&sb, ring, &ok);
+
+  if (sb.overflow)
+  {
+    LOGGER_LOGE(tag, "ring editor snapshot json overflow");
+  }
+
+  esp_err_t result =
+      ok ? sendJson(req, buffer) : sendError(req, 503, "the meter store is not running");
+  free(buffer);
+  return result;
+}
+
+static esp_err_t sendRingEditError(httpd_req_t* req, esp_err_t outcome, const char* reason)
+{
+  const char* status = "400 Bad Request";
+
+  if (outcome == ESP_ERR_INVALID_STATE)
+  {
+    //-- Stale snapshot, conflict or a busy store: the client reloads.
+    status = "409 Conflict";
+  }
+  else if ((outcome == ESP_ERR_NO_MEM) || (outcome == ESP_ERR_TIMEOUT) || (outcome == ESP_FAIL) ||
+           (outcome >= WEB_RINGEDIT_IO_BASE))
+  {
+    status = "500 Internal Server Error";
+  }
+
+  char buffer[320];
+  stringBuilder sb;
+  sbInit(&sb, buffer, sizeof buffer);
+  sbAppend(&sb, "{\"ok\":false,\"error\":");
+  sbAppendJsonString(&sb, (reason != NULL) ? reason : "the save was refused");
+  sbAppend(&sb, "}");
+
+  httpd_resp_set_status(req, status);
+  return sendJson(req, buffer);
+}
+
+//-- Reads one optional named number out of a JSON object: true when the
+//-- member is present and numeric (value filled), false when absent or not
+//-- a number (the caller refuses non-numeric junk explicitly).
+static bool ringEditReadNumber(const cJSON* object, const char* name, float* outValue)
+{
+  const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, name);
+
+  if ((item == NULL) || !cJSON_IsNumber(item))
+  {
+    return false;
+  }
+
+  *outValue = (float)item->valuedouble;
+  return true;
+}
+
+static esp_err_t handleRingEditPost(httpd_req_t* req)
+{
+  int contentLength = req->content_len;
+
+  if (contentLength <= 0)
+  {
+    return sendError(req, 400, "missing JSON body");
+  }
+
+  if ((size_t)contentLength > WEB_RINGEDIT_BODY_MAX)
+  {
+    return sendError(req, 400, "the request exceeds the editor bound");
+  }
+
+  char* body = malloc((size_t)contentLength + 1u);
+
+  if (body == NULL)
+  {
+    return sendError(req, 500, "out of memory");
+  }
+
+  int received = 0;
+
+  while (received < contentLength)
+  {
+    int chunk = httpd_req_recv(req, body + received, (size_t)(contentLength - received));
+
+    if (chunk <= 0)
+    {
+      free(body);
+      return sendError(req, 400, "cannot read body");
+    }
+
+    received += chunk;
+  }
+
+  body[contentLength] = '\0';
+
+  cJSON* root = cJSON_Parse(body);
+  free(body);
+
+  if (root == NULL)
+  {
+    return sendError(req, 400, "malformed JSON body");
+  }
+
+  esp_err_t refusal = ESP_OK;
+  const char* reason = "the request was refused";
+  loggerMeterRing_t ring = LOGGER_RING_HOURS;
+  loggerStoreRowEdit* edits = NULL;
+  uint32_t editCount = 0u;
+  int requestSize = -1;
+  uint32_t snapshotCount = 0u;
+  uint64_t snapshotNewestKey = 0u;
+  char storeReason[224] = "";
+
+  const cJSON* ringItem = cJSON_GetObjectItemCaseSensitive(root, "ring");
+  const cJSON* countItem = cJSON_GetObjectItemCaseSensitive(root, "count");
+  const cJSON* newestItem = cJSON_GetObjectItemCaseSensitive(root, "newestKey");
+  const cJSON* records = cJSON_GetObjectItemCaseSensitive(root, "records");
+
+  if (!cJSON_IsString(ringItem) || !loggerStoreRingFromName(ringItem->valuestring, &ring))
+  {
+    refusal = ESP_ERR_INVALID_ARG;
+    reason = "unknown ring";
+  }
+  else if (!cJSON_IsNumber(countItem) || !cJSON_IsNumber(newestItem) || !cJSON_IsArray(records))
+  {
+    refusal = ESP_ERR_INVALID_ARG;
+    reason = "the request needs ring, count, newestKey and a records array";
+  }
+  else if ((countItem->valuedouble < 0.0) || (newestItem->valuedouble < 0.0))
+  {
+    refusal = ESP_ERR_INVALID_ARG;
+    reason = "count and newestKey must be positive";
+  }
+  else
+  {
+    snapshotCount = (uint32_t)countItem->valuedouble;
+    snapshotNewestKey = (uint64_t)newestItem->valuedouble;
+    const int size = cJSON_GetArraySize(records);
+
+    if ((size < 0) || ((uint32_t)size > LOGGER_STORE_EDITOR_MAX_EDITS))
+    {
+      refusal = ESP_ERR_INVALID_ARG;
+      reason = "the request is oversized";
+    }
+    else
+    {
+      requestSize = size;
+    }
+  }
+
+  static const char* const consumptionNames[LOGGER_STORE_EDITOR_CHANNELS] = {"edT1", "edT2", "erT1",
+                                                                             "erT2", "gas"};
+  static const char* const amountNames[LOGGER_STORE_EDITOR_AMOUNTS] = {"ti", "te", "tg"};
+
+  if (refusal == ESP_OK)
+  {
+    edits = calloc((size_t)(requestSize > 0 ? requestSize : 1), sizeof *edits);
+
+    if (edits == NULL)
+    {
+      refusal = ESP_ERR_NO_MEM;
+      reason = "out of memory";
+    }
+  }
+
+  if (refusal == ESP_OK)
+  {
+    const cJSON* row = NULL;
+    uint32_t index = 0u;
+
+    cJSON_ArrayForEach(row, records)
+    {
+      loggerStoreRowEdit* edit = &edits[index];
+      memset(edit, 0, sizeof *edit);
+
+      const cJSON* indexItem = cJSON_GetObjectItemCaseSensitive(row, "index");
+      const cJSON* pinItem = cJSON_GetObjectItemCaseSensitive(row, "checksum");
+
+      if (!cJSON_IsNumber(indexItem) || !cJSON_IsNumber(pinItem) ||
+          (indexItem->valuedouble < 0.0) || (pinItem->valuedouble < 0.0))
+      {
+        refusal = ESP_ERR_INVALID_ARG;
+        reason = "every record needs a positive index and checksum";
+        break;
+      }
+
+      edit->index = (uint32_t)indexItem->valuedouble;
+      edit->checksum = (uint32_t)pinItem->valuedouble;
+
+      const cJSON* consumption = cJSON_GetObjectItemCaseSensitive(row, "consumption");
+
+      if ((consumption != NULL) && !cJSON_IsObject(consumption))
+      {
+        refusal = ESP_ERR_INVALID_ARG;
+        reason = "consumption must be an object";
+        break;
+      }
+
+      for (uint32_t channel = 0u; (consumption != NULL) && (channel < LOGGER_STORE_EDITOR_CHANNELS);
+           channel++)
+      {
+        float value = 0.0f;
+
+        if (ringEditReadNumber(consumption, consumptionNames[channel], &value))
+        {
+          edit->hasConsumption[channel] = true;
+          edit->consumption[channel] = value;
+        }
+        else if (cJSON_GetObjectItemCaseSensitive(consumption, consumptionNames[channel]) != NULL)
+        {
+          refusal = ESP_ERR_INVALID_ARG;
+          reason = "a consumption value is not a number";
+          break;
+        }
+      }
+
+      if (refusal != ESP_OK)
+      {
+        break;
+      }
+
+      const cJSON* amounts = cJSON_GetObjectItemCaseSensitive(row, "amounts");
+
+      if ((amounts != NULL) && !cJSON_IsObject(amounts))
+      {
+        refusal = ESP_ERR_INVALID_ARG;
+        reason = "amounts must be an object";
+        break;
+      }
+
+      for (uint32_t amount = 0u; (amounts != NULL) && (amount < LOGGER_STORE_EDITOR_AMOUNTS);
+           amount++)
+      {
+        float value = 0.0f;
+
+        if (ringEditReadNumber(amounts, amountNames[amount], &value))
+        {
+          edit->hasAmount[amount] = true;
+          edit->amount[amount] = value;
+        }
+        else if (cJSON_GetObjectItemCaseSensitive(amounts, amountNames[amount]) != NULL)
+        {
+          refusal = ESP_ERR_INVALID_ARG;
+          reason = "an amount value is not a number";
+          break;
+        }
+      }
+
+      bool hasAny = false;
+
+      for (uint32_t channel = 0u; channel < LOGGER_STORE_EDITOR_CHANNELS; channel++)
+      {
+        hasAny = hasAny || edit->hasConsumption[channel];
+      }
+
+      for (uint32_t amount = 0u; amount < LOGGER_STORE_EDITOR_AMOUNTS; amount++)
+      {
+        hasAny = hasAny || edit->hasAmount[amount];
+      }
+
+      if ((refusal == ESP_OK) && !hasAny)
+      {
+        refusal = ESP_ERR_INVALID_ARG;
+        reason = "a record without any edit field is not a save";
+        break;
+      }
+
+      if (refusal != ESP_OK)
+      {
+        break;
+      }
+
+      index++;
+      editCount++;
+    }
+  }
+
+  if (refusal == ESP_OK)
+  {
+    refusal = loggerStoreApplyRingEdits(ring, edits, editCount, snapshotCount, snapshotNewestKey,
+                                        storeReason, sizeof storeReason);
+
+    if (refusal == ESP_OK)
+    {
+      //-- A saved history edit is exactly the event the verbose console
+      //-- asks for (the values themselves stay out of the log line).
+      loggerControlConsoleEvent(LOGGER_VERBOSE_EVENTS, LOGGER_CONSOLE_EVENT,
+                                "store: ring editor saved the %s ring via the web page",
+                                loggerStoreRingName(ring));
+    }
+    else
+    {
+      reason = (storeReason[0] != '\0') ? storeReason : "the save was refused";
+    }
+  }
+
+  cJSON_Delete(root);
+  free(edits);
+
+  if (refusal != ESP_OK)
+  {
+    LOGGER_LOGW(tag, "ring editor save refused (%s ring): %s", loggerStoreRingName(ring), reason);
+    return sendRingEditError(req, refusal, reason);
+  }
+
+  return sendJson(req, "{\"ok\":true}");
+}
+
 static esp_err_t handleGraphGet(httpd_req_t* req)
 {
   //-- The usage series of one ring for the Hours, Days and Months Graph
@@ -2661,6 +3078,12 @@ static const ApiV3Entry apiV3Entries[] = {
     {"GET", "/api/v3/csv?ring=<hours|days|months>",
      "one meter ring as re-importable csv (text/csv, the ring2csv content)"},
     {"POST", "/api/v3/view", "reports the active browser screen name to the device display"},
+    {"GET", "/api/v3/ringedit?ring=<hours|days|months>",
+     "editor snapshot of one meter ring: retained records newest first with row pins and calendar "
+     "key repair previews"},
+    {"POST", "/api/v3/ringedit",
+     "applies one editor save (ring selector, snapshot pins, per-row consumption and tariff amount "
+     "edits) as a single ring transaction"},
     {"GET", "/api/v3/tariffs",
      "the active electricity tariff interval (or an explicit unavailable report)"},
     {"GET", "/api/v3/tariffs?from=<utc>&to=<utc>&resolution=<raw|hour|day|month>",
@@ -3653,7 +4076,7 @@ esp_err_t loggerWebStart(void)
 
   //-- Room for every URI below with headroom: the assets, the v2 API, the
   //-- /api/v3 data endpoints and the single /ws handler.
-  config.max_uri_handlers = 32;
+  config.max_uri_handlers = 36;
 
   //-- The per-sequence endpoints carry a trailing wildcard (/api/telegram/*,
   //-- /api/v3/telegram/*, /api/v3/raw/*): esp_http_server honours those only
@@ -3724,6 +4147,11 @@ esp_err_t loggerWebStart(void)
   registerUri(server, "/api/v3/store", HTTP_GET, false, handleApiV3StoreGet);
   registerUri(server, "/api/v3/csv", HTTP_GET, false, handleApiV3CsvGet);
   registerUri(server, "/api/v3/view", HTTP_POST, false, handleViewReport);
+
+  //-- The RFS history editor (the SPA's Edit view): the bounded typed SPA
+  //-- API over the store's editor snapshot and single-transaction Save.
+  registerUri(server, "/api/v3/ringedit", HTTP_GET, false, handleRingEditGet);
+  registerUri(server, "/api/v3/ringedit", HTTP_POST, false, handleRingEditPost);
 
   //-- The dynamic electricity tariffs: the POST accepts the shared
   //-- schedule document, the GET answers the active interval or an
