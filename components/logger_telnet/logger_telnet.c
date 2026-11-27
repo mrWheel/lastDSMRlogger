@@ -572,15 +572,7 @@ static void printHelp(int fd)
                      "                     (3 also mirrors the serial console log)\r\n"
                      "  restart            synchronise the ring files and reboot the device\r\n"
                      "                     (asks for confirmation)\r\n"
-                     "  quit               close this session\r\n"
-                     "\r\ncommands and options may be shortened to a unique leading part\r\n"
-                     "  (show == showring, popu m == populate months)\r\n"
-                     "a file name may follow its command directly\r\n"
-                     "  (filesystem show RINGmonths.csv)\r\n"
-                     "[Tab] completes command, option and volume file names:\r\n"
-                     "  a unique match is typed out, several complete to their\r\n"
-                     "  common prefix and the choices are listed\r\n"
-                     "an empty line shows this command list too\r\n");
+                     "  quit               close this session\r\n\n");
 }
 
 static void printStatus(int fd)

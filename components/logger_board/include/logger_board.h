@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_board.h - on-device TFT debug lines and user screens
-//-- Date: 2026-11-24 · Build: 15
+//-- Date: 2026-11-26 · Build: 18
 //--
 //-- Before the first telegram the TFT shows debug lines describing what the
 //-- device is doing: the active browser screen name, telegram reception on
@@ -9,14 +9,21 @@
 //-- IP address after connecting. Once the first telegram arrives the screen
 //-- is cleared and taken over by the user screens: PHASE LOAD (signed watt
 //-- bars per phase plus the total, consumption red and feed-in green, the
-//-- bar track a few pixels away from both panel edges), PHASE POWER (the
-//-- consumption of phase 1, 2, 3 and the total) and SYSTEM INFO (the device
-//-- facts grouped in logical sections). Every screen has a light blue
-//-- heading row with the screen name left and its function right, a light
-//-- blue status row at the bottom and a mostly white body; all texts are
-//-- English and no line wraps. The rotary encoder walks through all
-//-- screens, a short AUX press invokes Back and a dark panel lights on any
-//-- AUX press, the idle time-out being a setting of the SPA Display group.
+//-- bar track a few pixels away from both panel edges on a fully white
+//-- body, the bar scale following the ladder 100..18000 W), one PHASE
+//-- POWER screen per phase plus a TOTAL screen (each showing the delivered
+//-- and the returned watts of its channel as two large watt values under
+//-- their left aligned captions) and three SYSTEM INFO screens (the device
+//-- facts grouped in logical sections, a line too long for the panel split
+//-- over two lines). Every screen has a light blue heading row with the
+//-- screen name left and its function right, a light blue status row at the
+//-- bottom carrying the accepted and rejected telegram counters and a fully
+//-- white body; every text is drawn in the component's bold rendering, all
+//-- texts are English and no line wraps. The rotary encoder is the only
+//-- means to browse the screens; the AUX button never switches a screen, it
+//-- only lights a dark panel, and every event on any button restarts the
+//-- idle time-out, the idle time-out being a setting of the SPA Display
+//-- group.
 //-- All drawing goes through the esp32_s3_piggyback component; the board is
 //-- never driven directly.
 //-- ==========================================================================
@@ -91,9 +98,10 @@ void loggerBoardWifiConnected(const char* ssid, const char* ip);
 //-- The totals aggregate the frame;
 //-- sequence is the number of the accepted telegram and meterTime carries
 //-- the date and time published in OBIS 0-0:1.0.0 as "DD-MM-YYYY HH:MM"
-//-- (empty when the frame has none). The system fields serve the
-//-- AUX-button medium-press view: the reception counters, the active
-//-- country and profile, the P1 RX polarity and the device uptime.
+//-- (empty when the frame has none). The reception counters serve the
+//-- status row; the other system fields serve the encoder-reached SYSTEM
+//-- INFO screens: the active country and profile, the P1 RX polarity and
+//-- the device uptime.
 typedef struct
 {
   float phaseWatts[3];
@@ -119,9 +127,12 @@ typedef struct
 
 //-- Watt scale ladder shared by the panel bars and the SPA realtime view:
 //-- the smallest step that fits the largest absolute watt of a frame is
-//-- picked, so both presentations scale identically. Frames above the
+//-- picked, so both presentations scale identically. The steps roughly
+//-- double and stay on round numbers, 100/200/400/800/1500/3000/6000/
+//-- 12000/18000 W, so the top step covers the theoretical maximum of a
+//-- three-phase 25 A / 230 V connection (17250 W). Frames above the
 //-- largest step stay on that step.
-#define LOGGER_POWER_SCALE_COUNT 8u
+#define LOGGER_POWER_SCALE_COUNT 9u
 extern const uint16_t loggerPowerScales[LOGGER_POWER_SCALE_COUNT];
 
 //-- Smallest ladder step that fits the largest absolute watt of the frame
@@ -130,27 +141,39 @@ uint16_t loggerBoardPickPowerScale(const loggerPowerSnapshot* snapshot);
 
 //-- Clears the screen and takes it over completely with the power screens:
 //-- every screen starts with one light blue heading row (black screen name
-//-- left aligned, screen function right aligned) and ends with a light blue
-//-- status row carrying the status text with the meter date/time
-//-- "DD-MM-YYYY HH:MM" and the back hint; the body stays white. The PHASE
-//-- LOAD screen shows a row per phase plus Total, each with a header band
-//-- (phase current left, phase label centred and voltage right, all in
-//-- the medium native face), a half-height centre-zero watt bar carrying
-//-- its integer scale labels inside the bar, its track a few pixels away
-//-- from both panel edges and whose scale follows the largest absolute watt
-//-- on the smallest of the steps
-//-- 3800/3100/2400/1700/1000/500/250/100 W, and the watt value. No
-//-- debug lines are drawn while the power screens are active, and new
+//-- left aligned, screen function right aligned, both in the 13x24 native
+//-- face) and ends with a light blue status row in the 9x16 face carrying
+//-- only the accepted and rejected telegram counters; the body stays fully
+//-- white. Every text on every screen is drawn in the component's bold
+//-- rendering. The PHASE LOAD screen shows a
+//-- row per phase plus Total, each with a header band (phase current left,
+//-- phase label centred and voltage right, all in the 13x24 native face), a
+//-- centre-zero watt bar carrying its integer 8x12 scale labels inside the
+//-- bar, its track a few pixels away from both panel edges and whose scale
+//-- follows the largest absolute watt on the smallest of the steps
+//-- 100/200/400/800/1500/3000/6000/12000/18000 W, and the watt value in
+//-- the scalable 6x8 face at scale 2. The PHASE POWER screens are four
+//-- separate screens — one per phase plus the total — each showing that
+//-- channel's delivered (import, red) and returned (export, green) watts
+//-- as two large 17x32 values centred on the white body under their left
+//-- aligned 13x24 captions "Delivered (Import)" and "Returned (Export)".
+//-- The three
+//-- SYSTEM INFO screens group the device facts into sections, every line
+//-- in the 13x24 face and split over two lines when too long for the panel.
+//-- No debug lines are drawn while the power screens are active, and new
 //-- telegrams refresh the screen currently on view.
 void loggerBoardShowPower(const loggerPowerSnapshot* snapshot);
 
 //-- --------------------------------------------------------------------------
 //-- Screen navigation (driven by the board component input events)
 //-- --------------------------------------------------------------------------
-//-- The rotary encoder walks through all screens one by one: PHASE LOAD ->
-//-- PHASE POWER -> SYSTEM INFO and back. A short AUX press invokes Back on
-//-- the screen that opened the current one; a medium-long press jumps
-//-- straight to SYSTEM INFO. While the idle time-out has the panel dark,
-//-- any AUX press lights it again and restarts the timer.
+//-- The rotary encoder is the only means to browse: it walks through all
+//-- screens one by one, PHASE LOAD -> PHASE 1 -> PHASE 2 -> PHASE 3 ->
+//-- TOTAL -> SYSTEM INFO (reception) -> SYSTEM INFO (meter & net) ->
+//-- SYSTEM INFO (device) and back. The AUX button never switches a screen
+//-- (it is reserved for leaving a future menu); while the idle time-out has
+//-- the panel dark, any AUX press lights it again. Every event on any
+//-- button — encoder turns, the encoder button and the AUX button —
+//-- restarts the idle timer, lit or dark.
 
 #endif //-- LOGGER_BOARD_H
