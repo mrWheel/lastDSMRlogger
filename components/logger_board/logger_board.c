@@ -1,11 +1,13 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_board.c - on-device TFT debug lines and user screens
-//-- Date: 2026-11-25 · Build: 17
+//-- Date: 2026-11-27 · Build: 21
 //--
 //-- Everything is drawn through the documented API of the esp32_s3_piggyback
 //-- component: tft_ec11_init once, then filled rectangles and fixed-width
-//-- text. The component inputs are started so a small poll task can act on
+//-- text. Every text on every screen is drawn in the component's bold
+//-- rendering, so the strokes read a pixel heavier than the plain bitmaps.
+//-- The component inputs are started so a small poll task can act on
 //-- the AUX button, the encoder and the idle display time-out. Drawing is
 //-- serialized with a mutex because WiFi callbacks, the receive task and the
 //-- HTTP handlers all report state.
@@ -13,20 +15,28 @@
 //-- Before the first accepted telegram the panel shows the four debug lines.
 //-- When the power screens become active the screen is fully cleared first.
 //-- Every screen starts with one light blue heading row carrying the screen
-//-- name left aligned and the screen function right aligned, and ends with
-//-- a light blue status row carrying the status text and the back hint; the
-//-- body of every screen stays white with dark text. Three screens exist:
-//-- PHASE LOAD (one signed watt bar row per phase plus the total, the bar
-//-- staying a few pixels away from both panel edges), PHASE POWER (the
-//-- consumption of phase 1, 2, 3 and the total as four labelled watt
-//-- values) and SYSTEM INFO (the device facts grouped in logical sections).
-//-- The rotary encoder walks through all screens one by one. A short AUX
-//-- press invokes Back on the screen that opened the current one; a
-//-- medium-long press jumps straight to SYSTEM INFO. After the configured
+//-- name left aligned and the screen function right aligned in the 16 px
+//-- face, and ends with a light blue status row in the 11 px face carrying
+//-- the accepted and rejected telegram counters; the body of every screen
+//-- stays fully white with dark text. All screen text uses the component's
+//-- pixel-height API (tft_ec11_draw_text_px_bold, heights 10..18 px). Nine
+//-- screens exist: PHASE LOAD (one signed watt bar row per phase plus the
+//-- total, the row header in the 14 px face and the bar staying a few
+//-- pixels away from both panel edges, its scale following the ladder
+//-- 100..18000 W), one PHASE POWER screen per phase plus a TOTAL screen
+//-- (each showing the delivered and the returned watts of its channel as
+//-- two large 18 px values under their left aligned captions) and three
+//-- SYSTEM INFO screens (the device facts grouped in logical sections,
+//-- every line in the 14 px face and a line too long for the panel split
+//-- over two lines).
+//-- The rotary encoder is the only means to walk through all screens one by
+//-- one; the AUX button never switches a screen. It wakes a dark panel and,
+//-- like every other physical button action, restarts the idle time-out.
+//-- After the configured
 //-- idle time (loggerBoardSetDisplayTimeoutMinutes, mirrored by the SPA
 //-- display settings) the backlight goes off; an AUX press lights the panel
-//-- again and restarts the timer. Every physical button action while the
-//-- panel is on restarts the timer too.
+//-- again and restarts the timer. Every event on any button restarts the
+//-- timer, whether the panel is lit or dark.
 //--
 //-- The stored display mode (the settings view's "Piggyback board" /
 //-- "No Display" toggle, applied through loggerBoardSetEnabled) decides
@@ -74,16 +84,18 @@ static const char* tag = "loggerBoard";
 
 //-- Heading row (light blue, black screen name left aligned and the screen
 //-- function right aligned), then four equal rows and, at the very bottom
-//-- of every screen, a light blue status row carrying the status text and
-//-- the back hint; the body stays white.
+//-- of every screen, a light blue status row carrying the accepted and
+//-- rejected telegram counters; the body stays white.
 //-- Within a row: header band and a centre-zero bar carrying its integer
-//-- scale labels; the watt value sits at the bottom of the row.
-#define PANEL_NAME_H 20
+//-- scale labels; the watt value sits at the bottom of the row. The heights
+//-- add up exactly: header band 24 + bar 8 + watt row 16 = 48, the row
+//-- height on the 240 pixel panel (240 - 24 - 24) / 4.
+#define PANEL_NAME_H 24
 #define PANEL_TITLE_H PANEL_NAME_H
-#define PANEL_HEADER_H 16
+#define PANEL_HEADER_H 24
 #define PANEL_BAR_H 8
 #define PANEL_WATT_H 16
-#define PANEL_STATUS_H 20
+#define PANEL_STATUS_H 24
 #define PANEL_ROWS 4
 
 #define PANEL_BAR_Y PANEL_HEADER_H
@@ -93,27 +105,36 @@ static const char* tag = "loggerBoard";
 //-- edges, so a full-scale bar never touches the border of the screen.
 #define PANEL_BAR_MARGIN 6
 
-//-- All panel text uses the documented native faces of the component, named
-//-- after their character cell (the advance includes the 1 px
-//-- inter-character gap): 6x8, 8x12 and 9x16. The row texts (current, phase
-//-- label, voltage), the heading functions and the system information lines
-//-- use the 8x12 face, the status texts the 6x8 face and the watt values
-//-- the 9x16 face.
-#define FONT_TITLE TFT_EC11_FONT_8x12
-#define FONT_STAMP TFT_EC11_FONT_6x8
-#define FONT_VALUE TFT_EC11_FONT_6x8
-#define FONT_HEADER_INFO TFT_EC11_FONT_8x12
-#define FONT_ROW TFT_EC11_FONT_8x12
-#define FONT_SYSTEM TFT_EC11_FONT_8x12
-#define FONT_WATT TFT_EC11_FONT_9x16
+//-- All panel text uses the documented pixel-height API of the component:
+//-- one requested glyph-canvas height in physical TFT pixels (10 through
+//-- 18 px) picks its own bitmap strike; the cell is exactly that tall and
+//-- the monospaced advance (including the spacing columns) comes from
+//-- tft_ec11_get_font_metrics_px(). The heading row (screen name and
+//-- function) uses the 16 px face, the bar row headers (current, phase
+//-- label, voltage), the phase power captions and the system information
+//-- lines the 14 px face, the row watt values the 12 px face, the status
+//-- row the 11 px face, the bar scale labels the 10 px face and the phase
+//-- power values the 18 px face. Every text is drawn through the
+//-- component's bold rendering.
+#define FONT_TITLE_PX 16
+#define FONT_STAMP_PX 11
+#define FONT_VALUE_PX 10
+#define FONT_HEADER_INFO_PX 16
+#define FONT_ROW_PX 14
+#define FONT_SYSTEM_PX 14
+#define FONT_WATT_PX 12
+#define FONT_BIG_PX 18
 
 //-- Bar scale ladder: the smallest step that fits the largest absolute
-//-- watt of the frame; frames above 3800 W stay on the 3800 W step and
-//-- frames below 100 W stay on the 100 W step.
+//-- watt of the frame. The steps roughly double and stay on round numbers,
+//-- from 100 W up to 18000 W, so the top step covers the theoretical
+//-- maximum of a three-phase 25 A / 230 V connection (3 x 25 x 230 =
+//-- 17250 W); frames above 18000 W stay on that step and frames below
+//-- 100 W stay on the 100 W step.
 //-- Published for the SPA realtime view so its bars scale identically to
 //-- the panel (logger_board.h).
-const uint16_t loggerPowerScales[LOGGER_POWER_SCALE_COUNT] = {100u,  250u,  500u,  1000u,
-                                                              1700u, 2400u, 3100u, 3800u};
+const uint16_t loggerPowerScales[LOGGER_POWER_SCALE_COUNT] = {100u,  200u,  400u,   800u,  1500u,
+                                                              3000u, 6000u, 12000u, 18000u};
 
 //-- Panel colours (RGB565). The heading and status rows of every screen are
 //-- light blue with black text; the body stays white with dark text.
@@ -125,17 +146,20 @@ const uint16_t loggerPowerScales[LOGGER_POWER_SCALE_COUNT] = {100u,  250u,  500u
 #define PANEL_PRODUCE_COLOR TFT_EC11_RGB565(34, 160, 60)
 
 //-- Screens after the first accepted telegram; the rotary encoder walks
-//-- through them in this order and Back returns to the previous one.
+//-- through them in this order and nothing else: the bar screen, one power
+//-- screen per phase plus the total and three system information screens.
 typedef enum
 {
   BOARD_SCREEN_PHASE_LOAD = 0,
-  BOARD_SCREEN_PHASE_POWER,
-  BOARD_SCREEN_SYSTEM_INFO,
+  BOARD_SCREEN_PHASE_POWER_1,
+  BOARD_SCREEN_PHASE_POWER_2,
+  BOARD_SCREEN_PHASE_POWER_3,
+  BOARD_SCREEN_PHASE_POWER_TOTAL,
+  BOARD_SCREEN_SYSTEM_1,
+  BOARD_SCREEN_SYSTEM_2,
+  BOARD_SCREEN_SYSTEM_3,
   BOARD_SCREEN_COUNT
 } BoardScreen;
-
-//-- Number of screens remembered for the AUX Back button.
-#define BOARD_HISTORY_DEPTH 8u
 
 //-- Idle time-out used until the stored settings apply their own value.
 #define BOARD_DISPLAY_TIMEOUT_DEFAULT_MINUTES 10u
@@ -168,8 +192,6 @@ typedef struct
   SemaphoreHandle_t lifecycle;
   TaskHandle_t inputTask;
   BoardScreen currentScreen;
-  BoardScreen history[BOARD_HISTORY_DEPTH];
-  uint8_t historyDepth;
   bool screenOn;
   TickType_t lastActivityTick;
   uint16_t displayTimeoutMinutes;
@@ -186,6 +208,9 @@ typedef struct
 static LoggerBoard board;
 
 static const char* const phaseLabels[PANEL_ROWS] = {"Phase 1", "Phase 2", "Phase 3", "Total"};
+
+//-- Heading names of the four power screens (one per phase plus the total).
+static const char* const powerScreenNames[PANEL_ROWS] = {"PHASE 1", "PHASE 2", "PHASE 3", "TOTAL"};
 
 static void drawLine(uint8_t row, const char* label, const char* value)
 {
@@ -256,81 +281,58 @@ uint16_t loggerBoardPickPowerScale(const loggerPowerSnapshot* snapshot)
   return loggerPowerScales[LOGGER_POWER_SCALE_COUNT - 1u];
 }
 
-//-- Cell metrics of the documented native faces: the advance carries the
-//-- 1 px inter-character gap and the cell height is the cleared line height
-//-- (6x8, 8x12, 9x16, 13x24 and 17x32 per the component README).
-static int fontAdvance(tft_ec11_font_t font)
+//-- Monospaced advance of one pixel-height face from the component's
+//-- metrics query (the advance already includes the spacing columns); the
+//-- cell is exactly height_px tall, so a line height needs no lookup.
+static int fontAdvancePx(int height_px)
 {
-  switch (font)
+  tft_ec11_font_metrics_t metrics = {0, 0};
+
+  //-- Only an unsupported height fails (the panel uses fixed 10..18 px
+  //-- faces); keep the layout maths sane with a safe estimate if it does.
+  if (tft_ec11_get_font_metrics_px(height_px, &metrics) != ESP_OK)
   {
-  case TFT_EC11_FONT_17x32:
-    return 17;
-
-  case TFT_EC11_FONT_13x24:
-    return 13;
-
-  case TFT_EC11_FONT_9x16:
-    return 9;
-
-  case TFT_EC11_FONT_8x12:
-    return 8;
-
-  default:
-    return 6;
+    return height_px;
   }
+
+  return (int)metrics.advance_px;
 }
 
-static int fontCellHeight(tft_ec11_font_t font)
-{
-  switch (font)
-  {
-  case TFT_EC11_FONT_17x32:
-    return 32;
-
-  case TFT_EC11_FONT_13x24:
-    return 24;
-
-  case TFT_EC11_FONT_9x16:
-    return 16;
-
-  case TFT_EC11_FONT_8x12:
-    return 12;
-
-  default:
-    return 8;
-  }
-}
-
-static void drawLeftText(int y, const char* text, tft_ec11_font_t font, uint16_t background,
+//-- All panel text goes through the component's bold pixel-height
+//-- rendering: every lit glyph run is drawn a second time one pixel to the
+//-- right so the strokes read a pixel heavier. The extra pixel stays inside
+//-- the cell (including its spacing columns), so the advance and the cell
+//-- height stay exactly what tft_ec11_get_font_metrics_px() reports.
+static void drawLeftText(int y, const char* text, int height_px, uint16_t background,
                          uint16_t foreground)
 {
-  tft_ec11_draw_text_font(PANEL_EDGE_MARGIN, y, text, font, background, foreground);
+  tft_ec11_draw_text_px_bold(PANEL_EDGE_MARGIN, y, text, height_px, background, foreground, true);
 }
 
-static void drawCenteredText(int y, int panelWidth, const char* text, tft_ec11_font_t font,
+static void drawCenteredText(int y, int panelWidth, const char* text, int height_px,
                              uint16_t background, uint16_t foreground)
 {
-  int x = (panelWidth - (int)strlen(text) * fontAdvance(font)) / 2;
+  int x = (panelWidth - (int)strlen(text) * fontAdvancePx(height_px)) / 2;
 
   if (x < 0)
   {
     x = 0;
   }
 
-  tft_ec11_draw_text_font(x, y, text, font, background, foreground);
+  tft_ec11_draw_text_px_bold(x, y, text, height_px, background, foreground, true);
 }
 
 static void drawRightAlignedText(int y, int panelWidth, const char* text, int rightMargin,
-                                 tft_ec11_font_t font, uint16_t background, uint16_t foreground)
+                                 int height_px, uint16_t background, uint16_t foreground)
 {
-  int x = panelWidth - (int)strlen(text) * fontAdvance(font) - rightMargin;
+  int x = panelWidth - (int)strlen(text) * fontAdvancePx(height_px) - rightMargin;
 
   if (x < 0)
   {
     x = 0;
   }
 
-  tft_ec11_draw_text_font(x, y, text, font, background, foreground);
+  tft_ec11_draw_text_px_bold(x, y, text, height_px, background, foreground, true);
 }
 
 //-- Every screen starts with one light blue heading row: the screen name
@@ -339,13 +341,13 @@ static void drawRightAlignedText(int y, int panelWidth, const char* text, int ri
 static void drawScreenTitle(int panelWidth, const char* name, const char* rightText)
 {
   tft_ec11_fill_rect(0, 0, panelWidth, PANEL_NAME_H, PANEL_HEADING_COLOR);
-  tft_ec11_draw_text_font(PANEL_EDGE_MARGIN, (PANEL_NAME_H - fontCellHeight(FONT_TITLE)) / 2, name,
-                          FONT_TITLE, PANEL_HEADING_COLOR, TFT_EC11_BLACK);
+  tft_ec11_draw_text_px_bold(PANEL_EDGE_MARGIN, (PANEL_NAME_H - FONT_TITLE_PX) / 2, name,
+                             FONT_TITLE_PX, PANEL_HEADING_COLOR, TFT_EC11_BLACK, true);
 
   if ((rightText != NULL) && (rightText[0] != '\0'))
   {
-    drawRightAlignedText((PANEL_NAME_H - fontCellHeight(FONT_HEADER_INFO)) / 2, panelWidth,
-                         rightText, PANEL_EDGE_MARGIN, FONT_HEADER_INFO, PANEL_HEADING_COLOR,
+    drawRightAlignedText((PANEL_NAME_H - FONT_HEADER_INFO_PX) / 2, panelWidth, rightText,
+                         PANEL_EDGE_MARGIN, FONT_HEADER_INFO_PX, PANEL_HEADING_COLOR,
                          TFT_EC11_BLACK);
   }
 }
@@ -359,7 +361,7 @@ static void drawBar(int y, int panelWidth, float watts, uint16_t scale, int barH
   int trackWidth = panelWidth - 2 * PANEL_BAR_MARGIN;
   int mid = trackX + trackWidth / 2;
   int halfSpan = trackWidth / 2 - 1;
-  int labelY = y + (barHeight - fontCellHeight(FONT_VALUE)) / 2;
+  int labelY = y + (barHeight - FONT_VALUE_PX) / 2;
   char label[16];
 
   tft_ec11_fill_rect(trackX, y, trackWidth, barHeight, PANEL_BAR_BG);
@@ -385,13 +387,14 @@ static void drawBar(int y, int panelWidth, float watts, uint16_t scale, int barH
   //-- Scale labels as integers inside the bar so they sit in contrast on
   //-- the bar background and the coloured fill.
   snprintf(label, sizeof label, "-%" PRIu16, scale);
-  tft_ec11_draw_text_font(trackX + 2, labelY, label, FONT_VALUE, PANEL_BAR_BG, PANEL_TICK_COLOR);
+  tft_ec11_draw_text_px_bold(trackX + 2, labelY, label, FONT_VALUE_PX, PANEL_BAR_BG,
+                             PANEL_TICK_COLOR, true);
 
   snprintf(label, sizeof label, "%" PRIu16, scale);
-  drawRightAlignedText(labelY, panelWidth, label, PANEL_BAR_MARGIN + 2, FONT_VALUE, PANEL_BAR_BG,
+  drawRightAlignedText(labelY, panelWidth, label, PANEL_BAR_MARGIN + 2, FONT_VALUE_PX, PANEL_BAR_BG,
                        PANEL_TICK_COLOR);
 
-  drawCenteredText(labelY, panelWidth, "0", FONT_VALUE, PANEL_BAR_BG, PANEL_TICK_COLOR);
+  drawCenteredText(labelY, panelWidth, "0", FONT_VALUE_PX, PANEL_BAR_BG, PANEL_TICK_COLOR);
 
   //-- The centre tick stays on top so the zero label never covers it.
   tft_ec11_fill_rect(mid - 1, y, 2, barHeight, PANEL_TICK_COLOR);
@@ -401,20 +404,25 @@ static void drawPowerRow(int index, float watts, float amps, float volts, int y,
                          int rowHeight, uint16_t scale)
 {
   char text[24];
-  int textY = y + (PANEL_HEADER_H - fontCellHeight(FONT_ROW)) / 2;
+  int textY = y + (PANEL_HEADER_H - FONT_ROW_PX) / 2;
   int wattY = y + rowHeight - PANEL_WATT_H;
+  int wattTextY = wattY + (PANEL_WATT_H - FONT_WATT_PX) / 2;
+
+  //-- The whole row body is white: the header band, the bar margins and the
+  //-- strip under the bar never show the cleared black background.
+  tft_ec11_fill_rect(0, y, panelWidth, rowHeight, TFT_EC11_WHITE);
 
   //-- Header band on the white body: phase current left, voltage right and
-  //-- the centred phase label, all in black on white.
-  tft_ec11_fill_rect(0, y, panelWidth, PANEL_HEADER_H, TFT_EC11_WHITE);
+  //-- the centred phase label, all in the 14 px face in black on white.
 
   snprintf(text, sizeof text, "%.1fA", (double)amps);
-  drawLeftText(textY, text, FONT_ROW, TFT_EC11_WHITE, TFT_EC11_BLACK);
+  drawLeftText(textY, text, FONT_ROW_PX, TFT_EC11_WHITE, TFT_EC11_BLACK);
 
-  drawCenteredText(textY, panelWidth, phaseLabels[index], FONT_ROW, TFT_EC11_WHITE, TFT_EC11_BLACK);
+  drawCenteredText(textY, panelWidth, phaseLabels[index], FONT_ROW_PX, TFT_EC11_WHITE,
+                   TFT_EC11_BLACK);
 
   snprintf(text, sizeof text, "%.1fV", (double)volts);
-  drawRightAlignedText(textY, panelWidth, text, PANEL_EDGE_MARGIN, FONT_ROW, TFT_EC11_WHITE,
+  drawRightAlignedText(textY, panelWidth, text, PANEL_EDGE_MARGIN, FONT_ROW_PX, TFT_EC11_WHITE,
                        TFT_EC11_BLACK);
 
   drawBar(y + PANEL_BAR_Y, panelWidth, watts, scale, PANEL_BAR_H);
@@ -423,36 +431,27 @@ static void drawPowerRow(int index, float watts, float amps, float volts, int y,
   //-- leaves ghost pixels behind.
   tft_ec11_fill_rect(0, wattY, panelWidth, PANEL_WATT_H, TFT_EC11_WHITE);
   snprintf(text, sizeof text, "%.1f Watt", (double)watts);
-  drawCenteredText(wattY, panelWidth, text, FONT_WATT, TFT_EC11_WHITE, signedValueColor(watts));
+  drawCenteredText(wattTextY, panelWidth, text, FONT_WATT_PX, TFT_EC11_WHITE,
+                   signedValueColor(watts));
 
   //-- Thin divider under the row keeps the four white rows apart.
   tft_ec11_fill_rect(PANEL_EDGE_MARGIN, y + rowHeight - 1, panelWidth - 2 * PANEL_EDGE_MARGIN, 1,
                      PANEL_BAR_BG);
 }
 
-//-- Light blue status row at the very bottom of every screen: the current
-//-- device status text left (the reception note with the meter date/time
-//-- when the frame carries one) and the AUX back hint right aligned. The
-//-- left text is cut so it never runs under the hint and no line wraps.
+//-- Light blue status row at the very bottom of every screen: only the
+//-- telegram counters, left aligned — the accepted telegrams and the ones
+//-- received but rejected as erroneous. No date/time and no button hints.
 static void drawStatusLine(int panelWidth, int panelHeight)
 {
   int y = panelHeight - PANEL_STATUS_H;
-  int textY = y + (PANEL_STATUS_H - fontCellHeight(FONT_STAMP)) / 2;
-  const char* backHint = "AUX: back";
+  int textY = y + (PANEL_STATUS_H - FONT_STAMP_PX) / 2;
   char status[BOARD_TEXT_MAX + 24];
 
-  if (board.panel.meterTime[0] != '\0')
-  {
-    snprintf(status, sizeof status, "%s | %s", board.p1Note, board.panel.meterTime);
-  }
-  else
-  {
-    snprintf(status, sizeof status, "%s", board.p1Note);
-  }
+  snprintf(status, sizeof status, "Accepted %" PRIu32 " | Rejected %" PRIu32,
+           board.panel.acceptedCount, board.panel.rejectedCount);
 
-  int freeWidth =
-      panelWidth - (int)strlen(backHint) * fontAdvance(FONT_STAMP) - 3 * PANEL_EDGE_MARGIN;
-  int maxChars = freeWidth / fontAdvance(FONT_STAMP);
+  int maxChars = (panelWidth - 2 * PANEL_EDGE_MARGIN) / fontAdvancePx(FONT_STAMP_PX);
 
   if ((maxChars >= 0) && ((int)strlen(status) > maxChars))
   {
@@ -460,10 +459,7 @@ static void drawStatusLine(int panelWidth, int panelHeight)
   }
 
   tft_ec11_fill_rect(0, y, panelWidth, PANEL_STATUS_H, PANEL_HEADING_COLOR);
-  tft_ec11_draw_text_font(PANEL_EDGE_MARGIN, textY, status, FONT_STAMP, PANEL_HEADING_COLOR,
-                          TFT_EC11_BLACK);
-  drawRightAlignedText(textY, panelWidth, backHint, PANEL_EDGE_MARGIN, FONT_STAMP,
-                       PANEL_HEADING_COLOR, TFT_EC11_BLACK);
+  drawLeftText(textY, status, FONT_STAMP_PX, PANEL_HEADING_COLOR, TFT_EC11_BLACK);
 }
 
 static void drawPanel(void)
@@ -476,7 +472,7 @@ static void drawPanel(void)
 
   //-- The heading row prints the screen name left and the screen function
   //-- right; the meter date/time travels on the status row instead.
-  drawScreenTitle(width, "PHASE LOAD", "Live signed watt bars");
+  drawScreenTitle(width, "PHASE LOAD", "Watt bars");
 
   for (int row = 0; row < PANEL_ROWS; row++)
   {
@@ -491,66 +487,109 @@ static void drawPanel(void)
   drawStatusLine(width, height);
 }
 
-//-- Consumption screen: the net watt of phase 1, 2, 3 and the total as four
-//-- labelled rows on the white body, each with the phase name left and the
-//-- signed watt value right in the 9x16 face (consumption red, feed-in
-//-- green, a measured zero black).
-static void drawPhasePowerView(void)
+//-- One half of a phase power screen: the caption left aligned a little off
+//-- the left edge and the watt value in the large 18 px face centred below
+//-- it, both in the channel colour (delivered red, returned green) on the
+//-- white body.
+static void drawPowerHalf(int y, int halfHeight, int panelWidth, const char* caption, float watts,
+                          uint16_t color)
+{
+  char text[24];
+  int stackHeight = FONT_ROW_PX + 8 + FONT_BIG_PX;
+  int top = y + (halfHeight - stackHeight) / 2;
+
+  drawLeftText(top, caption, FONT_ROW_PX, TFT_EC11_WHITE, color);
+
+  snprintf(text, sizeof text, "%.1f W", (double)watts);
+  drawCenteredText(top + FONT_ROW_PX + 8, panelWidth, text, FONT_BIG_PX, TFT_EC11_WHITE, color);
+}
+
+//-- Phase power screen: one per phase plus the total. The channel shows its
+//-- delivered (import) and returned (export) watts as two large values
+//-- stacked on the white body, the delivered value red and the returned
+//-- value green.
+static void drawPhasePowerView(BoardScreen screen)
 {
   const loggerPowerSnapshot* snapshot = &board.panel;
   int width = (int)tft_ec11_width();
   int height = (int)tft_ec11_height();
-  int rowHeight = (height - PANEL_TITLE_H - PANEL_STATUS_H) / PANEL_ROWS;
-  char text[24];
+  int powerIndex = (int)screen - (int)BOARD_SCREEN_PHASE_POWER_1;
+  bool isTotal = (powerIndex == PANEL_ROWS - 1);
+  float delivered =
+      isTotal ? snapshot->totalDeliveredWatts : snapshot->phaseDeliveredWatts[powerIndex];
+  float returned =
+      isTotal ? snapshot->totalReturnedWatts : snapshot->phaseReturnedWatts[powerIndex];
+  int halfHeight = (height - PANEL_TITLE_H - PANEL_STATUS_H) / 2;
+  int midY = PANEL_TITLE_H + halfHeight;
 
-  drawScreenTitle(width, "PHASE POWER", "Consumption per phase");
+  drawScreenTitle(width, powerScreenNames[powerIndex], "Import / export");
   tft_ec11_fill_rect(0, PANEL_TITLE_H, width, height - PANEL_TITLE_H - PANEL_STATUS_H,
                      TFT_EC11_WHITE);
 
-  for (int row = 0; row < PANEL_ROWS; row++)
-  {
-    int y = PANEL_TITLE_H + row * rowHeight;
-    float watts = (row < 3) ? snapshot->phaseWatts[row] : snapshot->totalWatts;
-    int labelY = y + (rowHeight - fontCellHeight(FONT_ROW)) / 2;
-    int valueY = y + (rowHeight - fontCellHeight(FONT_WATT)) / 2;
+  drawPowerHalf(PANEL_TITLE_H, halfHeight, width, "Delivered (Import)", delivered,
+                PANEL_CONSUME_COLOR);
+  drawPowerHalf(midY, halfHeight, width, "Returned (Export)", returned, PANEL_PRODUCE_COLOR);
 
-    drawLeftText(labelY, phaseLabels[row], FONT_ROW, TFT_EC11_WHITE, TFT_EC11_BLACK);
-
-    snprintf(text, sizeof text, "%.1f W", (double)watts);
-    drawRightAlignedText(valueY, width, text, PANEL_EDGE_MARGIN, FONT_WATT, TFT_EC11_WHITE,
-                         signedValueColor(watts));
-
-    //-- Thin divider under the row keeps the four white rows apart.
-    tft_ec11_fill_rect(PANEL_EDGE_MARGIN, y + rowHeight - 1, width - 2 * PANEL_EDGE_MARGIN, 1,
-                       PANEL_BAR_BG);
-  }
+  //-- Thin divider between the two halves keeps them apart.
+  tft_ec11_fill_rect(PANEL_EDGE_MARGIN, midY - 1, width - 2 * PANEL_EDGE_MARGIN, 1, PANEL_BAR_BG);
 
   drawStatusLine(width, height);
 }
 
-//-- Line pitch of the system information view: the 8x12 cell plus a small
-//-- gap, so every line stays on its own row without wrapping.
-#define SYSTEM_LINE_PITCH 14
+//-- Line pitch of the system information screens: the 14 px cell plus a
+//-- small gap, so every line stays on its own row.
+#define SYSTEM_LINE_PITCH 16
 
-//-- One group label of the system information view: the section name in the
-//-- dark navy tone, its facts in black on the white body below it.
+//-- One group label of the system information screens: the section name in
+//-- the dark navy tone, its facts in black on the white body below it.
 static void drawSystemSection(int* y, const char* label)
 {
-  drawLeftText(*y, label, FONT_SYSTEM, TFT_EC11_WHITE, PANEL_HEADER_COLOR);
+  drawLeftText(*y, label, FONT_SYSTEM_PX, TFT_EC11_WHITE, PANEL_HEADER_COLOR);
   *y += SYSTEM_LINE_PITCH;
 }
 
-//-- One "name : value" line of the system information view.
-static void drawSystemLine(int* y, const char* text)
+//-- One "name : value" line of the system information screens: a line too
+//-- long for the panel is split over two lines at the last space before the
+//-- edge, so no text ever wraps or runs off the screen mid word.
+static void drawSystemLine(int* y, const char* text, int panelWidth)
 {
-  drawLeftText(*y, text, FONT_SYSTEM, TFT_EC11_WHITE, TFT_EC11_BLACK);
+  char first[64];
+  int maxChars = (panelWidth - 2 * PANEL_EDGE_MARGIN) / fontAdvancePx(FONT_SYSTEM_PX);
+  int split;
+
+  if ((int)strlen(text) <= maxChars)
+  {
+    drawLeftText(*y, text, FONT_SYSTEM_PX, TFT_EC11_WHITE, TFT_EC11_BLACK);
+    *y += SYSTEM_LINE_PITCH;
+    return;
+  }
+
+  for (split = maxChars; split > 0; split--)
+  {
+    if (text[split] == ' ')
+    {
+      break;
+    }
+  }
+
+  //-- No space to break at: keep the head of the single long word.
+  if (split <= 0)
+  {
+    split = maxChars;
+  }
+
+  snprintf(first, sizeof first, "%.*s", split, text);
+  drawLeftText(*y, first, FONT_SYSTEM_PX, TFT_EC11_WHITE, TFT_EC11_BLACK);
+  *y += SYSTEM_LINE_PITCH;
+
+  snprintf(first, sizeof first, "%.*s", maxChars, text + split + ((text[split] == ' ') ? 1 : 0));
+  drawLeftText(*y, first, FONT_SYSTEM_PX, TFT_EC11_WHITE, TFT_EC11_BLACK);
   *y += SYSTEM_LINE_PITCH;
 }
 
-//-- System information screen: the device facts grouped in the sections
-//-- they belong to — telegram reception, the P1 input, the network and the
-//-- device itself — every line in the 8x12 native face.
-static void drawSystemView(void)
+//-- System information screen one: the telegram counters and the P1 input
+//-- profile, every line in the 14 px face.
+static void drawSystemTelegramView(void)
 {
   const loggerPowerSnapshot* snapshot = &board.panel;
   int width = (int)tft_ec11_width();
@@ -558,64 +597,113 @@ static void drawSystemView(void)
   char line[64];
   int y = PANEL_TITLE_H + 2;
 
-  drawScreenTitle(width, "SYSTEM INFO", "Device and reception");
+  drawScreenTitle(width, "SYSTEM INFO", "Reception");
   tft_ec11_fill_rect(0, PANEL_TITLE_H, width, height - PANEL_TITLE_H - PANEL_STATUS_H,
                      TFT_EC11_WHITE);
 
   drawSystemSection(&y, "TELEGRAMS");
 
   snprintf(line, sizeof line, "Accepted : %" PRIu32, snapshot->acceptedCount);
-  drawSystemLine(&y, line);
+  drawSystemLine(&y, line, width);
 
   snprintf(line, sizeof line, "Rejected : %" PRIu32, snapshot->rejectedCount);
-  drawSystemLine(&y, line);
+  drawSystemLine(&y, line, width);
 
   drawSystemSection(&y, "P1 INPUT");
 
   snprintf(line, sizeof line, "Country / profile : %s %s",
            (snapshot->countryCode[0] != '\0') ? snapshot->countryCode : "?",
            (snapshot->profileId[0] != '\0') ? snapshot->profileId : "?");
-  drawSystemLine(&y, line);
+  drawSystemLine(&y, line, width);
 
   snprintf(line, sizeof line, "RX polarity : %s", snapshot->rxInverted ? "inverted" : "normal");
-  drawSystemLine(&y, line);
+  drawSystemLine(&y, line, width);
+
+  drawStatusLine(width, height);
+}
+
+//-- System information screen two: the meter clock and the network, every
+//-- line in the 14 px face.
+static void drawSystemNetworkView(void)
+{
+  const loggerPowerSnapshot* snapshot = &board.panel;
+  int width = (int)tft_ec11_width();
+  int height = (int)tft_ec11_height();
+  char line[64];
+  int y = PANEL_TITLE_H + 2;
+
+  drawScreenTitle(width, "SYSTEM INFO", "Meter & net");
+  tft_ec11_fill_rect(0, PANEL_TITLE_H, width, height - PANEL_TITLE_H - PANEL_STATUS_H,
+                     TFT_EC11_WHITE);
+
+  drawSystemSection(&y, "METER");
 
   snprintf(line, sizeof line, "Meter time : %s",
            (snapshot->meterTime[0] != '\0') ? snapshot->meterTime : "none");
-  drawSystemLine(&y, line);
+  drawSystemLine(&y, line, width);
 
   drawSystemSection(&y, "NETWORK");
 
   snprintf(line, sizeof line, "SSID : %s", (board.ssid[0] != '\0') ? board.ssid : "none");
-  drawSystemLine(&y, line);
+  drawSystemLine(&y, line, width);
 
   snprintf(line, sizeof line, "IP : %s", (board.ip[0] != '\0') ? board.ip : "none");
-  drawSystemLine(&y, line);
+  drawSystemLine(&y, line, width);
+
+  drawStatusLine(width, height);
+}
+
+//-- System information screen three: the device facts, every line in the
+//-- 14 px face.
+static void drawSystemDeviceView(void)
+{
+  const loggerPowerSnapshot* snapshot = &board.panel;
+  int width = (int)tft_ec11_width();
+  int height = (int)tft_ec11_height();
+  char line[64];
+  int y = PANEL_TITLE_H + 2;
+
+  drawScreenTitle(width, "SYSTEM INFO", "Device");
+  tft_ec11_fill_rect(0, PANEL_TITLE_H, width, height - PANEL_TITLE_H - PANEL_STATUS_H,
+                     TFT_EC11_WHITE);
 
   drawSystemSection(&y, "DEVICE");
 
   snprintf(line, sizeof line, "Uptime : %" PRIu32 "d %02" PRIu32 ":%02" PRIu32 ":%02" PRIu32,
            snapshot->uptimeSeconds / 86400u, (snapshot->uptimeSeconds / 3600u) % 24u,
            (snapshot->uptimeSeconds / 60u) % 60u, snapshot->uptimeSeconds % 60u);
-  drawSystemLine(&y, line);
+  drawSystemLine(&y, line, width);
 
   snprintf(line, sizeof line, "Firmware : %s", getAppVersion());
-  drawSystemLine(&y, line);
+  drawSystemLine(&y, line, width);
 
   drawStatusLine(width, height);
 }
 
 static void drawActiveView(void)
 {
-  if (board.currentScreen == BOARD_SCREEN_PHASE_POWER)
+  if ((board.currentScreen >= BOARD_SCREEN_PHASE_POWER_1) &&
+      (board.currentScreen <= BOARD_SCREEN_PHASE_POWER_TOTAL))
   {
-    drawPhasePowerView();
+    drawPhasePowerView(board.currentScreen);
     return;
   }
 
-  if (board.currentScreen == BOARD_SCREEN_SYSTEM_INFO)
+  if (board.currentScreen == BOARD_SCREEN_SYSTEM_1)
   {
-    drawSystemView();
+    drawSystemTelegramView();
+    return;
+  }
+
+  if (board.currentScreen == BOARD_SCREEN_SYSTEM_2)
+  {
+    drawSystemNetworkView();
+    return;
+  }
+
+  if (board.currentScreen == BOARD_SCREEN_SYSTEM_3)
+  {
+    drawSystemDeviceView();
     return;
   }
 
@@ -641,8 +729,8 @@ static void refreshAll(void)
 
 //-- Screen navigation helpers; every caller holds the drawing mutex.
 
-//-- Switch to the given screen, remembering the current one so the AUX
-//-- Back button can return to it.
+//-- Switch to the given screen; the rotary encoder is the only means to
+//-- browse, so there is no history to remember.
 static void gotoScreen(BoardScreen next)
 {
   if (next == board.currentScreen)
@@ -650,36 +738,7 @@ static void gotoScreen(BoardScreen next)
     return;
   }
 
-  if (board.historyDepth < BOARD_HISTORY_DEPTH)
-  {
-    board.history[board.historyDepth++] = board.currentScreen;
-  }
-  else
-  {
-    //-- The fixed history is full: the oldest entry falls out.
-    for (uint8_t index = 1u; index < BOARD_HISTORY_DEPTH; index++)
-    {
-      board.history[index - 1u] = board.history[index];
-    }
-
-    board.history[BOARD_HISTORY_DEPTH - 1u] = board.currentScreen;
-  }
-
   board.currentScreen = next;
-  drawActiveViewCleared();
-}
-
-//-- AUX Back: return to the screen that opened the current one; the very
-//-- first screen simply stays put when there is nothing to return to.
-static void showBackScreen(void)
-{
-  if (board.historyDepth == 0u)
-  {
-    return;
-  }
-
-  board.historyDepth--;
-  board.currentScreen = board.history[board.historyDepth];
   drawActiveViewCleared();
 }
 
@@ -693,12 +752,12 @@ static void wakeScreen(void)
   drawActiveViewCleared();
 }
 
-//-- Input task: the rotary encoder walks through all screens one by one, a
-//-- short AUX press invokes Back on the screen that opened the current one,
-//-- a medium-long press jumps straight to SYSTEM INFO and any physical
-//-- button action restarts the idle timer. While the panel is dark only an
-//-- AUX press wakes it; the encoder stays idle until it is lit again.
-//-- Events only act once the power screens have taken the display over.
+//-- Input handling: the rotary encoder is the only means to walk through
+//-- all screens one by one. The AUX button never switches a screen (it is
+//-- reserved for leaving a future menu) and only wakes a dark panel. Every
+//-- event on any button — encoder turns, the encoder button and the AUX
+//-- button, lit or dark — restarts the idle time-out. Events only act once
+//-- the power screens have taken the display over.
 static void handleBoardEvent(const tft_ec11_event_t* event)
 {
   if (!board.panelActive)
@@ -708,11 +767,15 @@ static void handleBoardEvent(const tft_ec11_event_t* event)
 
   xSemaphoreTake(board.mutex, portMAX_DELAY);
 
-  if (!board.screenOn)
+  //-- Any physical button action restarts the idle time-out, whether the
+  //-- panel is lit or already dark.
+  board.lastActivityTick = xTaskGetTickCount();
+
+  if (event->type == TFT_EC11_EVENT_AUX_BUTTON)
   {
-    //-- Dark panel: any press of the AUX button lights it again and
-    //-- restarts the idle timer from this moment.
-    if (event->type == TFT_EC11_EVENT_AUX_BUTTON)
+    //-- Dark panel: any press of the AUX button lights it again. While the
+    //-- panel is lit the AUX button does nothing on the screens.
+    if (!board.screenOn)
     {
       wakeScreen();
     }
@@ -721,26 +784,7 @@ static void handleBoardEvent(const tft_ec11_event_t* event)
     return;
   }
 
-  //-- Every physical button action while the panel is on restarts the idle
-  //-- time-out.
-  board.lastActivityTick = xTaskGetTickCount();
-
-  if (event->type == TFT_EC11_EVENT_AUX_BUTTON)
-  {
-    if (event->press == TFT_EC11_PRESS_SHORT)
-    {
-      showBackScreen();
-    }
-    else if (event->press == TFT_EC11_PRESS_MEDIUM)
-    {
-      gotoScreen(BOARD_SCREEN_SYSTEM_INFO);
-    }
-
-    xSemaphoreGive(board.mutex);
-    return;
-  }
-
-  if ((event->type == TFT_EC11_EVENT_ROTATE) && (event->steps != 0))
+  if ((event->type == TFT_EC11_EVENT_ROTATE) && (event->steps != 0) && board.screenOn)
   {
     int steps = (int)event->steps % (int)BOARD_SCREEN_COUNT;
 
@@ -895,8 +939,9 @@ static esp_err_t boardBringUp(void)
   refreshAll();
   xSemaphoreGive(board.mutex);
 
-  //-- The AUX button and the encoder drive the panel views; when the inputs
-  //-- cannot be started the panel keeps working without them.
+  //-- The encoder browses the panel views and the AUX button wakes a dark
+  //-- panel; when the inputs cannot be started the panel keeps working
+  //-- without them.
   esp_err_t inputs = tft_ec11_inputs_start(BOARD_INPUT_QUEUE_LEN);
 
   if (inputs == ESP_OK)

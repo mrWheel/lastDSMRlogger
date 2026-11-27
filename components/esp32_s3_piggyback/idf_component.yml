@@ -1,5 +1,37 @@
-version: "1.4.0"
+## esp32_s3_piggyBack - manifest for the ESP Component Registry
+## Date: 2026-11-27 · Build: 6
+##
+## The repository field must point at the public repository before the
+## component is published. repository_info.path tells the registry where
+## the component lives inside the repository.
+##
+## Pack and upload from this directory:
+##   compote component pack --name esp32-s3-Piggyback
+##   compote component upload --name esp32-s3-Piggyback --namespace mrwheel
+##
+## The single source of the version is PROG_VERSION in components/esp32_s3_piggyback/esp32_s3_piggyback.c.
+## The registry tooling needs a static version: field here, so keep this
+## value in sync with PROG_VERSION (without the leading 'v').
+
+version: "1.6.0"
+license: "GPL-3.0-or-later"
 description: "Native ESP-IDF driver for the ESP32-S3 Piggyback board"
-url: "https://github.com/mrWheel/TFT_LCD_Display_EC11_ESP32S3_Board"
+url: "https://github.com/mrWheel/esp32-s3-Piggyback"
+
+maintainers:
+  - "Willem Aandewiel (mrWheel)"
+
+repository: "https://github.com/mrWheel/esp32-s3-Piggyback"
+
+repository_info:
+  path: "components/esp32_s3_piggyback"
+
+issues: "https://github.com/mrWheel/esp32-s3-Piggyback/issues"
+
+documentation: "https://github.com/mrWheel/esp32-s3-Piggyback/blob/main/components/esp32_s3_piggyback/README.md"
+
+targets: 
+  - "esp32s3"
+
 dependencies:
-  idf: ">=5.1"
+  idf: ">=6.0.2"

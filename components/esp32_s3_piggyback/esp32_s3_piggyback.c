@@ -12,11 +12,23 @@
 #include "freertos/semphr.h"
 #include "sdkconfig.h"
 
+//-- Library version. Kept in exactly one place; the version travels with the
+//-- source file headers (Date/Build) and with idf_component.yml. Callers read
+//-- it through piggyBackVersion().
+static const char* PROG_VERSION = "v1.6.0";
+
 uint8_t tft_ec11_font_row(unsigned char c, uint8_t row);
 uint8_t tft_ec11_font_medium_row(unsigned char c, uint8_t row);
 uint8_t tft_ec11_font_large_row(unsigned char c, uint8_t row);
-uint16_t tft_ec11_font_xlarge_row(unsigned char c, uint8_t row);
-uint16_t tft_ec11_font_xxlarge_row(unsigned char c, uint8_t row);
+
+//-- Pixel-height faces (10..18 px): the face descriptor stays private to
+//-- esp32_s3_piggyback_font.c, the renderer only handles the opaque
+//-- pointer returned by tft_ec11_font_px_lookup().
+typedef struct tft_ec11_font_px_face_s tft_ec11_font_px_face_t;
+const tft_ec11_font_px_face_t* tft_ec11_font_px_lookup(int height_px);
+uint8_t tft_ec11_font_px_advance_px(const tft_ec11_font_px_face_t* face);
+uint8_t tft_ec11_font_px_glyph_width_px(const tft_ec11_font_px_face_t* face);
+uint16_t tft_ec11_font_px_row(const tft_ec11_font_px_face_t* face, unsigned char c, uint8_t row);
 
 static esp_lcd_panel_io_handle_t s_io;
 static esp_lcd_panel_handle_t s_panel;
@@ -287,8 +299,13 @@ static size_t count_utf8_characters(const char* text)
   return count;
 }
 
+//-- bold renders every lit glyph pixel twice: once at its own column and
+//-- once one pixel to the right, so the strokes read a pixel heavier
+//-- (the extra pixel may take the inter-character gap column, which is
+//-- exactly what makes the face look bolder).
 static esp_err_t draw_text_with_style(int x, int y, size_t slots, const char* text,
-                                      uint16_t background, uint8_t font_scale, uint16_t foreground)
+                                      uint16_t background, uint8_t font_scale, uint16_t foreground,
+                                      bool bold)
 {
   if (!text || !slots || !font_scale)
     return ESP_ERR_INVALID_ARG;
@@ -303,8 +320,13 @@ static esp_err_t draw_text_with_style(int x, int y, size_t slots, const char* te
       uint8_t bits = tft_ec11_font_row(character, row);
       for (int col = 0; col < 5; col++)
         if (bits & (1 << (4 - col)))
+        {
           draw_pixels(x + (int)glyph_index * cw + col * font_scale, y + row * font_scale,
                       font_scale, font_scale, foreground);
+          if (bold)
+            draw_pixels(x + (int)glyph_index * cw + col * font_scale + 1, y + row * font_scale,
+                        font_scale, font_scale, foreground);
+        }
     }
     glyph_index++;
   }
@@ -317,34 +339,40 @@ esp_err_t tft_ec11_draw_text_simple(int x, int y, const char* text)
   {
     return ESP_ERR_INVALID_ARG;
   }
-  return draw_text_with_style(x, y, count_utf8_characters(text), text, s_bg, s_scale, s_fg);
+  return draw_text_with_style(x, y, count_utf8_characters(text), text, s_bg, s_scale, s_fg, false);
 }
 
 esp_err_t tft_ec11_draw_text_styled(int x, int y, const char* text, uint16_t background,
                                     uint8_t font_scale, uint16_t foreground)
+{
+  return tft_ec11_draw_text_styled_bold(x, y, text, background, font_scale, foreground, false);
+}
+
+esp_err_t tft_ec11_draw_text_styled_bold(int x, int y, const char* text, uint16_t background,
+                                         uint8_t font_scale, uint16_t foreground, bool bold)
 {
   if (!text)
   {
     return ESP_ERR_INVALID_ARG;
   }
   return draw_text_with_style(x, y, count_utf8_characters(text), text, background, font_scale,
-                              foreground);
+                              foreground, bold);
 }
 
 esp_err_t tft_ec11_draw_text(int x, int y, size_t slots, const char* text)
 {
-  return draw_text_with_style(x, y, slots, text, s_bg, s_scale, s_fg);
+  return draw_text_with_style(x, y, slots, text, s_bg, s_scale, s_fg, false);
 }
 
 //-- Cell metrics for the native font faces, indexed by tft_ec11_font_t.
 //-- Glyph size comes from its own bitmap (never scaled); advance is the
 //-- glyph width plus the normal 1 px inter-character gap; cell_height is
 //-- the height of the area cleared before drawing.
-static const uint8_t s_face_glyph_width[] = {5, 7, 8, 12, 16};
-static const uint8_t s_face_glyph_rows[] = {7, 12, 16, 24, 32};
-static const uint8_t s_face_advance[] = {6, 8, 9, 13, 17};
-static const uint8_t s_face_cell_height[] = {8, 12, 16, 24, 32};
-static const uint16_t s_face_left_pixel_bit[] = {1 << 4, 1 << 6, 1 << 7, 1 << 15, 1 << 15};
+static const uint8_t s_face_glyph_width[] = {5, 7, 8};
+static const uint8_t s_face_glyph_rows[] = {7, 12, 16};
+static const uint8_t s_face_advance[] = {6, 8, 9};
+static const uint8_t s_face_cell_height[] = {8, 12, 16};
+static const uint16_t s_face_left_pixel_bit[] = {1 << 4, 1 << 6, 1 << 7};
 
 //-- One row of a glyph of the selected face; every row access function
 //-- returns its bits with the leftmost glyph pixel at
@@ -357,40 +385,41 @@ static uint16_t font_face_row(tft_ec11_font_t font, unsigned char character, uin
     return tft_ec11_font_medium_row(character, row);
   case TFT_EC11_FONT_9x16:
     return tft_ec11_font_large_row(character, row);
-  case TFT_EC11_FONT_13x24:
-    return tft_ec11_font_xlarge_row(character, row);
-  case TFT_EC11_FONT_17x32:
-    return tft_ec11_font_xxlarge_row(character, row);
   default:
     return tft_ec11_font_row(character, row);
   }
 }
 
-static esp_err_t draw_text_with_font(int x, int y, size_t slots, const char* text,
-                                     tft_ec11_font_t font, uint16_t background, uint16_t foreground)
+typedef uint16_t (*font_row_reader)(const void* face, unsigned char character, uint8_t row);
+
+//-- Shared glyph renderer for the native faces and the pixel-height faces.
+//-- Every decoded glyph row is scanned for contiguous lit pixels and each
+//-- run is sent as one horizontal rectangle through the existing clipped
+//-- transfer path, so each exact glyph pixel is written once and
+//-- consecutive pixels do not need one SPI call each. With bold set, every
+//-- run is also drawn one pixel to the right; a face's advance is always
+//-- at least one pixel wider than its bitmap, so the extra pixel stays
+//-- inside the cell including its spacing columns.
+//-- propagate_run_errors keeps the legacy behaviour (per-run errors are
+//-- ignored, only the clearing step reports) when false, and reports
+//-- genuine LCD transfer failures when true while off-screen runs (which
+//-- the transfer path rejects with ESP_ERR_INVALID_ARG) keep clipping
+//-- silently.
+static esp_err_t draw_glyph_runs(int x, int y, size_t slots, const char* text, int advance,
+                                 int glyph_width, int glyph_rows, uint16_t left_bit,
+                                 font_row_reader row_reader, const void* face, uint16_t foreground,
+                                 bool bold, bool propagate_run_errors)
 {
-  if (!text || !slots || (unsigned)font > (unsigned)TFT_EC11_FONT_17x32)
-  {
-    return ESP_ERR_INVALID_ARG;
-  }
-  const int advance = s_face_advance[font];
-  const int glyph_width = s_face_glyph_width[font];
-  const uint16_t left_bit = s_face_left_pixel_bit[font];
-  ESP_RETURN_ON_ERROR(draw_pixels(x, y, (int)slots * advance, s_face_cell_height[font], background),
-                      TAG, "text clear");
   size_t byte_index = 0, glyph_index = 0;
   while (text[byte_index] != '\0' && glyph_index < slots)
   {
     unsigned char character = decode_next_character(text, &byte_index);
-    for (int row = 0; row < s_face_glyph_rows[font]; row++)
+    for (int row = 0; row < glyph_rows; row++)
     {
-      uint16_t bits = font_face_row(font, character, row);
+      uint16_t bits = row_reader(face, character, row);
       int col = 0;
       while (col < glyph_width)
       {
-        //-- Draw one horizontal run of lit pixels as a single
-        //-- rectangle so each exact glyph pixel is written once and
-        //-- consecutive pixels do not need one SPI call each.
         if (bits & (left_bit >> col))
         {
           int run = 1;
@@ -398,7 +427,27 @@ static esp_err_t draw_text_with_font(int x, int y, size_t slots, const char* tex
           {
             run++;
           }
-          draw_pixels(x + (int)glyph_index * advance + col, y + row, run, 1, foreground);
+          //-- Guard the coordinate arithmetic before converting it to the
+          //-- transfer path's int parameters; values outside the integer
+          //-- range are far outside the display anyway.
+          int64_t run_x = (int64_t)x + (int64_t)glyph_index * advance + col;
+          int64_t run_y = (int64_t)y + row;
+          if (run_x >= INT32_MIN && run_x <= INT32_MAX && run_y >= INT32_MIN && run_y <= INT32_MAX)
+          {
+            esp_err_t e = draw_pixels((int)run_x, (int)run_y, run, 1, foreground);
+            if (propagate_run_errors && e != ESP_OK && e != ESP_ERR_INVALID_ARG)
+            {
+              return e;
+            }
+            if (bold)
+            {
+              e = draw_pixels((int)run_x + 1, (int)run_y, run, 1, foreground);
+              if (propagate_run_errors && e != ESP_OK && e != ESP_ERR_INVALID_ARG)
+              {
+                return e;
+              }
+            }
+          }
           col += run;
         }
         else
@@ -412,14 +461,105 @@ static esp_err_t draw_text_with_font(int x, int y, size_t slots, const char* tex
   return ESP_OK;
 }
 
-esp_err_t tft_ec11_draw_text_font(int x, int y, const char* text, tft_ec11_font_t font,
-                                  uint16_t background, uint16_t foreground)
+//-- Row reader for the three native enum faces; the face index travels in
+//-- the opaque context pointer.
+static uint16_t legacy_face_row(const void* face, unsigned char character, uint8_t row)
+{
+  return font_face_row((tft_ec11_font_t)(intptr_t)face, character, row);
+}
+
+//-- bold renders every drawn run of lit glyph pixels twice: once at its own
+//-- columns and once one pixel to the right, so the native faces read a
+//-- pixel heavier (the extra pixel may take the 1 px inter-character gap).
+static esp_err_t draw_text_with_font(int x, int y, size_t slots, const char* text,
+                                     tft_ec11_font_t font, uint16_t background, uint16_t foreground,
+                                     bool bold)
+{
+  if (!text || !slots || (unsigned)font > (unsigned)TFT_EC11_FONT_9x16)
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+  ESP_RETURN_ON_ERROR(
+      draw_pixels(x, y, (int)slots * s_face_advance[font], s_face_cell_height[font], background),
+      TAG, "text clear");
+  return draw_glyph_runs(x, y, slots, text, s_face_advance[font], s_face_glyph_width[font],
+                         s_face_glyph_rows[font], s_face_left_pixel_bit[font], legacy_face_row,
+                         (const void*)(intptr_t)font, foreground, bold, false);
+}
+
+//-- Row reader for the pixel-height faces; the opaque face descriptor
+//-- travels in the context pointer. Rows are returned MSB-left so one
+//-- left_bit (bit 15) serves every pixel-height face.
+static uint16_t px_face_row(const void* face, unsigned char character, uint8_t row)
+{
+  return tft_ec11_font_px_row((const tft_ec11_font_px_face_t*)face, character, row);
+}
+
+esp_err_t tft_ec11_get_font_metrics_px(int height_px, tft_ec11_font_metrics_t* metrics)
+{
+  const tft_ec11_font_px_face_t* face = tft_ec11_font_px_lookup(height_px);
+  if (!face || !metrics)
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+  metrics->advance_px = tft_ec11_font_px_advance_px(face);
+  metrics->cell_height_px = (uint8_t)height_px;
+  return ESP_OK;
+}
+
+esp_err_t tft_ec11_draw_text_px(int x, int y, const char* text, int height_px, uint16_t background,
+                                uint16_t foreground)
+{
+  return tft_ec11_draw_text_px_bold(x, y, text, height_px, background, foreground, false);
+}
+
+esp_err_t tft_ec11_draw_text_px_bold(int x, int y, const char* text, int height_px,
+                                     uint16_t background, uint16_t foreground, bool bold)
 {
   if (!text)
   {
     return ESP_ERR_INVALID_ARG;
   }
-  return draw_text_with_font(x, y, count_utf8_characters(text), text, font, background, foreground);
+  //-- Resolve the face once and validate every argument (height, slots,
+  //-- slot-count multiplication) before issuing any LCD transfer.
+  const tft_ec11_font_px_face_t* face = tft_ec11_font_px_lookup(height_px);
+  if (!face)
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+  const int advance = tft_ec11_font_px_advance_px(face);
+  const int glyph_width = tft_ec11_font_px_glyph_width_px(face);
+  const size_t slots = count_utf8_characters(text);
+  if (!slots || slots > (size_t)INT32_MAX / (unsigned)advance)
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+  //-- The opaque background rectangle uses the same decoded character
+  //-- count and the same advance as the renderer; the cell height is
+  //-- exactly the requested height. An empty or entirely off-screen draw
+  //-- reports ESP_ERR_INVALID_ARG through this step, as the existing
+  //-- native entry points do.
+  ESP_RETURN_ON_ERROR(draw_pixels(x, y, (int)slots * advance, height_px, background), TAG,
+                      "text clear");
+  return draw_glyph_runs(x, y, slots, text, advance, glyph_width, height_px, (uint16_t)(1 << 15),
+                         px_face_row, face, foreground, bold, true);
+}
+
+esp_err_t tft_ec11_draw_text_font(int x, int y, const char* text, tft_ec11_font_t font,
+                                  uint16_t background, uint16_t foreground)
+{
+  return tft_ec11_draw_text_font_bold(x, y, text, font, background, foreground, false);
+}
+
+esp_err_t tft_ec11_draw_text_font_bold(int x, int y, const char* text, tft_ec11_font_t font,
+                                       uint16_t background, uint16_t foreground, bool bold)
+{
+  if (!text)
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+  return draw_text_with_font(x, y, count_utf8_characters(text), text, font, background, foreground,
+                             bold);
 }
 
 static void emit_button(tft_ec11_event_type_t type, tft_ec11_press_t press, uint32_t ms)
@@ -600,4 +740,9 @@ QueueHandle_t tft_ec11_event_queue(void)
 bool tft_ec11_get_event(tft_ec11_event_t* e, TickType_t w)
 {
   return s_queue && e && xQueueReceive(s_queue, e, w) == pdTRUE;
+}
+
+const char* piggyBackVersion(void)
+{
+  return PROG_VERSION;
 }
