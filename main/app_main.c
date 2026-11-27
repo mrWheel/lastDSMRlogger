@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: app_main.c - application entry
-//-- Date: 2026-11-25 · Build: 25
+//-- Date: 2026-11-27 · Build: 26
 //--
 //-- Boot order: NVS comes up first and the stored settings are read, because
 //-- the stored display mode decides whether the board stays up ("No Display"
@@ -26,7 +26,7 @@
 
 //-- never remove or change in this line,
 //-- it indicates the program version (the part "x.y.z" can and will change)
-static const char* PROG_VERSION = "v0.6.8";
+static const char* PROG_VERSION = "v0.6.9";
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -1005,6 +1005,50 @@ bool wifiManagerStationHasIp(void)
   return stationHasIp;
 }
 
+//-- Tariff price provider of the phase power price boxes: answers with the
+//-- prices that value the energy at this very moment — the dynamic table's
+//-- prices while the dynamic tariffs switch is on and the table covers this
+//-- instant, otherwise the manual price of the tariff the meter's indicator
+//-- names (indicator 0 prices like tariff 1) — exactly the rule the meter
+//-- store calculator follows. The board never depends on the tariff or
+//-- settings components itself, so the application wires them together here.
+static void tftTariffPrices(uint8_t tariffIndicator, float* importPricePerKwh,
+                            float* exportPricePerKwh, char* currencyOut, size_t currencySize)
+{
+  loggerSettingsConfig settings;
+  bool haveSettings = (loggerSettingsLoad(&settings) == ESP_OK);
+  bool tariff2Active = (tariffIndicator == 2u);
+
+  *importPricePerKwh = haveSettings ? (tariff2Active ? settings.tariff2ImportPricePerKwh
+                                                     : settings.tariff1ImportPricePerKwh)
+                                    : 0.0f;
+  *exportPricePerKwh = haveSettings ? (tariff2Active ? settings.tariff2ExportPricePerKwh
+                                                     : settings.tariff1ExportPricePerKwh)
+                                    : 0.0f;
+
+  if (haveSettings && settings.dynamicTariffsEnabled)
+  {
+    loggerTariffInterval active;
+
+    //-- Also false while the clock is not synchronised: then the manual
+    //-- prices stand.
+    if (loggerTariffsActiveInterval(time(NULL), &active))
+    {
+      if (active.hasImport)
+      {
+        *importPricePerKwh = active.importPricePerKwh;
+      }
+
+      if (active.hasExport)
+      {
+        *exportPricePerKwh = active.exportPricePerKwh;
+      }
+    }
+  }
+
+  snprintf(currencyOut, currencySize, "%s", loggerTariffsCurrency());
+}
+
 void app_main(void)
 {
   //-- Serial quiet mode: the console shows warnings and errors only. The
@@ -1036,6 +1080,12 @@ void app_main(void)
   bool displayEnabled = haveSettings ? settings.displayEnabled : true;
 
   loggerBoardSetEnabled(true);
+
+  //-- The phase power price boxes ask this application for the active price
+  //-- per kWh (the board itself never depends on the tariff or settings
+  //-- components): dynamic prices with the manual fallback, installed after
+  //-- the board state is prepared so the registration is never wiped.
+  loggerBoardSetTariffGetter(tftTariffPrices);
 
   if (!displayEnabled)
   {

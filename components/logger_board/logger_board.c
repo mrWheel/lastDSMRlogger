@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_board.c - on-device TFT debug lines and user screens
-//-- Date: 2026-11-27 · Build: 21
+//-- Date: 2026-11-27 · Build: 22
 //--
 //-- Everything is drawn through the documented API of the esp32_s3_piggyback
 //-- component: tft_ec11_init once, then filled rectangles and fixed-width
@@ -17,15 +17,18 @@
 //-- Every screen starts with one light blue heading row carrying the screen
 //-- name left aligned and the screen function right aligned in the 16 px
 //-- face, and ends with a light blue status row in the 11 px face carrying
-//-- the accepted and rejected telegram counters; the body of every screen
+//-- the telegram and error counters; the body of every screen
 //-- stays fully white with dark text. All screen text uses the component's
 //-- pixel-height API (tft_ec11_draw_text_px_bold, heights 10..18 px). Nine
 //-- screens exist: PHASE LOAD (one signed watt bar row per phase plus the
-//-- total, the row header in the 14 px face and the bar staying a few
+//-- total, the row header in the 10 px face, the watt value under the bar
+//-- in the 14 px face and the bar staying a few
 //-- pixels away from both panel edges, its scale following the ladder
 //-- 100..18000 W), one PHASE POWER screen per phase plus a TOTAL screen
 //-- (each showing the delivered and the returned watts of its channel as
-//-- two large 18 px values under their left aligned captions) and three
+//-- two large 18 px values under their left aligned 12 px captions, each
+//-- beside a black-framed box carrying the active tariff price per kWh of
+//-- its direction) and three
 //-- SYSTEM INFO screens (the device facts grouped in logical sections,
 //-- every line in the 14 px face and a line too long for the panel split
 //-- over two lines).
@@ -88,12 +91,14 @@ static const char* tag = "loggerBoard";
 //-- rejected telegram counters; the body stays white.
 //-- Within a row: header band and a centre-zero bar carrying its integer
 //-- scale labels; the watt value sits at the bottom of the row. The heights
-//-- add up exactly: header band 24 + bar 8 + watt row 16 = 48, the row
-//-- height on the 240 pixel panel (240 - 24 - 24) / 4.
+//-- add up exactly: header band 22 + bar 10 + watt row 16 = 48, the row
+//-- height on the 240 pixel panel (240 - 24 - 24) / 4. The bar is as tall
+//-- as the 10 px scale labels so their cells fit the bar exactly and the
+//-- white watt row never clips their bottoms.
 #define PANEL_NAME_H 24
 #define PANEL_TITLE_H PANEL_NAME_H
-#define PANEL_HEADER_H 24
-#define PANEL_BAR_H 8
+#define PANEL_HEADER_H 22
+#define PANEL_BAR_H 10
 #define PANEL_WATT_H 16
 #define PANEL_STATUS_H 24
 #define PANEL_ROWS 4
@@ -111,19 +116,29 @@ static const char* tag = "loggerBoard";
 //-- the monospaced advance (including the spacing columns) comes from
 //-- tft_ec11_get_font_metrics_px(). The heading row (screen name and
 //-- function) uses the 16 px face, the bar row headers (current, phase
-//-- label, voltage), the phase power captions and the system information
-//-- lines the 14 px face, the row watt values the 12 px face, the status
-//-- row the 11 px face, the bar scale labels the 10 px face and the phase
-//-- power values the 18 px face. Every text is drawn through the
-//-- component's bold rendering.
+//-- label, voltage) and the bar scale labels the 10 px face, the phase
+//-- power captions the 12 px face, the system information lines the 14 px
+//-- face, the row watt values the 14 px face, the status row and the
+//-- tariff price boxes the 11 px face and the phase power values the
+//-- 18 px face (the largest strike the component offers). Every text is
+//-- drawn through the component's bold rendering.
 #define FONT_TITLE_PX 16
 #define FONT_STAMP_PX 11
 #define FONT_VALUE_PX 10
 #define FONT_HEADER_INFO_PX 16
-#define FONT_ROW_PX 14
+#define FONT_HEADER_ROW_PX 10
+#define FONT_CAPTION_PX 12
 #define FONT_SYSTEM_PX 14
-#define FONT_WATT_PX 12
+#define FONT_WATT_PX 14
 #define FONT_BIG_PX 18
+#define FONT_TARIFF_PX 11
+
+//-- Black-framed tariff price box of the phase power screens: the direction
+//-- label on top and the active price per kWh below it, both centred on
+//-- the white body and framed in black. The component draws filled
+//-- rectangles only, so the frame is four one-pixel lines. The height
+//-- stacks the two 11 px cells with a two pixel gap and equal margins.
+#define TARIFF_BOX_H 30
 
 //-- Bar scale ladder: the smallest step that fits the largest absolute
 //-- watt of the frame. The steps roughly double and stay on round numbers,
@@ -203,6 +218,10 @@ typedef struct
   char wifiIp[BOARD_TEXT_MAX];
   char ssid[BOARD_TEXT_MAX];
   char ip[BOARD_TEXT_MAX];
+
+  //-- Provider of the active tariff prices per kWh for the phase power
+  //-- price boxes (installed by the application; see logger_board.h).
+  loggerBoardTariffGetter tariffGetter;
 } LoggerBoard;
 
 static LoggerBoard board;
@@ -404,7 +423,7 @@ static void drawPowerRow(int index, float watts, float amps, float volts, int y,
                          int rowHeight, uint16_t scale)
 {
   char text[24];
-  int textY = y + (PANEL_HEADER_H - FONT_ROW_PX) / 2;
+  int textY = y + (PANEL_HEADER_H - FONT_HEADER_ROW_PX) / 2;
   int wattY = y + rowHeight - PANEL_WATT_H;
   int wattTextY = wattY + (PANEL_WATT_H - FONT_WATT_PX) / 2;
 
@@ -413,17 +432,17 @@ static void drawPowerRow(int index, float watts, float amps, float volts, int y,
   tft_ec11_fill_rect(0, y, panelWidth, rowHeight, TFT_EC11_WHITE);
 
   //-- Header band on the white body: phase current left, voltage right and
-  //-- the centred phase label, all in the 14 px face in black on white.
+  //-- the centred phase label, all in the 10 px face in black on white.
 
   snprintf(text, sizeof text, "%.1fA", (double)amps);
-  drawLeftText(textY, text, FONT_ROW_PX, TFT_EC11_WHITE, TFT_EC11_BLACK);
+  drawLeftText(textY, text, FONT_HEADER_ROW_PX, TFT_EC11_WHITE, TFT_EC11_BLACK);
 
-  drawCenteredText(textY, panelWidth, phaseLabels[index], FONT_ROW_PX, TFT_EC11_WHITE,
+  drawCenteredText(textY, panelWidth, phaseLabels[index], FONT_HEADER_ROW_PX, TFT_EC11_WHITE,
                    TFT_EC11_BLACK);
 
   snprintf(text, sizeof text, "%.1fV", (double)volts);
-  drawRightAlignedText(textY, panelWidth, text, PANEL_EDGE_MARGIN, FONT_ROW_PX, TFT_EC11_WHITE,
-                       TFT_EC11_BLACK);
+  drawRightAlignedText(textY, panelWidth, text, PANEL_EDGE_MARGIN, FONT_HEADER_ROW_PX,
+                       TFT_EC11_WHITE, TFT_EC11_BLACK);
 
   drawBar(y + PANEL_BAR_Y, panelWidth, watts, scale, PANEL_BAR_H);
 
@@ -448,8 +467,8 @@ static void drawStatusLine(int panelWidth, int panelHeight)
   int textY = y + (PANEL_STATUS_H - FONT_STAMP_PX) / 2;
   char status[BOARD_TEXT_MAX + 24];
 
-  snprintf(status, sizeof status, "Accepted %" PRIu32 " | Rejected %" PRIu32,
-           board.panel.acceptedCount, board.panel.rejectedCount);
+  snprintf(status, sizeof status, "Telegrms %" PRIu32 " | Err. %" PRIu32, board.panel.acceptedCount,
+           board.panel.rejectedCount);
 
   int maxChars = (panelWidth - 2 * PANEL_EDGE_MARGIN) / fontAdvancePx(FONT_STAMP_PX);
 
@@ -487,21 +506,70 @@ static void drawPanel(void)
   drawStatusLine(width, height);
 }
 
+//-- One text centred inside a tariff price box (the shared centring helper
+//-- only knows the full panel width, the box needs its own centre maths).
+static void drawBoxCenteredText(int boxX, int boxWidth, int y, const char* text, int height_px)
+{
+  int textX = boxX + (boxWidth - (int)strlen(text) * fontAdvancePx(height_px)) / 2;
+
+  if (textX < boxX + 1)
+  {
+    textX = boxX + 1;
+  }
+
+  tft_ec11_draw_text_px_bold(textX, y, text, height_px, TFT_EC11_WHITE, TFT_EC11_BLACK, true);
+}
+
+//-- Width of a tariff price box: room for the longest direction label and
+//-- for a currency plus a five-decimal price, with small inner margins. The
+//-- same figure keeps the big watt value clear of the box.
+static int tariffBoxWidth(void)
+{
+  return 11 * fontAdvancePx(FONT_TARIFF_PX) + 2 * PANEL_EDGE_MARGIN;
+}
+
+//-- Black-framed tariff price box: the direction label on top and the
+//-- active price per kWh below it, both centred inside the frame. The
+//-- component draws filled rectangles only, so the frame is its four
+//-- one-pixel edge lines.
+static void drawTariffBox(int x, int y, int width, const char* label, const char* price)
+{
+  int labelY = y + (TARIFF_BOX_H - (2 * FONT_TARIFF_PX + 2)) / 2;
+
+  tft_ec11_fill_rect(x, y, width, 1, TFT_EC11_BLACK);
+  tft_ec11_fill_rect(x, y + TARIFF_BOX_H - 1, width, 1, TFT_EC11_BLACK);
+  tft_ec11_fill_rect(x, y, 1, TARIFF_BOX_H, TFT_EC11_BLACK);
+  tft_ec11_fill_rect(x + width - 1, y, 1, TARIFF_BOX_H, TFT_EC11_BLACK);
+
+  drawBoxCenteredText(x, width, labelY, label, FONT_TARIFF_PX);
+  drawBoxCenteredText(x, width, labelY + FONT_TARIFF_PX + 2, price, FONT_TARIFF_PX);
+}
+
 //-- One half of a phase power screen: the caption left aligned a little off
-//-- the left edge and the watt value in the large 18 px face centred below
-//-- it, both in the channel colour (delivered red, returned green) on the
-//-- white body.
+//-- the left edge, the watt value in the large 18 px face centred below it
+//-- and clear of the tariff price box on the right, and the box itself
+//-- right aligned against the panel edge. Caption and value carry the
+//-- channel colour (delivered red, returned green), the box stays black on
+//-- the white body.
 static void drawPowerHalf(int y, int halfHeight, int panelWidth, const char* caption, float watts,
-                          uint16_t color)
+                          uint16_t color, const char* tariffLabel, float pricePerKwh,
+                          const char* currency)
 {
   char text[24];
-  int stackHeight = FONT_ROW_PX + 8 + FONT_BIG_PX;
+  char price[16];
+  int stackHeight = FONT_CAPTION_PX + 8 + FONT_BIG_PX;
   int top = y + (halfHeight - stackHeight) / 2;
+  int boxWidth = tariffBoxWidth();
+  int boxX = panelWidth - PANEL_EDGE_MARGIN - boxWidth;
 
-  drawLeftText(top, caption, FONT_ROW_PX, TFT_EC11_WHITE, color);
+  drawLeftText(top, caption, FONT_CAPTION_PX, TFT_EC11_WHITE, color);
 
   snprintf(text, sizeof text, "%.1f W", (double)watts);
-  drawCenteredText(top + FONT_ROW_PX + 8, panelWidth, text, FONT_BIG_PX, TFT_EC11_WHITE, color);
+  drawCenteredText(top + FONT_CAPTION_PX + 8, boxX - PANEL_EDGE_MARGIN, text, FONT_BIG_PX,
+                   TFT_EC11_WHITE, color);
+
+  snprintf(price, sizeof price, "%s %.2f", currency, (double)pricePerKwh);
+  drawTariffBox(boxX, y + (halfHeight - TARIFF_BOX_H) / 2, boxWidth, tariffLabel, price);
 }
 
 //-- Phase power screen: one per phase plus the total. The channel shows its
@@ -521,14 +589,33 @@ static void drawPhasePowerView(BoardScreen screen)
       isTotal ? snapshot->totalReturnedWatts : snapshot->phaseReturnedWatts[powerIndex];
   int halfHeight = (height - PANEL_TITLE_H - PANEL_STATUS_H) / 2;
   int midY = PANEL_TITLE_H + halfHeight;
+  float costPerKwh = 0.0f;
+  float returnPerKwh = 0.0f;
+  char currency[LOGGER_BOARD_CURRENCY_MAX] = "EUR";
+
+  //-- The active price per kWh for both directions, from the tariff price
+  //-- provider the application installed (dynamic prices with the manual
+  //-- fallback, picked by the frame's tariff indicator); without a provider
+  //-- the boxes simply show zero on the default currency.
+  if (board.tariffGetter != NULL)
+  {
+    board.tariffGetter(snapshot->tariffIndicator, &costPerKwh, &returnPerKwh, currency,
+                       sizeof currency);
+  }
+
+  if (currency[0] == '\0')
+  {
+    snprintf(currency, sizeof currency, "EUR");
+  }
 
   drawScreenTitle(width, powerScreenNames[powerIndex], "Import / export");
   tft_ec11_fill_rect(0, PANEL_TITLE_H, width, height - PANEL_TITLE_H - PANEL_STATUS_H,
                      TFT_EC11_WHITE);
 
   drawPowerHalf(PANEL_TITLE_H, halfHeight, width, "Delivered (Import)", delivered,
-                PANEL_CONSUME_COLOR);
-  drawPowerHalf(midY, halfHeight, width, "Returned (Export)", returned, PANEL_PRODUCE_COLOR);
+                PANEL_CONSUME_COLOR, "Cost kWh", costPerKwh, currency);
+  drawPowerHalf(midY, halfHeight, width, "Returned (Export)", returned, PANEL_PRODUCE_COLOR,
+                "Return kWh", returnPerKwh, currency);
 
   //-- Thin divider between the two halves keeps them apart.
   tft_ec11_fill_rect(PANEL_EDGE_MARGIN, midY - 1, width - 2 * PANEL_EDGE_MARGIN, 1, PANEL_BAR_BG);
@@ -1079,6 +1166,16 @@ void loggerBoardSetDisplayTimeoutMinutes(uint16_t minutes)
   xSemaphoreGive(board.mutex);
 
   LOGGER_LOGI(tag, "display time-out: %" PRIu16 " minute(s)", minutes);
+}
+
+void loggerBoardSetTariffGetter(loggerBoardTariffGetter getter)
+{
+  if (!boardEnsurePrepared())
+  {
+    return;
+  }
+
+  board.tariffGetter = getter;
 }
 
 void loggerBoardShowScreen(const char* screen)

@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_board.h - on-device TFT debug lines and user screens
-//-- Date: 2026-11-26 · Build: 18
+//-- Date: 2026-11-27 · Build: 19
 //--
 //-- Before the first telegram the TFT shows debug lines describing what the
 //-- device is doing: the active browser screen name, telegram reception on
@@ -32,6 +32,7 @@
 #define LOGGER_BOARD_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -123,7 +124,37 @@ typedef struct
   char profileId[32];
   bool rxInverted;
   uint32_t uptimeSeconds;
+
+  //-- The meter's active tariff indicator (OBIS 0-0:96.14.0) of the frame:
+  //-- 1 or 2 as published, 0 when the frame names none (which prices like
+  //-- tariff 1). It lets the phase power price boxes show the manual price
+  //-- of the direction the meter is actually on.
+  uint8_t tariffIndicator;
 } loggerPowerSnapshot;
+
+//-- --------------------------------------------------------------------------
+//-- Tariff prices for the phase power price boxes
+//-- --------------------------------------------------------------------------
+
+//-- Room for the currency name the provider hands back ("EUR" by default).
+#define LOGGER_BOARD_CURRENCY_MAX 8
+
+//-- Provider of the prices that value the energy at this very moment: the
+//-- tariff indicator is the frame's meter indicator (0 prices like tariff 1),
+//-- the two prices are EUR per kWh for the import (cost) and the export
+//-- (return) direction and currencyOut receives the active currency name.
+//-- The provider mirrors the meter store calculator's rule: the dynamic
+//-- table's prices while the dynamic tariffs switch is on and the table
+//-- covers this instant, the manual prices otherwise. The board itself
+//-- never depends on the tariff or settings components; the application
+//-- wires them together through this callback.
+typedef void (*loggerBoardTariffGetter)(uint8_t tariffIndicator, float* importPricePerKwh,
+                                        float* exportPricePerKwh, char* currencyOut,
+                                        size_t currencySize);
+
+//-- Installs the tariff price provider the phase power screens query while
+//-- drawing (a NULL getter keeps both prices at zero on the "EUR" default).
+void loggerBoardSetTariffGetter(loggerBoardTariffGetter getter);
 
 //-- Watt scale ladder shared by the panel bars and the SPA realtime view:
 //-- the smallest step that fits the largest absolute watt of a frame is
@@ -141,22 +172,24 @@ uint16_t loggerBoardPickPowerScale(const loggerPowerSnapshot* snapshot);
 
 //-- Clears the screen and takes it over completely with the power screens:
 //-- every screen starts with one light blue heading row (black screen name
-//-- left aligned, screen function right aligned, both in the 13x24 native
-//-- face) and ends with a light blue status row in the 9x16 face carrying
-//-- only the accepted and rejected telegram counters; the body stays fully
+//-- left aligned, screen function right aligned, both in the 16 px face)
+//-- and ends with a light blue status row in the 11 px face carrying the
+//-- telegram and error counters; the body stays fully
 //-- white. Every text on every screen is drawn in the component's bold
 //-- rendering. The PHASE LOAD screen shows a
 //-- row per phase plus Total, each with a header band (phase current left,
-//-- phase label centred and voltage right, all in the 13x24 native face), a
-//-- centre-zero watt bar carrying its integer 8x12 scale labels inside the
+//-- phase label centred and voltage right, all in the 10 px face), a
+//-- centre-zero watt bar carrying its integer 10 px scale labels inside the
 //-- bar, its track a few pixels away from both panel edges and whose scale
 //-- follows the largest absolute watt on the smallest of the steps
 //-- 100/200/400/800/1500/3000/6000/12000/18000 W, and the watt value in
-//-- the scalable 6x8 face at scale 2. The PHASE POWER screens are four
+//-- the 14 px face. The PHASE POWER screens are four
 //-- separate screens — one per phase plus the total — each showing that
 //-- channel's delivered (import, red) and returned (export, green) watts
-//-- as two large 17x32 values centred on the white body under their left
-//-- aligned 13x24 captions "Delivered (Import)" and "Returned (Export)".
+//-- as two large 18 px values centred on the white body under their left
+//-- aligned 12 px captions "Delivered (Import)" and "Returned (Export)",
+//-- each beside a black-framed tariff price box ("Cost kWh" and
+//-- "Return kWh") carrying the active price per kWh of its direction.
 //-- The three
 //-- SYSTEM INFO screens group the device facts into sections, every line
 //-- in the 13x24 face and split over two lines when too long for the panel.

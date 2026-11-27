@@ -1,7 +1,7 @@
 //-- ==========================================================================
 //-- lastDSMRlogger - P1 smart meter logger
 //-- File: logger_receiver.c - P1 receiver, parser state and telegram history
-//-- Date: 2026-11-21 · Build: 20
+//-- Date: 2026-11-27 · Build: 21
 //--
 //-- The parserDSMR adapter task owns the parser instance while it runs. The
 //-- event callback copies the complete accepted frame and the decoded fields
@@ -558,6 +558,18 @@ static void extractPowerSnapshot(const loggerTelegramRecord* record, bool testDa
   snapshot->totalVolts = (voltCount > 0u) ? (voltSum / (float)voltCount) : 0.0f;
   snapshot->totalAmps =
       (snapshot->totalVolts > 0.0f) ? (snapshot->totalWatts / snapshot->totalVolts) : 0.0f;
+
+  //-- The frame's active tariff indicator (OBIS 0-0:96.14.0) travels with
+  //-- the snapshot so the phase power price boxes show the manual price of
+  //-- the tariff the meter is actually on; 0 (prices like tariff 1) when the
+  //-- frame names none or publishes an unexpected value.
+  float tariffIndicator = 0.0f;
+
+  if (findNumericField(record, "0-0:96.14.0", &tariffIndicator) && (tariffIndicator > 0.5f) &&
+      (tariffIndicator < 2.5f))
+  {
+    snapshot->tariffIndicator = (uint8_t)(tariffIndicator + 0.5f);
+  }
 
   extractPanelMeterTime(record, snapshot->meterTime, sizeof snapshot->meterTime);
 }

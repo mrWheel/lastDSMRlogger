@@ -1,6 +1,6 @@
 # lastDSMRlogger
 <!--
-fileVersion: [63] - 26-11-2026 - 11:15
+fileVersion: [64] - 27-11-2026 - 20:47
 -->
 ESP-IDF application for the ESP32-S3 on the TFT LCD Display EC11 Piggyback
 Board v3. It reads P1 telegrams from a smart meter through parserDSMR and
@@ -52,7 +52,7 @@ automatically.
 |esp-idf-wifi-provisioner  |ESP Component Registry `michmich/esp-idf-wifi-provisioner`                                                  |version `0.4.0` (upstream commit `2c7aaa6aa0e319a429186ee470e137b8579f632f`) |
 |ring_file_store           |ESP Component Registry `mrwheel/ring_file_store`                                                            |`^0.1.3` |
 |littlefs                  |ESP Component Registry `joltwallet/littlefs`                                                                |`^1.23.1` |
-|smb_server                |ESP Component Registry `mrwheel/smb_server`                                                                 |`^0.3.0` (GPL-3.0, guest-only SMB2/SMB3 file server) |
+|smb_server                |ESP Component Registry `mrwheel/smb_server`                                                                 |`^0.3.1` (GPL-3.0, guest-only SMB2/SMB3 file server) |
 |cjson                     |ESP Component Registry `espressif/cjson`                                                                    |`^1.7.19` (tariff document parsing) |
 |mdns                      |ESP Component Registry `espressif/mdns`                                                                     |`^1.15.1` (hostname and `_http._tcp` discovery on the local network) |
 
